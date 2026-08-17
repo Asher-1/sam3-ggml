@@ -17,9 +17,15 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#ifdef _WIN32
+#include <cstring>
+#else
+#include <strings.h>
+#endif
 
 struct options {
     std::string case_name = "all";
+    std::string backend = "metal";
     bool dump_mismatch = false;
     int n_threads = 8;
     int max_wall_ms = 30000;
@@ -49,6 +55,7 @@ static const case_desc CASES[] = {
     { "cpu_ref_stride1", 3,   2,    2,   3, 2, 2, 1, 0x1234u, 1e-5f },
     { "cpu_ref_stride2", 3,   2,    2,   3, 2, 2, 2, 0x2345u, 1e-5f },
     { "cpu_ref_stride3", 3,   2,    2,   3, 2, 2, 3, 0x3456u, 1e-5f },
+    { "tiny_2x2_s2",     8,   8,    2,   3, 2, 2, 2, 0x4242u, 1e-4f },
     { "small_rect",      5,   4,    3,   4, 3, 2, 1, 0x4567u, 1e-5f },
     { "medium_stride2",  8,   7,    5,   6, 3, 3, 2, 0x5678u, 1e-4f },
     { "sam_first",      72,  72, 1024, 512, 2, 2, 2, 0x6789u, 2e-3f },
@@ -68,6 +75,9 @@ static bool parse_args(int argc, char ** argv, options & opts) {
             opts.case_name = argv[++i];
         } else if (strcmp(argv[i], "--dump-mismatch") == 0) {
             opts.dump_mismatch = true;
+        } else if (strcmp(argv[i], "--backend") == 0) {
+            if (i + 1 >= argc) return false;
+            opts.backend = argv[++i];
         } else if (strcmp(argv[i], "--n-threads") == 0) {
             if (i + 1 >= argc) return false;
             opts.n_threads = atoi(argv[++i]);
@@ -125,6 +135,23 @@ static ggml_backend_t create_backend(const std::string & name, int n_threads) {
         return ggml_backend_metal_init();
     }
 #endif
+
+    if (name == "cuda" || name == "vulkan") {
+        ggml_backend_load_all();
+        const size_t n = ggml_backend_dev_count();
+        for (size_t i = 0; i < n; ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                continue;
+            }
+            const char * dev_name = ggml_backend_dev_name(dev);
+            if (dev_name && strncasecmp(dev_name, name.c_str(), name.size()) == 0) {
+                return ggml_backend_dev_init(dev, nullptr);
+            }
+        }
+        fprintf(stderr, "Failed to find %s backend\n", name.c_str());
+        return nullptr;
+    }
 
     return nullptr;
 }
@@ -288,9 +315,11 @@ int main(int argc, char ** argv) {
     }
 
 #ifndef GGML_USE_METAL
-    fprintf(stderr, "Metal not available, skipping test\n");
-    return 0;
-#else
+    if (opts.backend == "metal") {
+        fprintf(stderr, "Metal not available, skipping test\n");
+        return 0;
+    }
+#endif
     bool all_pass = true;
 
     fprintf(stderr, "| case | output | max abs diff | mean abs diff | tolerance | status |\n");
@@ -309,7 +338,15 @@ int main(int argc, char ** argv) {
         fill_input_data(tc, input_data);
 
         run_result cpu = run_case(tc, "cpu", opts.n_threads, weight_f16, input_data);
-        run_result metal = run_case(tc, "metal", opts.n_threads, weight_f16, input_data);
+        run_result metal = run_case(tc, opts.backend, opts.n_threads, weight_f16, input_data);
+
+        if (getenv("GGML_VK_FAST_DEBUG") && (tc.in_w <= 8 && tc.in_h <= 8)) {
+            fprintf(stderr, "[tst] %s cpu[0..47]: ", tc.name);
+            for (int i = 0; i < std::min<int>(48, (int)cpu.output.size()); ++i) fprintf(stderr, "%.4f ", cpu.output[i]);
+            fprintf(stderr, "\n[tst] %s gpu[0..47]: ", tc.name);
+            for (int i = 0; i < std::min<int>(48, (int)metal.output.size()); ++i) fprintf(stderr, "%.4f ", metal.output[i]);
+            fprintf(stderr, "\n");
+        }
 
         compare_result diff = compare_tensors(cpu.output.data(), metal.output.data(), (int) cpu.output.size(), tc.tol);
         const bool pass = diff.max_diff <= tc.tol;
@@ -334,5 +371,4 @@ int main(int argc, char ** argv) {
 
     fprintf(stderr, "\n%s\n", all_pass ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
     return all_pass ? 0 : 1;
-#endif
 }

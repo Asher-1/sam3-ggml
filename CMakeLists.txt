@@ -22,11 +22,62 @@ endif()
 # ─────────────────────────────────────────────────────────────────────────
 option(SAM3_USE_EXTERNAL_GGML "Consume external ggml via find_package() instead of the bundled submodule" OFF)
 
-# ggml options — enable Metal on Apple (bundled-ggml path only)
-option(SAM3_METAL "Enable Metal backend" ON)
-if(APPLE AND SAM3_METAL AND NOT SAM3_USE_EXTERNAL_GGML)
-    set(GGML_METAL        ON CACHE BOOL "" FORCE)
-    set(GGML_METAL_EMBED_LIBRARY ON CACHE BOOL "" FORCE)
+# ─────────────────────────────────────────────────────────────────────────
+# ggml backends — forwarded to the bundled ggml submodule. The sam3 runtime
+# discovers the active backend through the ggml backend registry
+# (ggml_backend_dev_by_type(GPU) in sam3.cpp), so no sam3 code changes are
+# needed per backend — these flags only decide what ggml compiles in.
+#
+#   SAM3_CUDA    -> GGML_CUDA    (NVIDIA GPUs)
+#   SAM3_VULKAN  -> GGML_VULKAN  (any GPU with a Vulkan driver)
+#   SAM3_METAL   -> GGML_METAL   (Apple Silicon; auto-enabled on macOS)
+#   SAM3_HIPBLAS -> GGML_HIP     (AMD HIP)
+#
+# External-ggml builds (SAM3_USE_EXTERNAL_GGML=ON) compile nothing here;
+# the backend set is whatever the installed ggml was built with.
+# ─────────────────────────────────────────────────────────────────────────
+option(SAM3_CUDA    "Enable CUDA backend in ggml"    OFF)
+option(SAM3_VULKAN  "Enable Vulkan backend in ggml"  OFF)
+option(SAM3_METAL   "Enable Metal backend"           ON)
+option(SAM3_HIPBLAS "Enable HIP backend in ggml"     OFF)
+
+if(NOT SAM3_USE_EXTERNAL_GGML)
+    if(SAM3_CUDA)
+        set(GGML_CUDA ON CACHE BOOL "" FORCE)
+    endif()
+    if(SAM3_VULKAN)
+        set(GGML_VULKAN ON CACHE BOOL "" FORCE)
+    endif()
+    if(SAM3_HIPBLAS)
+        set(GGML_HIP ON CACHE BOOL "" FORCE)
+    endif()
+    if(APPLE AND SAM3_METAL)
+        set(GGML_METAL        ON CACHE BOOL "" FORCE)
+        set(GGML_METAL_EMBED_LIBRARY ON CACHE BOOL "" FORCE)
+    endif()
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Apply local ggml patches before descending into the submodule. The
+    # patches live in ggml-patches/ and are applied idempotently by
+    # scripts/apply_ggml_patches.sh; re-running CMake is a no-op once
+    # they're in place. NEVER edit ggml/ by hand — uncommitted submodule
+    # changes are silently lost on the next `git submodule update`.
+    # ─────────────────────────────────────────────────────────────────────
+    execute_process(
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/apply_ggml_patches.sh
+        RESULT_VARIABLE _ggml_patch_result
+        OUTPUT_VARIABLE _ggml_patch_output
+        ERROR_VARIABLE  _ggml_patch_error
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_STRIP_TRAILING_WHITESPACE
+    )
+    if(NOT _ggml_patch_result EQUAL 0)
+        message(FATAL_ERROR
+            "Failed to apply ggml patches (exit ${_ggml_patch_result}):\n"
+            "stdout:\n${_ggml_patch_output}\n"
+            "stderr:\n${_ggml_patch_error}")
+    endif()
+    message(STATUS "${_ggml_patch_output}")
 endif()
 
 if(SAM3_USE_EXTERNAL_GGML)
