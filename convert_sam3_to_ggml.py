@@ -197,110 +197,80 @@ def rename_key(k: str) -> str | None:
     return k
 
 
-# ── I/O helpers ───────────────────────────────────────────────────────────────
+# ── GGUF output ─────────────────────────────────────────────────────────────
 
-def write_header(fout, ftype: int, n_tensors: int, visual_only: bool = False):
-    """Write file header: magic, version, ftype, n_tensors, hparams."""
-    fout.write(struct.pack("<I", MAGIC))
-    fout.write(struct.pack("<i", VERSION))
-    fout.write(struct.pack("<i", ftype))
-    fout.write(struct.pack("<i", n_tensors))
+# Write the model as a standard GGUF v3 file (see scripts/gguf_writer.py). The
+# hparams go into sam3.hparams.* KV entries, the tokenizer into string-array
+# KVs, and every tensor into the GGUF tensor table — the same layout the other
+# ggml projects (face-detect-ggml, free-splatter.cpp, OpenPCDet-GGML) load via
+# gguf_init_from_file.
+def write_gguf(path: str, ftype: int, renamed: dict, visual_only: bool,
+               tokenizer_dir: str):
+    import sys as _sys
+    import os as _os
+    _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "scripts"))
+    from gguf_writer import GGUFWriter, GGML_TYPE_F16, GGML_TYPE_F32
+
+    w = GGUFWriter()
+    w.add_str("general.architecture", "sam3")
+    w.add_str("sam3.arch", "sam3")
+    w.add_i32("sam3.version", VERSION)
+    w.add_i32("sam3.ftype", ftype)
+
+    # Hparams → KV (global_attn_idx_0..3 merge into one INT32 array)
+    ga_idx = []
     for name, val in HPARAMS_FIELDS:
+        if name.startswith("global_attn_idx_"):
+            ga_idx.append((int(name.rsplit("_", 1)[1]), val))
+            continue
         if name == "visual_only" and visual_only:
             val = 1
-        fout.write(struct.pack("<i", val))
+        # Converter field name -> loader KV name
+        kv_name = {"n_global_attn_blocks": "n_global_attn"}.get(name, name)
+        w.add_i32(f"sam3.hparams.{kv_name}", val)
+    w.add_arr_i32("sam3.hparams.global_attn_idx",
+                  [v for _, v in sorted(ga_idx)])
 
+    # Tensors (ggml column-major ne = reversed PyTorch shape)
+    for name, data in renamed.items():
+        ne = list(reversed(data.shape))
+        use_f16 = (ftype == FTYPE_F16 and len(data.shape) >= 2
+                   and "embed" not in name
+                   and "pos_embed" not in name
+                   and "tpos" not in name
+                   and "pe_gaussian" not in name
+                   and "freqs_cis" not in name
+                   and "token" not in name
+                   and "no_obj" not in name
+                   and "no_mem" not in name
+                   and "gamma" not in name)
+        ttype = GGML_TYPE_F16 if use_f16 else GGML_TYPE_F32
+        dt = data.astype(np.float16 if use_f16 else np.float32)
+        w.add_tensor(name, ne, ttype, dt.tobytes())
 
-def write_tensor(fout, name: str, data: np.ndarray, ftype: int):
-    """Write one tensor record with 32-byte aligned data."""
-    n_dims = len(data.shape)
-    name_bytes = name.encode("utf-8")
+    # Tokenizer → string-array KV (vocab indexed by token id, merges as "a b")
+    if not visual_only:
+        import json
+        with open(os.path.join(tokenizer_dir, "vocab.json"), "r", encoding="utf-8") as f:
+            vocab = json.load(f)
+        merges = []
+        with open(os.path.join(tokenizer_dir, "merges.txt"), "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if line.startswith("#") or not line:
+                    continue
+                parts = line.split(" ", 1)
+                if len(parts) == 2:
+                    merges.append(f"{parts[0]} {parts[1]}")
+        w.add_arr_str("sam3.tokenizer.vocab",
+                      [t for _, t in sorted(vocab.items(), key=lambda x: x[1])])
+        w.add_arr_str("sam3.tokenizer.merges", merges)
+        print(f"Embedded tokenizer: {len(vocab)} vocab entries, {len(merges)} merges")
 
-    # Determine storage dtype
-    # 1D tensors, embeddings, and positions → always f32
-    use_f16 = (ftype == FTYPE_F16 and n_dims >= 2
-               and "embed" not in name
-               and "pos_embed" not in name
-               and "tpos" not in name
-               and "pe_gaussian" not in name
-               and "freqs_cis" not in name
-               and "token" not in name
-               and "no_obj" not in name
-               and "no_mem" not in name
-               and "gamma" not in name)
-
-    dtype_id = FTYPE_F16 if use_f16 else FTYPE_F32
-
-    if use_f16:
-        data = data.astype(np.float16)
-    else:
-        data = data.astype(np.float32)
-
-    # Write: n_dims, name_len, dtype, shape (reversed), name, padding, data
-    fout.write(struct.pack("<i", n_dims))
-    fout.write(struct.pack("<i", len(name_bytes)))
-    fout.write(struct.pack("<i", dtype_id))
-
-    # ggml expects dimensions in reverse order (column-major)
-    for dim in reversed(data.shape):
-        fout.write(struct.pack("<i", dim))
-
-    fout.write(name_bytes)
-
-    # Pad to 32-byte alignment
-    pos = fout.tell()
-    pad = (32 - pos % 32) % 32
-    fout.write(b"\x00" * pad)
-
-    fout.write(data.tobytes())
-
-
-# ── Tokenizer embedding ──────────────────────────────────────────────────────
-
-TOK_MAGIC = 0x746F6B00   # "tok\0"
-
-def write_tokenizer(fout, tokenizer_dir: str):
-    """Embed BPE tokenizer (vocab + merges) into the model file."""
-    import json
-
-    vocab_path  = os.path.join(tokenizer_dir, "vocab.json")
-    merges_path = os.path.join(tokenizer_dir, "merges.txt")
-
-    with open(vocab_path, "r", encoding="utf-8") as f:
-        vocab = json.load(f)
-
-    merges = []
-    with open(merges_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.rstrip("\n")
-            if line.startswith("#") or not line:
-                continue
-            parts = line.split(" ", 1)
-            if len(parts) == 2:
-                merges.append((parts[0], parts[1]))
-
-    # Sentinel
-    fout.write(struct.pack("<I", TOK_MAGIC))
-
-    # Vocab (sorted by token_id for determinism)
-    fout.write(struct.pack("<i", len(vocab)))
-    for token_str, token_id in sorted(vocab.items(), key=lambda x: x[1]):
-        token_bytes = token_str.encode("utf-8")
-        fout.write(struct.pack("<i", len(token_bytes)))
-        fout.write(token_bytes)
-        fout.write(struct.pack("<i", token_id))
-
-    # Merges
-    fout.write(struct.pack("<i", len(merges)))
-    for a, b in merges:
-        a_bytes = a.encode("utf-8")
-        b_bytes = b.encode("utf-8")
-        fout.write(struct.pack("<i", len(a_bytes)))
-        fout.write(a_bytes)
-        fout.write(struct.pack("<i", len(b_bytes)))
-        fout.write(b_bytes)
-
-    print(f"Embedded tokenizer: {len(vocab)} vocab entries, {len(merges)} merges")
+    with open(path, "wb") as fout:
+        w.write_header_and_meta(fout)
+        for i in range(len(renamed)):
+            w.write_tensor_data(fout, i)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -389,18 +359,9 @@ def main():
     # ── Write ─────────────────────────────────────────────────────────────
     print(f"\nWriting {args.output} (ftype={args.ftype}) ...")
 
-    with open(args.output, "wb") as fout:
-        write_header(fout, args.ftype, len(renamed), visual_only=args.visual_only)
-
-        for i, (name, data) in enumerate(renamed.items()):
-            write_tensor(fout, name, data, args.ftype)
-            if (i + 1) % 100 == 0 or i == len(renamed) - 1:
-                print(f"  [{i+1}/{len(renamed)}] {name}  {list(data.shape)}")
-
-        # Embed tokenizer for non-visual-only models
-        if not args.visual_only:
-            tok_dir = args.tokenizer if args.tokenizer else os.path.dirname(os.path.abspath(args.model))
-            write_tokenizer(fout, tok_dir)
+    tok_dir = args.tokenizer if args.tokenizer else os.path.dirname(os.path.abspath(args.model))
+    write_gguf(args.output, args.ftype, renamed, visual_only=args.visual_only,
+               tokenizer_dir=tok_dir)
 
     file_size = os.path.getsize(args.output)
     print(f"\nDone. {len(renamed)} tensors, {file_size / 1e9:.2f} GB")

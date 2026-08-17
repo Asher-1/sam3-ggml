@@ -201,121 +201,70 @@ def rename_key(k: str) -> str | None:
     return k
 
 
-# ── I/O helpers ──────────────────────────────────────────────────────────────
+# ── GGUF output ─────────────────────────────────────────────────────────────
 
-def write_header(fout, ftype: int, n_tensors: int, hparams: dict):
-    """Write SAM2 file header: magic, version, ftype, n_tensors, hparams."""
-    fout.write(struct.pack("<I", MAGIC))
-    fout.write(struct.pack("<i", VERSION))
-    fout.write(struct.pack("<i", ftype))
-    fout.write(struct.pack("<i", n_tensors))
+# Map this script's hparams dict keys to the loader's sam3.hparams.* KV names.
+# Keys absent from the map are written verbatim.
+HPARAMS_KEY_MAP = {
+    "image_size":                     "img_size",
+    "hiera_global_att_n":             "hiera_global_n",
+    "hiera_global_att_idx":           "hiera_global_idx",
+    "fpn_top_down_levels_n":          "fpn_top_down_n",
+    "sigmoid_scale_for_mem_enc_x100": "sigmoid_scale_x100",
+    "sigmoid_bias_for_mem_enc_x100":  "sigmoid_bias_x100",
+}
 
-    hp = hparams
+# Array hparams written as INT32 arrays: (dict key, max length)
+HPARAMS_ARRAYS = [
+    ("hiera_stages", 4),
+    ("hiera_global_att_idx", 8),
+    ("hiera_window_spec", 4),
+    ("fpn_top_down_levels", 4),
+]
 
-    # Image + backbone type
-    fout.write(struct.pack("<i", hp["image_size"]))
-    fout.write(struct.pack("<i", hp["backbone_type"]))
+# Write the model as a standard GGUF v3 file (see scripts/gguf_writer.py).
+def write_gguf(path: str, ftype: int, renamed: dict, hp: dict):
+    import sys as _sys
+    import os as _os
+    _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "scripts"))
+    from gguf_writer import GGUFWriter, GGML_TYPE_F16, GGML_TYPE_F32
 
-    # Hiera backbone
-    fout.write(struct.pack("<i", hp["hiera_embed_dim"]))
-    fout.write(struct.pack("<i", hp["hiera_num_heads"]))
-    fout.write(struct.pack("<i", hp["hiera_num_stages"]))
-    for i in range(4):
-        fout.write(struct.pack("<i", hp["hiera_stages"][i] if i < len(hp["hiera_stages"]) else 0))
-    fout.write(struct.pack("<i", hp["hiera_global_att_n"]))
-    for i in range(8):
-        idx = hp["hiera_global_att_idx"]
-        fout.write(struct.pack("<i", idx[i] if i < len(idx) else 0))
-    fout.write(struct.pack("<i", hp["hiera_q_pool"]))
-    for i in range(4):
-        fout.write(struct.pack("<i", hp["hiera_window_spec"][i] if i < len(hp["hiera_window_spec"]) else 0))
-    fout.write(struct.pack("<i", hp["hiera_pos_embed_bkg_h"]))
-    fout.write(struct.pack("<i", hp["hiera_pos_embed_bkg_w"]))
-    fout.write(struct.pack("<i", hp["scalp"]))
+    w = GGUFWriter()
+    w.add_str("general.architecture", "sam2")
+    w.add_str("sam3.arch", "sam2")
+    w.add_i32("sam3.version", VERSION)
+    w.add_i32("sam3.ftype", ftype)
 
-    # FPN neck
-    fout.write(struct.pack("<i", hp["neck_dim"]))
-    fout.write(struct.pack("<i", hp["fpn_top_down_levels_n"]))
-    for i in range(4):
-        td = hp["fpn_top_down_levels"]
-        fout.write(struct.pack("<i", td[i] if i < len(td) else 0))
+    # Hparams → KV (array fields merged into INT32 arrays)
+    for key, val in hp.items():
+        if any(key == ak for ak, _ in HPARAMS_ARRAYS):
+            continue   # handled below
+        w.add_i32(f"sam3.hparams.{HPARAMS_KEY_MAP.get(key, key)}", val)
+    for key, max_len in HPARAMS_ARRAYS:
+        arr = list(hp.get(key, []))
+        arr = (arr + [0] * max_len)[:max_len]
+        w.add_arr_i32(f"sam3.hparams.{HPARAMS_KEY_MAP.get(key, key)}", arr)
 
-    # SAM decoder
-    fout.write(struct.pack("<i", hp["sam_embed_dim"]))
-    fout.write(struct.pack("<i", hp["sam_dec_depth"]))
-    fout.write(struct.pack("<i", hp["sam_n_multimask"]))
-    fout.write(struct.pack("<i", hp["sam_iou_head_depth"]))
+    # Tensors (ggml column-major ne = reversed PyTorch shape)
+    for name, data in renamed.items():
+        ne = list(reversed(data.shape))
+        use_f16 = (ftype == FTYPE_F16 and len(data.shape) >= 2
+                   and "embed" not in name
+                   and "pos_embed" not in name
+                   and "tpos" not in name
+                   and "pe_gaussian" not in name
+                   and "token" not in name
+                   and "no_obj" not in name
+                   and "no_mem" not in name
+                   and "gamma" not in name)
+        ttype = GGML_TYPE_F16 if use_f16 else GGML_TYPE_F32
+        dt = data.astype(np.float16 if use_f16 else np.float32)
+        w.add_tensor(name, ne, ttype, dt.tobytes())
 
-    # Memory
-    fout.write(struct.pack("<i", hp["mem_out_dim"]))
-    fout.write(struct.pack("<i", hp["mem_attn_layers"]))
-    fout.write(struct.pack("<i", hp["num_maskmem"]))
-    fout.write(struct.pack("<i", hp["max_obj_ptrs"]))
-
-    # Sigmoid scale/bias
-    fout.write(struct.pack("<i", hp["sigmoid_scale_for_mem_enc_x100"]))
-    fout.write(struct.pack("<i", hp["sigmoid_bias_for_mem_enc_x100"]))
-
-    # Boolean flags
-    for flag in [
-        "use_high_res_features",
-        "use_obj_ptrs_in_encoder",
-        "pred_obj_scores",
-        "use_multimask_token_for_obj_ptr",
-        "directly_add_no_mem_embed",
-        "non_overlap_masks_for_mem_enc",
-        "binarize_mask_from_pts",
-        "multimask_output_for_tracking",
-        "multimask_min_pt_num",
-        "multimask_max_pt_num",
-        "fixed_no_obj_ptr",
-        "iou_prediction_use_sigmoid",
-        "use_mask_input_as_output",
-        "multimask_output_in_sam",
-        "is_sam2_1",
-    ]:
-        fout.write(struct.pack("<i", hp[flag]))
-
-
-def write_tensor(fout, name: str, data: np.ndarray, ftype: int):
-    """Write one tensor record with 32-byte aligned data."""
-    n_dims = len(data.shape)
-    name_bytes = name.encode("utf-8")
-
-    # 1D tensors, embeddings, positions → always f32
-    use_f16 = (ftype == FTYPE_F16 and n_dims >= 2
-               and "embed" not in name
-               and "pos_embed" not in name
-               and "tpos" not in name
-               and "pe_gaussian" not in name
-               and "token" not in name
-               and "no_obj" not in name
-               and "no_mem" not in name
-               and "gamma" not in name)
-
-    dtype_id = FTYPE_F16 if use_f16 else FTYPE_F32
-
-    if use_f16:
-        data = data.astype(np.float16)
-    else:
-        data = data.astype(np.float32)
-
-    fout.write(struct.pack("<i", n_dims))
-    fout.write(struct.pack("<i", len(name_bytes)))
-    fout.write(struct.pack("<i", dtype_id))
-
-    # ggml expects dimensions in reverse order (column-major)
-    for dim in reversed(data.shape):
-        fout.write(struct.pack("<i", dim))
-
-    fout.write(name_bytes)
-
-    # Pad to 32-byte alignment
-    pos = fout.tell()
-    pad = (32 - pos % 32) % 32
-    fout.write(b"\x00" * pad)
-
-    fout.write(data.tobytes())
+    with open(path, "wb") as fout:
+        w.write_header_and_meta(fout)
+        for i in range(len(renamed)):
+            w.write_tensor_data(fout, i)
 
 
 # ── Config parsing ───────────────────────────────────────────────────────────
@@ -525,12 +474,7 @@ def main():
 
     # ── Write output ──────────────────────────────────────────────────
     print(f"Writing: {args.output}")
-    with open(args.output, "wb") as fout:
-        write_header(fout, args.ftype, len(renamed), hparams)
-
-        for name in sorted(renamed.keys()):
-            data = renamed[name]
-            write_tensor(fout, name, data, args.ftype)
+    write_gguf(args.output, args.ftype, renamed, hparams)
 
     file_size = os.path.getsize(args.output)
     print(f"Done. {len(renamed)} tensors, {file_size / (1024*1024):.1f} MB")
