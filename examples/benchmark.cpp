@@ -12,7 +12,7 @@
  *   sam3_benchmark [options]
  *
  * Options:
- *   --models-dir <path>   Directory with .ggml files  (default: models/)
+ *   --models-dir <path>   Directory with .gguf/.ggml files (default: models/)
  *   --video <path>        Video file                   (default: data/test_video.mp4)
  *   --point-x <f>         Click point X                (default: 315.0)
  *   --point-y <f>         Click point Y                (default: 250.0)
@@ -43,6 +43,10 @@
 #include <unistd.h>
 #endif
 
+// ── Global options ──────────────────────────────────────────────────────────
+
+static sam3_device g_device = SAM3_DEVICE_AUTO;  // --device override
+
 // ── Wire format for child→parent result ─────────────────────────────────────
 
 struct BenchWire {
@@ -53,6 +57,7 @@ struct BenchWire {
     int     n_detections;
     int     ok;            // 1 = success, 0 = failure
     char    error[128];
+    char    backend[32];   // actual backend name, e.g. "CUDA"/"Vulkan"/"Metal"/"CPU"
 };
 
 // ── Display result ──────────────────────────────────────────────────────────
@@ -94,6 +99,11 @@ static std::string format_time_short(double ms) {
 static bool ends_with(const std::string & s, const std::string & suffix) {
     if (suffix.size() > s.size()) return false;
     return s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+// Accept both .gguf (standard GGUF) and legacy .ggml files.
+static bool is_model_file(const std::string & fname) {
+    return ends_with(fname, ".gguf") || ends_with(fname, ".ggml");
 }
 
 static std::string strip_extension(const std::string & filename) {
@@ -138,9 +148,8 @@ static std::vector<ModelEntry> discover_models(const std::string & dir,
     std::vector<ModelEntry> entries;
 
 #ifdef _WIN32
-    std::string pattern = dir + "\\*.ggml";
     WIN32_FIND_DATAA fd;
-    HANDLE hFind = FindFirstFileA(pattern.c_str(), &fd);
+    HANDLE hFind = FindFirstFileA((dir + "\\*").c_str(), &fd);
     if (hFind == INVALID_HANDLE_VALUE) {
         fprintf(stderr, "ERROR: cannot open models directory '%s'\n", dir.c_str());
         return entries;
@@ -148,7 +157,7 @@ static std::vector<ModelEntry> discover_models(const std::string & dir,
     do {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
         std::string fname = fd.cFileName;
-        if (!ends_with(fname, ".ggml")) continue;
+        if (!is_model_file(fname)) continue;
         if (!filter.empty() && fname.find(filter) == std::string::npos) continue;
 
         std::string full_path = dir + "\\" + fname;
@@ -171,7 +180,7 @@ static std::vector<ModelEntry> discover_models(const std::string & dir,
     struct dirent * ent;
     while ((ent = readdir(d)) != nullptr) {
         std::string fname = ent->d_name;
-        if (!ends_with(fname, ".ggml")) continue;
+        if (!is_model_file(fname)) continue;
         if (!filter.empty() && fname.find(filter) == std::string::npos) continue;
 
         std::string full_path = dir + "/" + fname;
@@ -224,6 +233,10 @@ static BenchWire run_single_benchmark(const std::string & model_path,
     params.use_gpu       = use_gpu;
     params.n_threads     = n_threads;
     params.encode_img_size = encode_img_size;
+    params.device        = g_device;
+    if (!use_gpu) {
+        params.device = SAM3_DEVICE_CPU;  // --cpu-only wins over --device
+    }
 
     auto model = sam3_load_model(params);
     if (!model) { fail("load failed"); return wire; }
@@ -291,6 +304,7 @@ static BenchWire run_single_benchmark(const std::string & model_path,
     wire.t_total_ms   = wire.t_frame0_ms + t_track_sum;
     wire.n_detections = (int)last_result.detections.size();
     wire.ok           = 1;
+    snprintf(wire.backend, sizeof(wire.backend), "%s", sam3_backend_name(*model));
 
     return wire;
 }
@@ -324,7 +338,7 @@ static BenchResult run_benchmark_isolated(const ModelEntry & entry,
                                            int encode_img_size = 0) {
     BenchResult res;
     res.model_name = entry.name;
-    res.backend    = use_gpu ? "Metal" : "CPU";
+    res.backend    = use_gpu ? "GPU" : "CPU";  // overwritten with the real name by the child wire
     res.file_size  = entry.file_size;
 
 #ifdef _WIN32
@@ -337,6 +351,9 @@ static BenchResult run_benchmark_isolated(const ModelEntry & entry,
         res.t_track_avg_ms = wire.t_track_avg_ms;
         res.t_total_ms     = wire.t_total_ms;
         res.n_detections   = wire.n_detections;
+        if (wire.backend[0]) {
+            res.backend = wire.backend;
+        }
         res.success        = true;
     } else {
         res.error = wire.error;
@@ -380,6 +397,9 @@ static BenchResult run_benchmark_isolated(const ModelEntry & entry,
         res.t_track_avg_ms = wire.t_track_avg_ms;
         res.t_total_ms     = wire.t_total_ms;
         res.n_detections   = wire.n_detections;
+        if (wire.backend[0]) {
+            res.backend = wire.backend;
+        }
         res.success        = true;
     } else if (nread == (ssize_t)sizeof(wire) && !wire.ok) {
         res.error = wire.error;
@@ -468,6 +488,14 @@ int main(int argc, char ** argv) {
         else if (arg == "--cpu-only")  { cpu_only = true; }
         else if (arg == "--gpu-only")  { gpu_only = true; }
         else if (arg == "--filter"     && i + 1 < argc) { filter = argv[++i]; }
+        else if (arg == "--device"     && i + 1 < argc) {
+            std::string dev = argv[++i];
+            if      (dev == "auto")   { g_device = SAM3_DEVICE_AUTO; }
+            else if (dev == "cpu")    { g_device = SAM3_DEVICE_CPU; }
+            else if (dev == "cuda")   { g_device = SAM3_DEVICE_CUDA; }
+            else if (dev == "vulkan") { g_device = SAM3_DEVICE_VULKAN; }
+            else { fprintf(stderr, "error: unknown --device '%s' (auto|cpu|cuda|vulkan)\n", dev.c_str()); return 1; }
+        }
         else if (arg == "--help" || arg == "-h") {
             fprintf(stderr,
                 "Usage: %s [options]\n"
@@ -479,6 +507,7 @@ int main(int argc, char ** argv) {
                 "  --n-threads <n>       CPU threads            (default: 4)\n"
                 "  --cpu-only            Skip Metal runs\n"
                 "  --gpu-only            Skip CPU runs\n"
+                "  --device <dev>        auto|cpu|cuda|vulkan (default: auto)\n"
                 "  --filter <substr>     Filter model filenames\n",
                 argv[0]);
             return 0;
@@ -496,7 +525,7 @@ int main(int argc, char ** argv) {
     // Discover models
     auto entries = discover_models(models_dir, filter);
     if (entries.empty()) {
-        fprintf(stderr, "ERROR: no .ggml files found in '%s'", models_dir.c_str());
+        fprintf(stderr, "ERROR: no .gguf/.ggml files found in '%s'", models_dir.c_str());
         if (!filter.empty()) fprintf(stderr, " (filter: '%s')", filter.c_str());
         fprintf(stderr, "\n");
         return 1;
@@ -551,7 +580,7 @@ int main(int argc, char ** argv) {
 
     for (size_t i = 0; i < runs.size(); i++) {
         const auto & run = runs[i];
-        const char * backend_str = run.use_gpu ? "Metal" : "CPU";
+        const char * backend_str = run.use_gpu ? "GPU" : "CPU";
 
         fprintf(stderr, "[%3zu/%zu] %s (%s) ...\n",
                 i + 1, runs.size(), run.entry->name.c_str(), backend_str);

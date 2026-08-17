@@ -41,7 +41,10 @@ if(APPLE)
     target_link_libraries(imgui-sdl2 PUBLIC "-framework OpenGL")
 else()
     find_package(OpenGL REQUIRED)
-    target_link_libraries(imgui-sdl2 PUBLIC OpenGL::GL)
+    # ${CMAKE_DL_LIBS} (libdl): the bundled imgl3w loader uses dlopen/dlsym
+    # to resolve GL entry points; on modern glibc these symbols live in libc
+    # but the link still needs -ldl on older toolchains.
+    target_link_libraries(imgui-sdl2 PUBLIC OpenGL::GL ${CMAKE_DL_LIBS})
 endif()
 
 # On non-Apple, leave IMGUI_IMPL_OPENGL_LOADER_* undefined so imgui uses its

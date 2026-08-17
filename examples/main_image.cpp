@@ -1,10 +1,12 @@
 // sam3_image — Interactive image segmentation example
 //
 // Usage: sam3_image --model <path.ggml> [--image <path>]
-//                   [--threads N] [--no-gpu]
+//                   [--threads N] [--no-gpu] [--device auto|cpu|cuda|vulkan]
 //
 // Controls:
 //   Mode selector: Points / Box (PVS) / Exemplar (PCS)
+//   Devices combo: Auto (CUDA -> Vulkan -> CPU) / CPU / CUDA / Vulkan.
+//     Switching re-loads the model onto the selected backend on the fly.
 //   Left-click on canvas: add positive point (or start box drag).
 //   Right-click on canvas: add negative point.
 //   Drag on canvas: draw bounding box.
@@ -155,6 +157,10 @@ struct app_state {
 
     // Model type
     bool                visual_only = false;  // true for SAM2 / SAM3 visual-only
+
+    // Device selection (Devices combo / --device)
+    sam3_device         device_sel   = SAM3_DEVICE_AUTO;  // user selection
+    bool                device_dirty = false;             // reload model on next frame
 };
 
 static GLuint upload_texture(const uint8_t* data, int w, int h, int ch, GLuint existing = 0) {
@@ -347,6 +353,52 @@ static void draw_busy_overlay(const char* message) {
         IM_COL32(255, 255, 255, 255), message);
 }
 
+// Reload the model on the currently selected device. Switching backends means
+// the weights move to a different buffer, so the encoded image, prompts and
+// results are reset (the caller must re-run encode/segment).
+static bool reload_model(app_state& app) {
+    app.busy = false;
+    app.pending = ACTION_NONE;
+
+    app.state.reset();
+    if (app.model) {
+        sam3_free_model(*app.model);   // release backend buffers before reset
+        app.model.reset();
+    }
+    app.params.device = app.device_sel;
+    app.image_encoded = false;
+    app.result = {};
+    app.pos_points.clear();
+    app.neg_points.clear();
+    app.pos_exemplars.clear();
+    app.neg_exemplars.clear();
+    app.pvs_box = {0, 0, 0, 0};
+    app.has_pvs_box = false;
+    app.text_prompt[0] = '\0';
+    build_overlay(app);
+
+    fprintf(stderr, "Loading model on device %d: %s\n", (int) app.device_sel,
+            app.params.model_path.c_str());
+    app.model = sam3_load_model(app.params);
+    if (!app.model) {
+        snprintf(app.status, sizeof(app.status),
+                 "Failed to load model on selected device.");
+        return false;
+    }
+    app.state = sam3_create_state(*app.model, app.params);
+    if (!app.state) {
+        snprintf(app.status, sizeof(app.status), "Failed to create state.");
+        return false;
+    }
+    app.visual_only = sam3_is_visual_only(*app.model);
+    if (app.visual_only) {
+        app.mode = MODE_POINTS;
+    }
+    snprintf(app.status, sizeof(app.status), "Model reloaded on %s backend.",
+             sam3_backend_name(*app.model));
+    return true;
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
@@ -366,13 +418,25 @@ int main(int argc, char** argv) {
             app.params.n_threads = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--no-gpu") == 0) {
             app.params.use_gpu = false;
+        } else if (strcmp(argv[i], "--device") == 0 && i+1 < argc) {
+            const std::string d = argv[++i];
+            if      (d == "auto")   app.device_sel = SAM3_DEVICE_AUTO;
+            else if (d == "cpu")    app.device_sel = SAM3_DEVICE_CPU;
+            else if (d == "cuda")   app.device_sel = SAM3_DEVICE_CUDA;
+            else if (d == "vulkan") app.device_sel = SAM3_DEVICE_VULKAN;
+            else {
+                fprintf(stderr, "unknown device '%s' (auto|cpu|cuda|vulkan)\n", d.c_str());
+                return 1;
+            }
         } else if (strcmp(argv[i], "--help") == 0) {
             fprintf(stderr,
                 "Usage: %s --model <path.ggml> [--image <path>]\n"
-                "          [--threads N] [--no-gpu]\n", argv[0]);
+                "          [--threads N] [--no-gpu] [--device auto|cpu|cuda|vulkan]\n", argv[0]);
             return 0;
         }
     }
+
+    app.params.device = app.device_sel;
 
     if (app.params.model_path.empty()) {
         fprintf(stderr, "Error: --model is required.\n");
@@ -523,6 +587,13 @@ int main(int argc, char** argv) {
             }
         }
 
+        // ── Device switch: reload the model on the newly selected backend ────
+
+        if (app.device_dirty) {
+            app.device_dirty = false;
+            reload_model(app);
+        }
+
         // ── ImGui frame ──────────────────────────────────────────────────────
 
         ImGui_ImplOpenGL3_NewFrame();
@@ -588,6 +659,19 @@ int main(int argc, char** argv) {
             ImGui::RadioButton("Exemplar (PCS)", false);
             ImGui::EndDisabled();
         }
+
+        // ── Device selector (auto probes CUDA -> Vulkan -> CPU) ─────────────
+        static const char* kDeviceNames[] = {"Auto", "CPU", "CUDA", "Vulkan"};
+        ImGui::Text("Devices:");
+        ImGui::SameLine();
+        int dev_idx = (int) app.device_sel;
+        if (ImGui::Combo("##device", &dev_idx, kDeviceNames, 4)) {
+            app.device_sel = (sam3_device) dev_idx;
+            app.device_dirty = true;
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("Backend: %s",
+                            app.model ? sam3_backend_name(*app.model) : "none");
 
         // ── Image canvas ─────────────────────────────────────────────────────
 

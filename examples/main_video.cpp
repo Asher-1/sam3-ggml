@@ -1,12 +1,16 @@
 // sam3_video — Interactive video segmentation + tracking example
 //
 // Usage: sam3_video --model <path.ggml> --video <path>
+//                   [--threads N] [--no-gpu] [--encode-img-size N]
+//                   [--device auto|cpu|cuda|vulkan]
 //
 // Controls:
 //   Mode selector chooses how to initialize tracking instances:
 //     Text:   Type a text prompt → auto-detect instances on each frame.
 //     Box:    Drag a bounding box on a paused frame → add instance.
-//     Points: Click positive/negative points → add instance.
+//     Points: Click positive/negative points -> add instance.
+//   Devices combo: Auto (CUDA -> Vulkan -> CPU) / CPU / CUDA / Vulkan.
+//     Switching re-loads the model onto the selected backend on the fly.
 //   In all modes, clicking on an existing tracked mask refines it.
 //   [Play]/[Pause]/[Step] for playback control.
 //   [Export] saves mask PNGs per frame.
@@ -149,6 +153,10 @@ struct vapp_state {
     // Model type
     bool                    visual_only = false;
     sam3_visual_track_params visual_track_params;
+
+    // Device selection (Devices combo / --device)
+    sam3_device             device_sel   = SAM3_DEVICE_AUTO;  // user selection
+    bool                    device_dirty = false;             // reload model on next frame
 
     // Timeline: per-frame instance presence
     // timeline_instances[frame_index] = list of {instance_id, score}
@@ -343,6 +351,65 @@ static void clear_init_prompts(vapp_state& app) {
     app.has_init_box = false;
 }
 
+// Reload the model on the currently selected device. Switching backends means
+// the weights move to a different buffer, so the encoded frame, tracker,
+// prompts and results are reset and the current frame is re-decoded.
+static bool reload_model(vapp_state& app) {
+    app.busy = false;
+    app.playing = false;
+
+    app.tracker.reset();
+    app.tracker_created = false;
+    app.state.reset();
+    if (app.model) {
+        sam3_free_model(*app.model);   // release backend buffers before reset
+        app.model.reset();
+    }
+    app.params.device = app.device_sel;
+    app.frame_encoded = false;
+    app.result = {};
+    app.timeline.clear();
+    app.timeline_max_frame = -1;
+    clear_init_prompts(app);
+
+    fprintf(stderr, "Loading model on device %d: %s\n", (int) app.device_sel,
+            app.params.model_path.c_str());
+    app.model = sam3_load_model(app.params);
+    if (!app.model) {
+        snprintf(app.status, sizeof(app.status),
+                 "Failed to load model on selected device.");
+        return false;
+    }
+    app.state = sam3_create_state(*app.model, app.params);
+    if (!app.state) {
+        snprintf(app.status, sizeof(app.status), "Failed to create state.");
+        return false;
+    }
+
+    app.visual_only = sam3_is_visual_only(*app.model);
+    if (app.visual_only) {
+        auto mt = sam3_get_model_type(*app.model);
+        fprintf(stderr, "Model: %s — text tracking disabled\n",
+                mt == SAM3_MODEL_SAM2 ? "SAM2" : "SAM3 visual-only");
+        app.init_mode = VMODE_BOX;
+    }
+
+    // Re-create the tracker and re-decode the current frame on the new backend
+    if (!app.video_path.empty() && app.video_info.n_frames > 0) {
+        create_tracker(app);
+        if (app.tracker_created) {
+            decode_and_track(app, app.frame_index);
+        } else {
+            app.frame = sam3_decode_video_frame(app.video_path, app.frame_index);
+            app.frame_encoded = false;
+        }
+    }
+
+    snprintf(app.status, sizeof(app.status), "Model reloaded on %s backend.",
+             sam3_backend_name(*app.model));
+    return true;
+}
+
 static void export_frame_masks(const vapp_state& app) {
     for (size_t i = 0; i < app.result.detections.size(); ++i) {
         char path[256];
@@ -373,13 +440,26 @@ int main(int argc, char** argv) {
             app.params.use_gpu = false;
         } else if (strcmp(argv[i], "--encode-img-size") == 0 && i+1 < argc) {
             app.params.encode_img_size = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--device") == 0 && i+1 < argc) {
+            const std::string d = argv[++i];
+            if      (d == "auto")   app.device_sel = SAM3_DEVICE_AUTO;
+            else if (d == "cpu")    app.device_sel = SAM3_DEVICE_CPU;
+            else if (d == "cuda")   app.device_sel = SAM3_DEVICE_CUDA;
+            else if (d == "vulkan") app.device_sel = SAM3_DEVICE_VULKAN;
+            else {
+                fprintf(stderr, "unknown device '%s' (auto|cpu|cuda|vulkan)\n", d.c_str());
+                return 1;
+            }
         } else if (strcmp(argv[i], "--help") == 0) {
             fprintf(stderr,
                 "Usage: %s --model <path.ggml> --video <path>\n"
-                "          [--threads N] [--no-gpu] [--encode-img-size N]\n", argv[0]);
+                "          [--threads N] [--no-gpu] [--encode-img-size N]\n"
+                "          [--device auto|cpu|cuda|vulkan]\n", argv[0]);
             return 0;
         }
     }
+
+    app.params.device = app.device_sel;
 
     if (app.params.model_path.empty()) {
         fprintf(stderr, "Error: --model is required.\n");
@@ -565,6 +645,13 @@ int main(int argc, char** argv) {
             }
         }
 
+        // ── Device switch: reload the model on the newly selected backend ────
+
+        if (app.device_dirty) {
+            app.device_dirty = false;
+            reload_model(app);
+        }
+
         // ── ImGui frame ──────────────────────────────────────────────────────
 
         ImGui_ImplOpenGL3_NewFrame();
@@ -654,6 +741,19 @@ int main(int argc, char** argv) {
                      app.frame_index, app.video_info.n_frames,
                      app.video_info.fps, (int)app.result.detections.size(),
                      app.play_speed);
+
+        // ── Device selector (auto probes CUDA -> Vulkan -> CPU) ─────────────
+        static const char* kDeviceNames[] = {"Auto", "CPU", "CUDA", "Vulkan"};
+        ImGui::Text("Devices:");
+        ImGui::SameLine();
+        int dev_idx = (int) app.device_sel;
+        if (ImGui::Combo("##device", &dev_idx, kDeviceNames, 4)) {
+            app.device_sel = (sam3_device) dev_idx;
+            app.device_dirty = true;
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("Backend: %s",
+                            app.model ? sam3_backend_name(*app.model) : "none");
 
         // ── Video canvas ─────────────────────────────────────────────────────
 
