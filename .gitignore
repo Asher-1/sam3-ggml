@@ -3,11 +3,16 @@
 
 # Build
 build/
+build-*/
 cmake-build-*/
 .cache/
 
+# ggml patch lock file (created by scripts/apply_ggml_patches.sh)
+.ggml-patch.lock
+
 # Models/weights
-models/
+models/*
+!models/README.md
 *.ggml
 *.bin
 *.pt

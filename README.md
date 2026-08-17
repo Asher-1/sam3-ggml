@@ -9,38 +9,45 @@ State-of-the-art image and video segmentation in portable C/C++
 
 ## Why sam3.cpp?
 
-Running Meta's Segment Anything models typically requires Python, PyTorch, and a CUDA GPU. **sam3.cpp** eliminates all of that. It's a single C++ library that runs SAM 2, SAM 2.1, SAM 3, and EdgeTAM inference on CPU and Apple Metal. No Python runtime, no GPU drivers, no heavyweight dependencies. Just compile and segment.
+Running Meta's Segment Anything models typically requires Python, PyTorch, and a CUDA GPU. **sam3.cpp** eliminates all of that. It's a single C++ library that runs SAM 2, SAM 2.1, SAM 3, and EdgeTAM inference on CPU, CUDA, Vulkan and Apple Metal. No Python runtime, no heavyweight dependencies. Just compile and segment.
 
 - **4 model families**: SAM 2, SAM 2.1 (Hiera), SAM 3 (ViT + text detection), EdgeTAM (RepViT, 22x faster than SAM 2 on mobile)
 - **4-bit quantization**: EdgeTAM in **15 MB**, SAM 2.1 Tiny in **22 MB** at ~1 fps on Metal, SAM 3 down to 673 MB
-- **Apple Metal GPU acceleration** for the full backbone and transformer decoder
+- **CUDA / Vulkan / Apple Metal GPU acceleration** for the full backbone and transformer decoder
 - **Text-prompted detection** (SAM 3 only): type `"cat"` and get every cat in the image, no clicks needed
 - **Point/box segmentation + video tracking** with memory bank across all models
 - **Single-file library**: `sam3.cpp` + `sam3.h`, C++14, no exceptions, no inheritance
+- **Standard GGUF model format** — every model loads through `gguf_init_from_file`, the same interface as face-detect-ggml, free-splatter.cpp, OpenPCDet-GGML and the rest of the ggml ecosystem
 - **Zero dependencies** beyond [ggml](https://github.com/ggerganov/ggml) and [stb](https://github.com/nothings/stb)
 
 ## Quick Start
 
 ```bash
 # Clone
+# 1. switch the ggml submodule to the official ggml-org/ggml @ v0.18.1
+#    (the fork URL in .gitmodules is updated; run `git submodule update --init`)
 git clone --recursive https://github.com/PABannier/sam3.cpp
 cd sam3.cpp
 
-# Build (Metal GPU enabled automatically on macOS)
+# Build (GPU backends are opt-in)
 mkdir build && cd build
-cmake ..
+cmake ..                       # CPU only
+cmake .. -DSAM3_CUDA=ON        # + NVIDIA CUDA
+cmake .. -DSAM3_VULKAN=ON      # + Vulkan (AMD/Intel/NVIDIA)
 make -j
 
-# Download a model (SAM 2.1 Tiny, 75 MB)
-# See "Model Zoo" below for all available models and download links
-curl -L -o ../models/sam2.1_hiera_tiny_f16.ggml \
-  https://huggingface.co/PABannier/sam3.cpp/resolve/main/sam2.1_hiera_tiny_f16.ggml
+# Download a model (SAM 2.1 Tiny, 75 MB) — auto-repacked to .gguf
+bash ../scripts/download_models.sh --filter tiny
+# or download + repack manually:
+#   curl -L -o ../models/sam2.1_hiera_tiny_f16.ggml \
+#     https://huggingface.co/PABannier/sam3.cpp/resolve/main/sam2.1_hiera_tiny_f16.ggml
+#   python3 ../scripts/convert_ggml_to_gguf.py ../models/sam2.1_hiera_tiny_f16.ggml
 
 # Segment an image interactively (requires SDL2)
-./examples/sam3_image --model ../models/sam2.1_hiera_tiny_f16.ggml --image ../data/test_image.jpg
+./examples/sam3_image --model ../models/sam2.1_hiera_tiny_f16.gguf --image ../data/test_image.jpg
 
 # Track objects in a video interactively (requires SDL2)
-./examples/sam3_video --model ../models/sam2.1_hiera_tiny_f16.ggml --video ../data/test_video.mp4
+./examples/sam3_video --model ../models/sam2.1_hiera_tiny_f16.gguf --video ../data/test_video.mp4
 ```
 
 The interactive apps use SDL2 + ImGui. If SDL2 isn't found, only the benchmark and quantize tools are built.
@@ -102,6 +109,23 @@ Video object tracking latency on **Apple M4 Pro (24 GB)**, 5 frames at 1008x1008
 | sam2.1_hiera_large_f16 | 430 MB | - | 8.5 | - | 41.4 |
 | sam2.1_hiera_large_q8_0 | 230 MB | - | 7.7 | - | 37.7 |
 
+### CUDA / Vulkan (RTX 3060, Linux)
+
+SAM 2.1 Tiny family, 2 frames at 1024x1024, measured on this repo's CI box.
+CUDA and Vulkan run the full backbone + decoder on the GPU; the reported
+`Track/frame` is the steady-state per-frame cost (encode amortized).
+
+| Model | Size | Track/fr CUDA (ms) | Track/fr Vulkan (ms) | Track/fr CPU (ms) |
+|-------|------|--------------------|----------------------|-------------------|
+| sam2.1_hiera_tiny_f32 | 148 MB | 695 | 883 | 3969 |
+| sam2.1_hiera_tiny_f16 | 75 MB | 651 | 1062 | 4182 |
+| sam2.1_hiera_tiny_q8_0 | 40 MB | 648 | 906 | 4091 |
+| sam2.1_hiera_tiny_q4_0 | 22 MB | 626 | 1003 | 4405 |
+| edgetam_f16 | 27 MB | - | - | 2084 |
+
+CUDA is the fastest backend on NVIDIA hardware; Vulkan offers a vendor-neutral
+alternative (AMD/Intel/NVIDIA) at roughly 1.5x the CUDA latency.
+
 
 <details>
 <summary><b>Reproduce these benchmarks</b></summary>
@@ -126,9 +150,14 @@ Options: `--models-dir <path>`, `--video <path>`, `--n-frames <n>`, `--n-threads
 
 ## Model Zoo
 
-All models are available in GGML format on Hugging Face:
+All models ship in the standard **GGUF** format (the upstream repo publishes
+legacy `.ggml` files; `scripts/download_models.sh` repacks them automatically,
+or use `scripts/convert_ggml_to_gguf.py` on an existing `.ggml` file):
 
 **[PABannier/sam3.cpp](https://huggingface.co/PABannier/sam3.cpp)**: 52 model files covering 4 architectures x multiple sizes x up to 5 precisions.
+
+For per-file sizes, use-case guidance and measured GPU latency of every model
+(including the SAM 3 family), see **[models/README.md](models/README.md)**.
 
 ### SAM 3 (850M params, ViT-32 backbone + text encoder + DETR decoder)
 
@@ -176,6 +205,7 @@ All models are available in GGML format on Hugging Face:
 | Interactive refinement | Yes | Yes | Yes | Yes |
 | Quantization (Q4/Q8) | Yes | Yes | Yes | Yes |
 | Metal GPU | Yes | Yes | Yes | Yes |
+| CUDA / Vulkan GPU | Yes | Yes | Yes | Yes |
 
 ## Building from Source
 
@@ -196,11 +226,42 @@ cmake ..
 make -j
 ```
 
-Metal is enabled automatically on macOS. To disable it:
+By default only the CPU backend is built. Enable the GPU backends you need:
 
 ```bash
-cmake .. -DSAM3_METAL=OFF
+cmake .. -DSAM3_CUDA=ON      # NVIDIA CUDA (needs CUDA toolkit)
+cmake .. -DSAM3_VULKAN=ON    # Vulkan (needs Vulkan SDK; works on AMD/Intel/NVIDIA)
 ```
+
+The backends are additive — you can enable **CUDA + Vulkan + CPU in one build**
+so a single binary can switch backends at runtime. Use the helper script (it
+also auto-detects your GPU's CUDA arch and builds SDL2 from source if the dev
+package is missing):
+
+```bash
+# CPU + CUDA + Vulkan in one binary (build-all/)
+bash scripts/build_multi_backend.sh
+
+# Subsets / options
+bash scripts/build_multi_backend.sh --cuda-only
+bash scripts/build_multi_backend.sh --vulkan-only
+bash scripts/build_multi_backend.sh --cpu-only
+bash scripts/build_multi_backend.sh --jobs 8 --build-dir build-all
+```
+
+The GUI examples (`sam3_image`, `sam3_video`) then expose a **Devices** combo
+(Auto / CPU / CUDA / Vulkan) in the top bar. **Auto** probes the ggml backend
+registry at load time in the order CUDA → Vulkan → CPU and uses the first one
+that initialises. `--device auto|cpu|cuda|vulkan` does the same from the
+command line; the combo re-loads the model onto the selected backend on the
+fly. The `Backend:` label next to it shows which device the model is actually
+running on.
+
+On macOS, Metal is enabled automatically (`SAM3_METAL=OFF` disables it).
+The ggml submodule is pinned to the official `ggml-org/ggml` at v0.18.1; the
+local patches in `ggml-patches/` (CUDA flash-attention head_dim=56, Metal
+head_dim=16/56) are applied automatically by CMake at configure time via
+`scripts/apply_ggml_patches.sh`.
 
 To build tests:
 
@@ -215,10 +276,10 @@ make -j
 
 ```bash
 # Point/box segmentation with any model
-./sam3_image --model models/sam2.1_hiera_tiny_f16.ggml --image photo.jpg
+./sam3_image --model models/sam2.1_hiera_tiny_f16.gguf --image photo.jpg
 
 # Text-prompted detection (SAM 3 only)
-./sam3_image --model models/sam3-f16.ggml --image photo.jpg
+./sam3_image --model models/sam3-f16.gguf --image photo.jpg
 # → Type "cat" in the text field, click [Segment]
 ```
 
@@ -233,10 +294,10 @@ make -j
 
 ```bash
 # Visual tracking (SAM 2/2.1/3/EdgeTAM)
-./sam3_video --model models/sam2.1_hiera_small_f16.ggml --video input.mp4
+./sam3_video --model models/sam2.1_hiera_small_f16.gguf --video input.mp4
 
 # Text-prompted tracking (SAM 3 only)
-./sam3_video --model models/sam3-f16.ggml --video input.mp4
+./sam3_video --model models/sam3-f16.gguf --video input.mp4
 ```
 
 **Controls:**
@@ -252,7 +313,7 @@ make -j
 
 // Load model
 sam3_params params;
-params.model_path = "models/sam2.1_hiera_tiny_f16.ggml";
+params.model_path = "models/sam2.1_hiera_tiny_f16.gguf";
 params.use_gpu    = true;
 params.n_threads  = 4;
 
@@ -313,29 +374,29 @@ sam3_tracker_add_instance_from_mask(*tracker, *state, *model, seed);
 
 ### Quantization
 
-Convert F32/F16 weights to smaller quantized formats:
+Convert F32/F16 weights to smaller quantized formats (standard GGUF in/out):
 
 ```bash
-./sam3_quantize models/sam3-f16.ggml models/sam3-q4_0.ggml q4_0
+./sam3_quantize models/sam3-f16.gguf models/sam3-q4_0.gguf q4_0
 # Supported types: q4_0, q4_1, q8_0
 ```
 
 ## Converting Weights
 
-Convert official PyTorch checkpoints to GGML format:
+Convert official PyTorch checkpoints straight to GGUF:
 
 ```bash
 # SAM 3
 uv run python convert_sam3_to_ggml.py \
     --model sam3.pt \
-    --output models/sam3-f16.ggml \
+    --output models/sam3-f16.gguf \
     --ftype 1 \
     --tokenizer /path/to/tokenizer
 
 # SAM 3 visual-only (no text encoder, smaller file)
 uv run python convert_sam3_to_ggml.py \
     --model sam3.pt \
-    --output models/sam3-visual-f16.ggml \
+    --output models/sam3-visual-f16.gguf \
     --ftype 1 \
     --visual-only
 
@@ -343,17 +404,25 @@ uv run python convert_sam3_to_ggml.py \
 uv run python convert_sam2_to_ggml.py \
     --model sam2.1_hiera_large.pt \
     --config sam2.1_hiera_l.yaml \
-    --output models/sam2.1_hiera_large_f16.ggml \
+    --output models/sam2.1_hiera_large_f16.gguf \
     --ftype 1
 
 # EdgeTAM
 uv run python convert_edgetam_to_ggml.py \
     --model edgetam.pt \
-    --output models/edgetam_f16.ggml \
+    --output models/edgetam_f16.gguf \
     --ftype 1
 ```
 
 `--ftype 0` = float32, `--ftype 1` = float16 (recommended). Then quantize with `sam3_quantize`.
+
+To migrate an existing legacy `.ggml` file (no PyTorch checkpoint needed):
+
+```bash
+python3 scripts/convert_ggml_to_gguf.py models/old_model.ggml models/old_model.gguf
+# or repack every model in a directory:
+python3 scripts/convert_ggml_to_gguf.py --dir models/
+```
 
 ## Acknowledgments
 

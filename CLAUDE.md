@@ -2,7 +2,7 @@
 
 ## Project
 
-sam3.cpp — a C++14 port of Meta's SAM 3 (Segment Anything Model 3) using ggml for inference on CPU and Metal.
+sam3.cpp — a C++14 port of Meta's SAM 3 (Segment Anything Model 3) using ggml for inference on CPU, CUDA, Vulkan and Apple Metal.
 
 ## Architecture
 
@@ -65,6 +65,32 @@ When lost on how to structure the ggml forward pass, how to build graphs, or how
 
 Only: ggml (submodule), stb_image/stb_image_write (vendored in `stb/`), C++14 standard library. Nothing else in the library. SDL2/ImGui are example-only.
 
+## ggml integration (CRITICAL)
+
+The `ggml/` submodule tracks the **official upstream repo** (`https://github.com/ggml-org/ggml`) pinned to tag **v0.18.1**. NEVER edit files inside `ggml/` by hand:
+
+1. Every local change lives as a `git format-patch` file in `ggml-patches/`.
+2. `scripts/apply_ggml_patches.sh` applies them idempotently (safe to re-run).
+3. CMake calls the script automatically at configure time — a fresh clone builds the same patched source without manual steps. The script fails the configure with diagnostics if a patch stops applying (e.g. after an upstream bump), instead of silently building stale code.
+
+To update ggml: bump the submodule tag, then regenerate/adjust the patches against the new tree (`cd ggml && git apply --check ../ggml-patches/*.patch`), and update the pin in this file + README.
+
+Current patch set:
+- `0001-metal-flash-attn-ext-head-dim-16-56.patch` — Metal `flash_attn_ext` kernels for head_dim 16 (SAM2 mask decoder) and 56 (Hiera backbone), which upstream v0.18.1 lacks (its Metal whitelist starts at 32). CUDA/Vulkan are unaffected: sam3's `sam3_attn_ext` wrapper probes `ggml_backend_supports_op` per backend and falls back to manual SDPA where the backend has no kernel.
+- `0002-ggml-cuda-flash-attn-ext-head-dim-56.patch` — CUDA `flash_attn_ext` tile-kernel path for head_dim 56 (Hiera backbone), which upstream routes to an aborting MMA path; adds the `(56,56)` tile config (nbatch_K=56) and excludes 56 from the MMA fast path.
+
+## Model format (GGUF, CRITICAL)
+
+All model files are **standard GGUF v3** — same container the rest of the ggml ecosystem (face-detect-ggml, free-splatter.cpp, OpenPCDet-GGML) loads via `gguf_init_from_file`. There is NO custom binary format anymore; legacy `.ggml` files are migrated with `scripts/convert_ggml_to_gguf.py` (byte-identical tensor data).
+
+Load path in `sam3_load_model`:
+1. `gguf_init_from_file(path, {no_alloc=true, &gguf_ctx})` — metadata + tensor table only, data streamed later so a 5 GB model never sits twice in RAM.
+2. All KV reads go through a single `gguf_kv` reader (err-accumulating, `required` flag) — the same interface as free-splatter.cpp / OpenPCDet-GGML's `model_file`. The standard `general.architecture` key (`sam3`/`sam2`/`edgetam`) dispatches to `sam3_load_hparams` / `sam2_load_hparams`; legacy files with only `sam3.arch` still load (fallback). Every hparam is a `sam3.hparams.<field>` KV (int32 or int32 array).
+3. Tensors are registered as before (register_* macros), then `sam3_load_tensors_from_gguf` streams each blob from `gguf_get_data_offset() + gguf_get_tensor_offset()` and uploads via `ggml_backend_tensor_set`. Registered type wins: file f16→registered f32 etc. is converted on load (1x1 convs are registered F32 even in F16 files); element-count (not per-dim shape) is enforced because legacy files store e.g. `sam_pe.pe_gaussian` as [128,2] while registered as [2,128].
+4. Tokenizer (SAM3 only) comes from `sam3.tokenizer.vocab` (string array indexed by token id) + `sam3.tokenizer.merges` ("a b" strings in rank order).
+
+Writers: `convert_sam3/sam2/edgetam_to_ggml.py` emit GGUF directly (hparams→KV, tokenizer→string-array KV, plus the standard `general.architecture` key; `sam3.arch` is written too for backwards compatibility); `examples/quantize.cpp` is GGUF in/out via `gguf_init_empty` + `gguf_add_tensor` + `gguf_write_to_file` and copies all KV through with `gguf_set_kv`. The quantize decision MUST mirror the register_* macros: quantize when `ne[0] % blk == 0` and the name is not an embedding / not `.bias` / not `norm` (GGUF n_dims cannot distinguish a [256,1] Linear output from a [256] bias). Quantized output goes through a pre-reserved pool — `gguf_set_tensor_data` stores a pointer dereferenced only at write time, so it must never point into a reallocating buffer.
+
 ## Python
 
 `uv` is the package manager. Use `uv run python` for all Python execution (scripts, tests, weight conversion). Never use bare `python` or `pip` — always `uv run python` and `uv pip install`.
@@ -75,11 +101,22 @@ Only: ggml (submodule), stb_image/stb_image_write (vendored in `stb/`), C++14 st
 cd build && cmake .. && make -j$(sysctl -n hw.ncpu)
 ```
 
+Backends are forwarded to ggml via CMake options:
+
+```bash
+cmake .. -DSAM3_CUDA=ON                 # NVIDIA CUDA backend
+cmake .. -DSAM3_VULKAN=ON               # Vulkan backend (needs Vulkan SDK / glslc)
+cmake .. -DSAM3_METAL=OFF               # disable Metal (on by default on macOS)
+cmake .. -DSAM3_HIPBLAS=ON              # AMD HIP backend
+```
+
+The active backend is discovered at runtime through the ggml backend registry (`ggml_backend_dev_by_type(GPU)`), so no sam3 code differs per backend. `sam3_backend_name(model)` reports which one a model actually runs on.
+
 Tests: `cmake .. -DSAM3_BUILD_TESTS=ON`
 
 ## Benchmarking
 
-`sam3_benchmark` tracks an object across video frames and reports latency for every model × backend combination. Each run is forked into a subprocess so a crash does not kill the suite.
+`sam3_benchmark` tracks an object across video frames and reports latency for every model × backend combination (CPU + whichever GPU backend the build includes). Each run is forked into a subprocess so a crash does not kill the suite. The `Backend` column shows the real backend name (CUDA/Vulkan/Metal/CPU), not a guess.
 
 ```bash
 # Full benchmark (all 49 models × Metal + CPU):
@@ -88,7 +125,7 @@ Tests: `cmake .. -DSAM3_BUILD_TESTS=ON`
 # Quick iteration (e.g. testing an optimization) — 4 runs, ~30 s:
 ./build/examples/sam3_benchmark --filter tiny --n-frames 3 --filter-prec f16,q4_0
 
-# Metal only:
+# GPU only (CUDA/Vulkan/Metal, whichever the build has):
 ./build/examples/sam3_benchmark --gpu-only
 
 # CPU only:
@@ -101,7 +138,7 @@ All options:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--models-dir <path>` | `models/` | Directory containing `.ggml` files |
+| `--models-dir <path>` | `models/` | Directory containing `.gguf`/`.ggml` files |
 | `--video <path>` | `data/test_video.mp4` | Video file |
 | `--point-x <f>` | `315.0` | X coordinate of the tracking point |
 | `--point-y <f>` | `250.0` | Y coordinate of the tracking point |
@@ -115,4 +152,4 @@ Output columns: model name, file size, backend, load time, init time (frame 0 en
 
 ## Weights
 
-PyTorch checkpoint → `convert_sam3_to_ggml.py` → `.ggml` binary. The conversion stores every tensor (1465 total). The C++ loader registers all 1465 and reads them via `ggml_backend_tensor_set`.
+PyTorch checkpoint → `convert_sam3_to_ggml.py` → `.gguf` (GGUF v3, standard). The conversion stores every tensor. The C++ loader registers them and streams the blobs into the backend buffer. Quantize with `sam3_quantize <in.gguf> <out.gguf> <q4_0|q4_1|q8_0>`.

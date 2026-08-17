@@ -129,7 +129,7 @@ sam3.cpp/
 
 | Dependency                     | Purpose                                             | Source                          |
 | ------------------------------ | --------------------------------------------------- | ------------------------------- |
-| **ggml**                       | Tensor operations, Metal backend, graph computation | Git submodule (latest `master`) |
+| **ggml**                       | Tensor ops, CUDA/Vulkan/Metal backends, graph computation | Git submodule (`ggml-org/ggml` @ **v0.18.1**) + `ggml-patches/` (applied automatically by CMake via `scripts/apply_ggml_patches.sh`) |
 | **stb_image.h**                | Load PNG/JPEG images                                | Single header, vendored         |
 | **stb_image_write.h**          | Write PNG/JPEG output masks                         | Single header, vendored         |
 | **C++14 std library**          | Smart pointers, containers, algorithms              | System                          |
