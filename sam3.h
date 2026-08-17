@@ -123,10 +123,21 @@ struct sam3_result {
 ** Configuration for model loading, segmentation, and video tracking.
 *****************************************************************************/
 
+// Backend device selection. AUTO probes the ggml backend registry in order
+// (CUDA -> Vulkan -> CPU) and uses the first one that initialises.
+// `use_gpu = false` still forces CPU for backwards compatibility.
+enum sam3_device {
+    SAM3_DEVICE_AUTO   = 0,
+    SAM3_DEVICE_CPU    = 1,
+    SAM3_DEVICE_CUDA   = 2,
+    SAM3_DEVICE_VULKAN = 3,
+};
+
 struct sam3_params {
     std::string model_path;
     int         n_threads       = 4;
     bool        use_gpu         = true;
+    sam3_device device          = SAM3_DEVICE_AUTO;  // explicit device; AUTO picks CUDA->Vulkan->CPU
     int         seed            = 42;
     int         encode_img_size = 0;  // 0 = model default; override input resolution
 };
@@ -222,6 +233,11 @@ SAM3_API bool sam3_is_visual_only(const sam3_model & model);
 
 /* Returns the model type (SAM2 or SAM3). */
 SAM3_API sam3_model_type sam3_get_model_type(const sam3_model & model);
+
+/* Returns the human-readable name of the active inference backend
+** (e.g. "CUDA", "Metal", "Vulkan", "CPU"). Useful for reporting which
+** device a model actually runs on. */
+SAM3_API const char * sam3_backend_name(const sam3_model & model);
 
 /*
 ** ── Inference State ──────────────────────────────────────────────────────
