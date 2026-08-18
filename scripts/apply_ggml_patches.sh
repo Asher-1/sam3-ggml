@@ -8,8 +8,8 @@
 # applied (or verified) by this script, so other developers get the same
 # source state after `git submodule update --init`.
 #
-# Patches live in ggml-patches/ and are applied in filename order (the
-# numeric prefix from `git format-patch` gives us the right ordering).
+# Patch files live in ggml-patches/ and are applied in filename order. The
+# consolidated patch keeps a numeric prefix so discovery is deterministic.
 #
 # Usage:
 #   bash scripts/apply_ggml_patches.sh
@@ -74,6 +74,31 @@ if [[ -z "${SAM3_PATCH_FLOCK_HELD:-}" ]] && command -v flock >/dev/null 2>&1; th
         SCRIPT_PATH="${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")"
         exec flock "${LOCK_FILE}" bash "${SCRIPT_PATH}" "$@"
     fi
+fi
+
+# A later patch may intentionally edit lines introduced by an earlier patch.
+# In that state `git apply --reverse --check earlier.patch` no longer proves
+# that the earlier patch is present. Compare complete tree states first: replay
+# the whole series into a temporary index, then hash the current worktree via a
+# second temporary index. This does not modify the user's real Git index.
+expected_index="$(mktemp "${TMPDIR:-/tmp}/sam3-ggml-expected-index.XXXXXX")"
+actual_index="$(mktemp "${TMPDIR:-/tmp}/sam3-ggml-actual-index.XXXXXX")"
+rm -f "${expected_index}" "${actual_index}"
+trap 'rm -f "${expected_index}" "${actual_index}"' EXIT
+
+GIT_INDEX_FILE="${expected_index}" git read-tree HEAD
+for patch in "${PATCHES[@]}"; do
+    GIT_INDEX_FILE="${expected_index}" git apply --cached "${patch}"
+done
+expected_tree="$(GIT_INDEX_FILE="${expected_index}" git write-tree)"
+
+GIT_INDEX_FILE="${actual_index}" git read-tree HEAD
+GIT_INDEX_FILE="${actual_index}" git add -A -- .
+actual_tree="$(GIT_INDEX_FILE="${actual_index}" git write-tree)"
+
+if [[ "${actual_tree}" == "${expected_tree}" ]]; then
+    echo "ggml patches: applied 0, skipped ${#PATCHES[@]} (final tree verified)"
+    exit 0
 fi
 
 for patch in "${PATCHES[@]}"; do

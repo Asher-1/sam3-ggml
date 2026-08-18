@@ -76,16 +76,6 @@ SAM2_HPARAMS = [
     ("is_sam2_1", 1),
 ]
 
-# Order MUST match edgetam_load_extra_hparams() in sam3.cpp.
-EDGETAM_HPARAMS = [
-    ("repvit_num_stages", 1), ("repvit_stages", 4), ("repvit_channels", 4),
-    ("repvit_se_ratio_x100", 1), ("has_perceiver", 1), ("perceiver_depth", 1),
-    ("perceiver_dim", 1), ("perceiver_n_latents_1d", 1),
-    ("perceiver_n_latents_2d", 1), ("perceiver_ff_mult", 1),
-    ("mem_attn_ca_type", 1), ("mem_attn_ca_q_size", 1),
-    ("mem_attn_ca_k_size", 1),
-]
-
 # .ggml dtype ints ARE GGML_TYPE enum values — verified by sam3_load_tensors()
 # which does `static_cast<ggml_type>(dtype)` and feeds it to ggml_row_size().
 DTYPE_TO_GGML = {
@@ -181,11 +171,9 @@ def convert_file(in_path, out_path):
             hp = read_hparams(fin, SAM3_HPARAMS)
         elif magic == SAM2_MAGIC:
             hp = read_hparams(fin, SAM2_HPARAMS)
-            if hp["backbone_type"] == 2:
-                arch = "edgetam"
-                hp.update(read_hparams(fin, EDGETAM_HPARAMS))
-            else:
-                arch = "sam2"
+            if hp["backbone_type"] != 1:
+                raise ValueError(f"unsupported SAM2 backbone_type={hp['backbone_type']}")
+            arch = "sam2"
         else:
             raise ValueError(f"unknown magic 0x{magic:08x} (not a sam3/sam2 .ggml)")
 

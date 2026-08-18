@@ -67,7 +67,6 @@ enum sam3_model_type {
     SAM3_MODEL_SAM3        = 0,  // Full SAM3 (ViT + detector + tracker)
     SAM3_MODEL_SAM3_VISUAL = 1,  // SAM3 visual-only (ViT + tracker, no text)
     SAM3_MODEL_SAM2        = 2,  // SAM2 (Hiera + tracker, no text/detector)
-    SAM3_MODEL_EDGETAM     = 3,  // EdgeTAM (RepViT + Perceiver, no text/detector)
 };
 
 /*****************************************************************************
@@ -262,6 +261,15 @@ SAM3_API void sam3_free_state(sam3_state & state);
 SAM3_API bool sam3_encode_image(sam3_state       & state,
                        const sam3_model & model,
                        const sam3_image & image);
+
+/*
+** Encode only the image features consumed by point/box segmentation and
+** tracking. For full SAM3 checkpoints this skips the detector neck; use
+** sam3_encode_image() when sam3_segment_pcs() will consume the image.
+*/
+SAM3_API bool sam3_encode_image_pvs(sam3_state       & state,
+                           const sam3_model & model,
+                           const sam3_image & image);
 
 /*
 ** ── Image Segmentation ──────────────────────────────────────────────────
@@ -576,26 +584,3 @@ SAM3_API bool sam3_test_run_vit_block_stage(const sam3_model        & model,
                                    std::vector<float>      & output_data,
                                    int64_t                   output_ne[4],
                                    int                       n_threads = 4);
-
-/*
-** ── Profiling ───────────────────────────────────────────────────────────
-*/
-
-/*
-** Profile the EdgeTAM image encoder (RepViT backbone + FPN neck).
-**
-** Runs the full graph once for a total timing and op summary, then builds
-** and times each stage as a separate sub-graph to produce a per-stage
-** latency breakdown:
-**   - Stem (2 convolutions)
-**   - Stage 0..3 (downsample + RepViT blocks)
-**   - FPN neck (lateral convolutions + top-down fusion)
-**
-** n_warmup iterations are run before n_iter timed iterations.
-** Results are printed to stderr.
-*/
-SAM3_API bool sam3_profile_edgetam_encode(const sam3_model & model,
-                                 const sam3_image & image,
-                                 int                n_threads = 4,
-                                 int                n_warmup  = 2,
-                                 int                n_iter    = 5);

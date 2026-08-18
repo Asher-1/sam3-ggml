@@ -69,15 +69,14 @@ Only: ggml (submodule), stb_image/stb_image_write (vendored in `stb/`), C++14 st
 
 The `ggml/` submodule tracks the **official upstream repo** (`https://github.com/ggml-org/ggml`) pinned to tag **v0.18.1**. NEVER edit files inside `ggml/` by hand:
 
-1. Every local change lives as a `git format-patch` file in `ggml-patches/`.
+1. Every local change lives in the consolidated patch file in `ggml-patches/`.
 2. `scripts/apply_ggml_patches.sh` applies them idempotently (safe to re-run).
 3. CMake calls the script automatically at configure time — a fresh clone builds the same patched source without manual steps. The script fails the configure with diagnostics if a patch stops applying (e.g. after an upstream bump), instead of silently building stale code.
 
-To update ggml: bump the submodule tag, then regenerate/adjust the patches against the new tree (`cd ggml && git apply --check ../ggml-patches/*.patch`), and update the pin in this file + README.
+To update ggml: bump the submodule tag, then regenerate/adjust the consolidated patch against the new tree (`cd ggml && git apply --check ../ggml-patches/0001-sam3-ggml-combined.patch`), and update the pin in this file + README.
 
 Current patch set:
-- `0001-metal-flash-attn-ext-head-dim-16-56.patch` — Metal `flash_attn_ext` kernels for head_dim 16 (SAM2 mask decoder) and 56 (Hiera backbone), which upstream v0.18.1 lacks (its Metal whitelist starts at 32). CUDA/Vulkan are unaffected: sam3's `sam3_attn_ext` wrapper probes `ggml_backend_supports_op` per backend and falls back to manual SDPA where the backend has no kernel.
-- `0002-ggml-cuda-flash-attn-ext-head-dim-56.patch` — CUDA `flash_attn_ext` tile-kernel path for head_dim 56 (Hiera backbone), which upstream routes to an aborting MMA path; adds the `(56,56)` tile config (nbatch_K=56) and excludes 56 from the MMA fast path.
+`0001-sam3-ggml-combined.patch` — the single consolidated patch containing the Metal head-dimension extensions, CUDA flash-attention head-dimension support, CUDA/Vulkan conv2d-transpose fast paths, CUDA F16 matmul output, fused custom-frequency/F16-to-F32 RoPE, native window partition, and fused QKV layout plus Q/K RoPE changes.
 
 ## Model format (GGUF, CRITICAL)
 
@@ -85,11 +84,11 @@ All model files are **standard GGUF v3** — same container the rest of the ggml
 
 Load path in `sam3_load_model`:
 1. `gguf_init_from_file(path, {no_alloc=true, &gguf_ctx})` — metadata + tensor table only, data streamed later so a 5 GB model never sits twice in RAM.
-2. All KV reads go through a single `gguf_kv` reader (err-accumulating, `required` flag) — the same interface as free-splatter.cpp / OpenPCDet-GGML's `model_file`. The standard `general.architecture` key (`sam3`/`sam2`/`edgetam`) dispatches to `sam3_load_hparams` / `sam2_load_hparams`; legacy files with only `sam3.arch` still load (fallback). Every hparam is a `sam3.hparams.<field>` KV (int32 or int32 array).
+2. All KV reads go through a single `gguf_kv` reader (err-accumulating, `required` flag) — the same interface as free-splatter.cpp / OpenPCDet-GGML's `model_file`. The standard `general.architecture` key (`sam3`/`sam2`) dispatches to `sam3_load_hparams` / `sam2_load_hparams`; legacy files with only `sam3.arch` still load (fallback). Every hparam is a `sam3.hparams.<field>` KV (int32 or int32 array).
 3. Tensors are registered as before (register_* macros), then `sam3_load_tensors_from_gguf` streams each blob from `gguf_get_data_offset() + gguf_get_tensor_offset()` and uploads via `ggml_backend_tensor_set`. Registered type wins: file f16→registered f32 etc. is converted on load (1x1 convs are registered F32 even in F16 files); element-count (not per-dim shape) is enforced because legacy files store e.g. `sam_pe.pe_gaussian` as [128,2] while registered as [2,128].
 4. Tokenizer (SAM3 only) comes from `sam3.tokenizer.vocab` (string array indexed by token id) + `sam3.tokenizer.merges` ("a b" strings in rank order).
 
-Writers: `convert_sam3/sam2/edgetam_to_ggml.py` emit GGUF directly (hparams→KV, tokenizer→string-array KV, plus the standard `general.architecture` key; `sam3.arch` is written too for backwards compatibility); `examples/quantize.cpp` is GGUF in/out via `gguf_init_empty` + `gguf_add_tensor` + `gguf_write_to_file` and copies all KV through with `gguf_set_kv`. The quantize decision MUST mirror the register_* macros: quantize when `ne[0] % blk == 0` and the name is not an embedding / not `.bias` / not `norm` (GGUF n_dims cannot distinguish a [256,1] Linear output from a [256] bias). Quantized output goes through a pre-reserved pool — `gguf_set_tensor_data` stores a pointer dereferenced only at write time, so it must never point into a reallocating buffer.
+Writers: `convert_sam3_to_ggml.py` and `convert_sam2_to_ggml.py` emit GGUF directly (hparams→KV, tokenizer→string-array KV, plus the standard `general.architecture` key; `sam3.arch` is written too for backwards compatibility); `examples/quantize.cpp` is GGUF in/out via `gguf_init_empty` + `gguf_add_tensor` + `gguf_write_to_file` and copies all KV through with `gguf_set_kv`. The quantize decision MUST mirror the register_* macros: quantize when `ne[0] % blk == 0` and the name is not an embedding / not `.bias` / not `norm` (GGUF n_dims cannot distinguish a [256,1] Linear output from a [256] bias). Quantized output goes through a pre-reserved pool — `gguf_set_tensor_data` stores a pointer dereferenced only at write time, so it must never point into a reallocating buffer.
 
 ## Python
 

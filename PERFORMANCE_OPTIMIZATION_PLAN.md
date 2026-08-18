@@ -2,9 +2,57 @@
 
 ## 目标
 
-将所有 SAM3 模型加速到超过 PyTorch-CUDA 推理速度。
+先将 SAM3 F16 的 PVS 热推理压到 500-600 ms，并保持自然图像语义精度；
+随后再以同一算子路径推进其他精度和 PCS。
 
 ## 当前状态
+
+### SAM3 PVS 热推理基线（RTX 3060，2026-08-17）
+
+统一口径：`sam3-f16.gguf`、`tests/cat.jpg`、点提示 `(315, 250)`、CUDA、
+1008 输入分辨率，先 warmup 再重复采样；模型加载时间不计入推理时间。
+
+| 实现 | encode p50 | segment p50 | 合计 p50 | 说明 |
+|------|-----------:|------------:|---------:|------|
+| sam3.cpp（原始 F16 热路径） | 829.338 ms | 32.179 ms | **861.517 ms** | 优化前同口径 |
+| sam3.cpp（优化后） | 566.167 ms | 31.925 ms | **598.092 ms** | 2 warmup + 7 repeat |
+| 官方 PyTorch 计算图 | 394.2 ms | 8.2 ms | **402.4 ms** | BF16 autocast；随机权重，仅测性能 |
+
+本机已登录 Hugging Face，但 `facebook/sam3` 门控申请仍在审核；checkpoint
+请求返回 HTTP 403。因此
+PyTorch 行只能代表官方代码、相同张量形状和算子路径的耗时，不能用于精度对比。
+获得权限后运行 `benchmarks/bench_pytorch_sam3.py` 即可测官方权重。
+
+本轮已落地：
+
+- PVS 的高分辨率 tracker feature 改为 GPU 内直接拷贝，避免约 106 MB 的
+  GPU -> CPU -> GPU pageable host staging。
+- detector/tracker 双 neck 共享同一个 20 MiB ViT 布局转换结果。
+- 约 111 MB 的四层 neck PE 改为首次 PCS 时延迟初始化；首次 PVS encode
+  从约 1.20 s 降到约 1.00 s，首次 encode + point decode 约 1.07 s。
+- 新增 `sam3_encode_image_pvs()`，完整 SAM 3 做点/框分割时不再构建 detector
+  neck；原 `sam3_encode_image()` 保持 PCS 所需的完整语义。
+- ViT matmul 中间结果使用 F16，CUDA 上融合自定义频率 RoPE、F16->F32
+  RoPE、window partition 以及 QKV layout + Q/K RoPE，减少中间显存流量和
+  kernel launch。
+- 基准程序同时测 encode/segment 的 warmup、repeat、平均值和 p50。
+
+最终热推理 p50 从 861.517 ms 降到 598.092 ms，降低 30.6%。RTX 3060 会随
+P-state 出现约 590-620 ms 波动，因此性能门槛按热态多次采样的 p50 判断，
+不使用单次最小值。
+
+精度边界不是逐 bit 一致，而是语义输出一致：检测数和 box 相同、score 差值
+不超过 0.001、真实图像 mask IoU 不低于 0.999。
+
+| 输入 | mask IoU（优化前 vs 优化后） | score | box | 结论 |
+|------|------------------------------:|-------|-----|------|
+| `cat.jpg` | 0.999033 | 0.9525 / 0.9527 | 相同 | 通过 |
+| `llama.jpg` | 1.000000 | 0.8100 / 0.8103 | 相同 | 通过 |
+| 随机噪声 | 0.987616 | 0.5075 / 0.4998 | 阈值附近变化 | 仅作数值敏感性记录 |
+
+随机噪声恰好落在决策阈值附近，不代表自然图像精度回退，也不能被写成通过。
+当前剩余差距主要来自 MLP 的独立 bias/activation kernel 与通用 ggml 图调度；
+继续追赶官方 PyTorch 的 402 ms 需要进一步融合 `matmul + bias + activation`。
 
 ### 已完成的工作
 
@@ -23,7 +71,7 @@
 - 清除所有 `GGML_VK_FAST_DEBUG` 和 `GGML_VK_DISABLE_FAST` 代码
 
 **交付物：**
-- 干净的 patch 文件：`ggml-patches/0003-ggml-cuda-vulkan-conv2d-transpose-4-phase-fast-path.patch`
+- 干净的 patch 文件：`ggml-patches/0001-sam3-ggml-combined.patch`
 - 编译验证通过：`build-vulkan/libsam3.so` (909K)
 
 **技术细节：**
@@ -43,12 +91,11 @@ p.nb03 = Cin * Cout; // phase
 
 | 模型 | load ms | encode ms | seg ms | 总计 ms | score |
 |------|--------:|----------:|-------:|--------:|------:|
-| edgetam_f16 | 25 | 324 | 85 | **434** | 0.495 |
 | sam2_hiera_tiny_f16 | 155 | 419 | 105 | **679** | 0.959 |
 | sam2.1_hiera_tiny_q8_0 | 129 | 447 | 108 | **684** | 0.945 |
 | sam2.1_hiera_base_plus_q8_0 | 195 | 541 | 95 | **831** | 0.953 |
 | sam3-visual-f16 | 322 | 921 | 107 | **1350** | 0.953 |
-| sam3-f16 | 750 | 973 | 111 | **1836** | 0.953 |
+| sam3-f16（当前 PVS 路径） | 807 | 566 | 32 | **1405** | 0.953 |
 | sam3-f32 | 1285 | 1494 | 105 | **2884** | 0.953 |
 
 **视频跟踪（test_video.mp4 10 帧，Track/fr 均值，CUDA 后端）：**
@@ -64,7 +111,6 @@ p.nb03 = Cin * Cout; // phase
 **Metal 后端 (Apple M4 Pro)：**
 - SAM 3 f16: 7.7s track/frame
 - SAM 2.1 Tiny f16: 0.8s track/frame
-- EdgeTAM f16: 0.4s track/frame
 
 ## 性能优化路线图
 
@@ -215,12 +261,11 @@ python bench_pytorch_sam2.py --model sam2.1_hiera_large --frames 10
 
 ### 中期目标 (3-6 个月)
 - 所有 SAM 2.1 模型: 超过 PyTorch-CUDA 速度
-- SAM 3: CUDA < 2s/frame (当前约 7-8s)
-- EdgeTAM: 实时性能 (>30 FPS)
+- SAM 3 PVS: CUDA 稳定 < 500 ms（当前热态 p50 约 598 ms）
 
 ### 长期目标 (6-12 个月)
 - SAM 2.1 Tiny: < 100ms/frame
-- SAM 3: < 1s/frame
+- SAM 3: 达到或超过同机官方 PyTorch-CUDA
 - 多 GPU 支持：线性加速比
 
 ## 测试与验证

@@ -9,10 +9,10 @@ State-of-the-art image and video segmentation in portable C/C++
 
 ## Why sam3.cpp?
 
-Running Meta's Segment Anything models typically requires Python, PyTorch, and a CUDA GPU. **sam3.cpp** eliminates all of that. It's a single C++ library that runs SAM 2, SAM 2.1, SAM 3, and EdgeTAM inference on CPU, CUDA, Vulkan and Apple Metal. No Python runtime, no heavyweight dependencies. Just compile and segment.
+Running Meta's Segment Anything models typically requires Python, PyTorch, and a CUDA GPU. **sam3.cpp** eliminates all of that. It's a single C++ library that runs SAM 2, SAM 2.1, and SAM 3 inference on CPU, CUDA, Vulkan and Apple Metal. No Python runtime, no heavyweight dependencies. Just compile and segment.
 
-- **4 model families**: SAM 2, SAM 2.1 (Hiera), SAM 3 (ViT + text detection), EdgeTAM (RepViT, 22x faster than SAM 2 on mobile)
-- **4-bit quantization**: EdgeTAM in **15 MB**, SAM 2.1 Tiny in **22 MB** at ~1 fps on Metal, SAM 3 down to 673 MB
+- **3 supported releases**: SAM 2, SAM 2.1 (Hiera), and SAM 3 (ViT + text detection)
+- **4-bit quantization**: SAM 2.1 Tiny in **22 MB** at ~1 fps on Metal, SAM 3 down to 673 MB
 - **CUDA / Vulkan / Apple Metal GPU acceleration** for the full backbone and transformer decoder
 - **Text-prompted detection** (SAM 3 only): type `"cat"` and get every cat in the image, no clicks needed
 - **Point/box segmentation + video tracking** with memory bank across all models
@@ -75,14 +75,6 @@ Video object tracking latency on **Apple M4 Pro (24 GB)**, 5 frames at 1008x1008
 | sam3-visual-q4_1 | 318 MB | - | 23.1 | - | 113.9 |
 | sam3-visual-q4_0 | 275 MB | **6.7** | 22.3 | 33.0 | 110.0 |
 
-### EdgeTAM (RepViT backbone + Perceiver)
-
-| Model | Size | Track/frame Metal (s) | Track/frame CPU (s) | Total Metal (s) | Total CPU (s) |
-|-------|------|-----------------------|---------------------|-----------------|---------------|
-| edgetam_f16 | 27 MB | **0.4** | 1.1 | 2.2 | 5.2 |
-| edgetam_q8_0 | 19 MB | **0.4** | 1.1 | 2.1 | 5.1 |
-| edgetam_q4_0 | 15 MB | **0.4** | 1.1 | 2.1 | 5.1 |
-
 ### SAM 2 / SAM 2.1 (Hiera backbone)
 
 | Model | Size | Track/frame Metal (s) | Track/frame CPU (s) | Total Metal (s) | Total CPU (s) |
@@ -121,10 +113,22 @@ CUDA and Vulkan run the full backbone + decoder on the GPU; the reported
 | sam2.1_hiera_tiny_f16 | 75 MB | 651 | 1062 | 4182 |
 | sam2.1_hiera_tiny_q8_0 | 40 MB | 648 | 906 | 4091 |
 | sam2.1_hiera_tiny_q4_0 | 22 MB | 626 | 1003 | 4405 |
-| edgetam_f16 | 27 MB | - | - | 2084 |
 
 CUDA is the fastest backend on NVIDIA hardware; Vulkan offers a vendor-neutral
 alternative (AMD/Intel/NVIDIA) at roughly 1.5x the CUDA latency.
+
+### SAM 3 PVS CUDA latency (RTX 3060, Linux)
+
+Full `sam3-f16.gguf`, 1008x1008 input, point `(315,250)` on `tests/cat.jpg`,
+2 warmups followed by 7 timed runs. Model loading is excluded.
+
+| Encode p50 | Segment p50 | Inference p50 | Mask score |
+|-----------:|------------:|--------------:|-----------:|
+| 566.167 ms | 31.925 ms | **598.092 ms** | 0.9527 |
+
+Point/box-only callers should use `sam3_encode_image_pvs()`. It skips the
+detector neck for full SAM 3 checkpoints while keeping the visual features
+consumed by PVS and tracking unchanged.
 
 
 <details>
@@ -154,7 +158,8 @@ All models ship in the standard **GGUF** format (the upstream repo publishes
 legacy `.ggml` files; `scripts/download_models.sh` repacks them automatically,
 or use `scripts/convert_ggml_to_gguf.py` on an existing `.ggml` file):
 
-**[PABannier/sam3.cpp](https://huggingface.co/PABannier/sam3.cpp)**: 52 model files covering 4 architectures x multiple sizes x up to 5 precisions.
+The supported model set contains 49 GGUF variants across the SAM 2 and SAM 3
+architectures, with multiple sizes and up to five precisions.
 
 For per-file sizes, use-case guidance and measured GPU latency of every model
 (including the SAM 3 family), see **[models/README.md](models/README.md)**.
@@ -186,26 +191,18 @@ For per-file sizes, use-case guidance and measured GPU latency of every model
 | SAM 2.1 | Base+ | 81M | 323 MB | 163 MB | 88 MB | 53 MB | 48 MB |
 | SAM 2.1 | Large | 224M | 898 MB | 451 MB | 241 MB | 144 MB | 130 MB |
 
-### EdgeTAM (RepViT-M1 backbone + Perceiver memory compressor)
-
-| Variant | Precision | Size | Features |
-|---------|-----------|------|----------|
-| edgetam | f16 | 27 MB | Point/box segmentation (PVS) + video tracking |
-| edgetam | q8_0 | 19 MB | Same |
-| edgetam | q4_0 | 15 MB | Same |
-
 ### Feature Matrix
 
-| Capability | SAM 3 | SAM 3 Visual | SAM 2 / 2.1 | EdgeTAM |
-|-----------|-------|-------------|-------------|---------|
-| Text-prompted detection (PCS) | Yes | - | - | - |
-| Point/box segmentation (PVS) | Yes | Yes | Yes | Yes |
-| Multi-mask output | Yes | Yes | Yes | Yes |
-| Video tracking (memory bank) | Yes | Yes | Yes | Yes |
-| Interactive refinement | Yes | Yes | Yes | Yes |
-| Quantization (Q4/Q8) | Yes | Yes | Yes | Yes |
-| Metal GPU | Yes | Yes | Yes | Yes |
-| CUDA / Vulkan GPU | Yes | Yes | Yes | Yes |
+| Capability | SAM 3 | SAM 3 Visual | SAM 2 / 2.1 |
+|-----------|-------|-------------|-------------|
+| Text-prompted detection (PCS) | Yes | - | - |
+| Point/box segmentation (PVS) | Yes | Yes | Yes |
+| Multi-mask output | Yes | Yes | Yes |
+| Video tracking (memory bank) | Yes | Yes | Yes |
+| Interactive refinement | Yes | Yes | Yes |
+| Quantization (Q4/Q8) | Yes | Yes | Yes |
+| Metal GPU | Yes | Yes | Yes |
+| CUDA / Vulkan GPU | Yes | Yes | Yes |
 
 ## Building from Source
 
@@ -259,8 +256,8 @@ running on.
 
 On macOS, Metal is enabled automatically (`SAM3_METAL=OFF` disables it).
 The ggml submodule is pinned to the official `ggml-org/ggml` at v0.18.1; the
-local patches in `ggml-patches/` (CUDA flash-attention head_dim=56, Metal
-head_dim=16/56) are applied automatically by CMake at configure time via
+local patches in `ggml-patches/` (Metal/CUDA attention support plus CUDA
+F16 matmul output, fused RoPE/window layout and fused QKV layout+RoPE) are applied automatically by CMake at configure time via
 `scripts/apply_ggml_patches.sh`.
 
 To build tests:
@@ -293,7 +290,7 @@ make -j
 ### Video Tracking (Interactive GUI)
 
 ```bash
-# Visual tracking (SAM 2/2.1/3/EdgeTAM)
+# Visual tracking (SAM 2/2.1/3)
 ./sam3_video --model models/sam2.1_hiera_small_f16.gguf --video input.mp4
 
 # Text-prompted tracking (SAM 3 only)
@@ -320,9 +317,9 @@ params.n_threads  = 4;
 auto model = sam3_load_model(params);
 auto state = sam3_create_state(*model, params);
 
-// Encode image (call once, reuse for multiple prompts)
+// Encode PVS/tracking features (call once, reuse for multiple prompts)
 auto image = sam3_load_image("photo.jpg");
-sam3_encode_image(*state, *model, image);
+sam3_encode_image_pvs(*state, *model, image);
 
 // Segment with a point click
 sam3_pvs_params pvs;
@@ -407,11 +404,6 @@ uv run python convert_sam2_to_ggml.py \
     --output models/sam2.1_hiera_large_f16.gguf \
     --ftype 1
 
-# EdgeTAM
-uv run python convert_edgetam_to_ggml.py \
-    --model edgetam.pt \
-    --output models/edgetam_f16.gguf \
-    --ftype 1
 ```
 
 `--ftype 0` = float32, `--ftype 1` = float16 (recommended). Then quantize with `sam3_quantize`.
@@ -426,7 +418,7 @@ python3 scripts/convert_ggml_to_gguf.py --dir models/
 
 ## Acknowledgments
 
-- [Meta AI Research](https://github.com/facebookresearch) for SAM, SAM 2, SAM 3, and EdgeTAM
+- [Meta AI Research](https://github.com/facebookresearch) for SAM, SAM 2, and SAM 3
 - [ggml](https://github.com/ggerganov/ggml), the tensor computation library that makes this possible
 - [sam.cpp](https://github.com/YavorGIvanov/sam.cpp), the original SAM 1 C++ port that inspired this project's architecture
 

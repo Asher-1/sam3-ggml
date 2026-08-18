@@ -2,8 +2,8 @@
 #
 # download_models.sh
 #
-# Download every model of the sam3.cpp Hugging Face repo into the local
-# models/ directory, then repack each legacy .ggml file into the standard
+# Download every supported SAM2/SAM3 model of the sam3.cpp Hugging Face repo
+# into the local models/ directory, then repack each legacy .ggml file into the standard
 # .gguf format (scripts/convert_ggml_to_gguf.py) and delete the .ggml source.
 # The file list is fetched live from the HF API so the script never goes
 # stale when new models are published.
@@ -54,7 +54,7 @@ import json, sys
 d = json.load(sys.stdin)
 for s in d.get("siblings", []):
     n = s["rfilename"]
-    if n.endswith(".ggml"):
+    if n.endswith(".ggml") and (n.startswith("sam2") or n.startswith("sam3")):
         print(n)
 ')"
 
