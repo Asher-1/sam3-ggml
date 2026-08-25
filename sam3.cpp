@@ -3508,6 +3508,14 @@ static bool sam3_fattn_hd_supported(ggml_backend_t backend, int64_t hd) {
         return false;
     }
 
+    // CUDA flash-attention offers only the generic TILE kernel for head_dim=32
+    // (MMA/VEC kernels exclude it), which is pathologically slow for the small
+    // query counts used here (geometry/fusion encoders). Route it to manual
+    // SDPA, which is an order of magnitude faster in practice.
+    if (hd == 32) {
+        return false;
+    }
+
     struct probe_cache {
         ggml_backend_t backend;
         bool tested[4097];
@@ -3556,7 +3564,12 @@ static struct ggml_tensor* sam3_attn_ext(
     float                max_bias,
     float                logit_softcap)
 {
-    if (sam3_fattn_hd_supported(g_sam3_backend, Q->ne[0])) {
+    // CUDA FA aborts on masks whose ne[2] != 1 (e.g. PCS per-head masks
+    // [n_kv, n_q, n_heads, B]); the supports_op probe uses no mask, so it can
+    // report "supported" and then abort at graph compute. Route such masks to
+    // the manual SDPA path, which handles arbitrary mask shapes.
+    const bool mask_compat = (mask == nullptr) || (mask->ne[2] == 1);
+    if (mask_compat && sam3_fattn_hd_supported(g_sam3_backend, Q->ne[0])) {
         return ggml_flash_attn_ext(ctx, Q, K, V, mask, scale, max_bias, logit_softcap);
     }
 
@@ -6715,7 +6728,8 @@ static std::vector<float> sam3_precompute_geom_input(
     const sam3_model& model,
     const sam3_pcs_params& params,
     const float* img_feats_data,  // [D, W, H] ggml-layout backbone features (nullable if no boxes)
-    int W_feat, int H_feat) {
+    int W_feat, int H_feat,
+    float img_w, float img_h) {   // original image size in pixels (for normalization)
     const auto& ge = model.geom_enc;
     const int D = model.hparams.neck_dim;  // 256
     const int roi_size = 7;
@@ -6728,18 +6742,21 @@ static std::vector<float> sam3_precompute_geom_input(
     };
     std::vector<box_info> boxes;
     for (const auto& b : params.pos_exemplars) {
-        // API provides XYXY in original image space — convert to normalized CxCyWH [0,1]
-        float cx = (b.x0 + b.x1) * 0.5f;
-        float cy = (b.y0 + b.y1) * 0.5f;
-        float bw = b.x1 - b.x0;
-        float bh = b.y1 - b.y0;
+        // API provides XYXY in original image space — convert to normalized
+        // CxCyWH [0,1] (the ROI-align feature scaling below assumes
+        // normalized box coordinates; unnormalized pixel values would blow
+        // up the sampling count by ~(img_size)^2 and hang on CPU).
+        float cx = ((b.x0 + b.x1) * 0.5f) / img_w;
+        float cy = ((b.y0 + b.y1) * 0.5f) / img_h;
+        float bw = (b.x1 - b.x0) / img_w;
+        float bh = (b.y1 - b.y0) / img_h;
         boxes.push_back({cx, cy, bw, bh, 0});  // label 0 = positive
     }
     for (const auto& b : params.neg_exemplars) {
-        float cx = (b.x0 + b.x1) * 0.5f;
-        float cy = (b.y0 + b.y1) * 0.5f;
-        float bw = b.x1 - b.x0;
-        float bh = b.y1 - b.y0;
+        float cx = ((b.x0 + b.x1) * 0.5f) / img_w;
+        float cy = ((b.y0 + b.y1) * 0.5f) / img_h;
+        float bw = (b.x1 - b.x0) / img_w;
+        float bh = (b.y1 - b.y0) / img_h;
         boxes.push_back({cx, cy, bw, bh, 1});  // label 1 = negative
     }
 
@@ -8728,6 +8745,7 @@ sam3_result sam3_segment_pcs(sam3_state& state,
     */
     std::vector<float> geo_feats_cpu(D * N_geo);
     {
+        SAM3_LOG(2, "%s: geom: building graph...\n", __func__);
         const size_t sz = ggml_tensor_overhead() * 4096 + ggml_graph_overhead() * 2;
         struct ggml_init_params gp = {sz, nullptr, true};
         auto* ctx = ggml_init(gp);
@@ -8745,6 +8763,7 @@ sam3_result sam3_segment_pcs(sam3_state& state,
         auto* graph = ggml_new_graph_custom(ctx, 4096, false);
         ggml_build_forward_expand(graph, gr.geo_feats);
 
+        SAM3_LOG(2, "%s: geom: reserving...\n", __func__);
         auto* alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
         if (!ggml_gallocr_reserve(alloc, graph) || !ggml_gallocr_alloc_graph(alloc, graph)) {
             fprintf(stderr, "%s: geometry encoder alloc failed\n", __func__);
@@ -8753,13 +8772,16 @@ sam3_result sam3_segment_pcs(sam3_state& state,
             return result;
         }
 
+        // Upload image features + PE to GPU
         ggml_backend_tensor_set(g_img, img_feats_cpu.data(), 0, D * N_spatial * sizeof(float));
         ggml_backend_tensor_set(g_pe, img_pe_cpu.data(), 0, D * N_spatial * sizeof(float));
 
         // Pre-transformer input (CLS + optional box embeddings)
         {
             const float* feats_ptr = n_boxes > 0 ? img_feats_cpu.data() : nullptr;
-            auto geom_data = sam3_precompute_geom_input(model, params, feats_ptr, H, H);
+            auto geom_data = sam3_precompute_geom_input(model, params, feats_ptr, H, H,
+                                                        (float)state.orig_width,
+                                                        (float)state.orig_height);
             auto* gi = ggml_get_tensor(ctx, "geom_post_final_proj");
             if (gi) ggml_backend_tensor_set(gi, geom_data.data(), 0, geom_data.size() * sizeof(float));
         }
@@ -12882,7 +12904,8 @@ bool sam3_test_dump_geom_enc(const sam3_model& model,
     ggml_backend_tensor_set(img_pe_t, img_pe_ggml.data(), 0, D * H * H * sizeof(float));
 
     // Pre-compute geometry input on CPU and upload
-    auto geom_data = sam3_precompute_geom_input(model, params, neck_det_2_ggml.data(), H, H);
+    // (test reference boxes are already normalized, so pass 1.0 scale)
+    auto geom_data = sam3_precompute_geom_input(model, params, neck_det_2_ggml.data(), H, H, 1.0f, 1.0f);
     auto* gi = ggml_get_tensor(ctx0, "geom_post_final_proj");
     if (gi) {
         ggml_backend_tensor_set(gi, geom_data.data(), 0, geom_data.size() * sizeof(float));
