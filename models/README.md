@@ -21,6 +21,29 @@ Each file name encodes three things:
 > (points/box + tracking); **SAM 3 full adds text-prompted detection (PCS)**:
 > type `"cat"` and get every cat in the image.
 
+## Download
+
+All checkpoints listed in this README are published as ready-to-run **GGUF**
+files on Hugging Face — no PyTorch weights or conversion step needed:
+
+> **https://huggingface.co/Asher-1/sam3-gguf**
+
+The repo mirrors this directory 1:1 (40 files, ~14 GB total).
+
+```bash
+# All 40 models into models/
+huggingface-cli download Asher-1/sam3-gguf --local-dir models
+
+# Or just one file
+huggingface-cli download Asher-1/sam3-gguf sam3-f16.gguf --local-dir models
+
+# Or plain curl (single-file direct URL)
+curl -L -o models/sam3-f16.gguf \
+  https://huggingface.co/Asher-1/sam3-gguf/resolve/main/sam3-f16.gguf
+```
+
+(`huggingface-cli` comes from `pip install huggingface_hub`.)
+
 ## Quick pick
 
 | You want… | Pick |
