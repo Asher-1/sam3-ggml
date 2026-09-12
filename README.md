@@ -24,7 +24,7 @@ Running Meta's Segment Anything models typically requires Python, PyTorch, and a
 
 ```bash
 # Clone
-# 1. switch the ggml submodule to the official ggml-org/ggml @ v0.18.1
+# 1. switch the ggml submodule to the official ggml-org/ggml @ v0.21.0
 #    (the fork URL in .gitmodules is updated; run `git submodule update --init`)
 git clone --recursive https://github.com/PABannier/sam3.cpp
 cd sam3.cpp
@@ -255,7 +255,7 @@ fly. The `Backend:` label next to it shows which device the model is actually
 running on.
 
 On macOS, Metal is enabled automatically (`SAM3_METAL=OFF` disables it).
-The ggml submodule is pinned to the official `ggml-org/ggml` at v0.18.1; the
+The ggml submodule is pinned to the official `ggml-org/ggml` at v0.21.0; the
 local patches in `ggml-patches/` (Metal/CUDA attention support plus CUDA
 F16 matmul output, fused RoPE/window layout and fused QKV layout+RoPE) are applied automatically by CMake at configure time via
 `scripts/apply_ggml_patches.sh`.

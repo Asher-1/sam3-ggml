@@ -67,7 +67,7 @@ Only: ggml (submodule), stb_image/stb_image_write (vendored in `stb/`), C++14 st
 
 ## ggml integration (CRITICAL)
 
-The `ggml/` submodule tracks the **official upstream repo** (`https://github.com/ggml-org/ggml`) pinned to tag **v0.18.1**. NEVER edit files inside `ggml/` by hand:
+The `ggml/` submodule tracks the **official upstream repo** (`https://github.com/ggml-org/ggml`) pinned to tag **v0.21.0**. NEVER edit files inside `ggml/` by hand:
 
 1. Every local change lives in the consolidated patch file in `ggml-patches/`.
 2. `scripts/apply_ggml_patches.sh` applies them idempotently (safe to re-run).
