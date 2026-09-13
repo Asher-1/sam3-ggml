@@ -154,9 +154,18 @@ Options: `--models-dir <path>`, `--video <path>`, `--n-frames <n>`, `--n-threads
 
 ## Model Zoo
 
-All models ship in the standard **GGUF** format (the upstream repo publishes
-legacy `.ggml` files; `scripts/download_models.sh` repacks them automatically,
-or use `scripts/convert_ggml_to_gguf.py` on an existing `.ggml` file):
+All models ship in the standard **GGUF** format. The SAM 3 family (text-prompted
+PCS + tracking) is published ready-to-run on
+**[huggingface.co/Asher-1/sam3-gguf](https://huggingface.co/Asher-1/sam3-gguf)**
+— download straight from there (see [models/README.md](models/README.md)).
+The legacy upstream repo (PABannier/sam3.cpp, `.ggml` +
+`scripts/download_models.sh` repack, or `scripts/convert_ggml_to_gguf.py`) also
+serves SAM 2 variants; note its SAM 3 `.ggml` files predate the tokenizer merge
+table fix (6 `#`-first merges missing) and the tracker-alignment hparams —
+prefer the Asher-1 GGUFs, or run `scripts/fix_gguf_merges.py` on repacked ones.
+For converting from the original `sam3.pt`, use
+`scripts/download_model.sh` (fetches the official BPE vocab from GitHub and
+embeds the complete tokenizer via `--bpe-gz`).
 
 The supported model set contains 49 GGUF variants across the SAM 2 and SAM 3
 architectures, with multiple sizes and up to five precisions.
@@ -200,6 +209,13 @@ For per-file sizes, use-case guidance and measured GPU latency of every model
 | Multi-mask output | Yes | Yes | Yes |
 | Video tracking (memory bank) | Yes | Yes | Yes |
 | Interactive refinement | Yes | Yes | Yes |
+| Offline result visualization (PNG) | Yes | Yes | Yes |
+| IoM mask dedup (agent-aligned) | Yes | Yes | Yes |
+| Soft mask logits output (opt-in) | Yes | Yes | Yes |
+| Image mask prompt (SAM1-task style) | - | Yes | Yes |
+| Session edit: remove tracked instance | - | Yes | Yes |
+| Session edit: rewind to earlier frame | - | Yes | Yes |
+| Session edit: clear frame prompt | - | Yes | Yes |
 | Quantization (Q4/Q8) | Yes | Yes | Yes |
 | Metal GPU | Yes | Yes | Yes |
 | CUDA / Vulkan GPU | Yes | Yes | Yes |
@@ -355,6 +371,15 @@ for (int f = 1; f < n_frames; f++) {
     sam3_result result = sam3_propagate_frame(*tracker, *state, *model, frames[f]);
     // result.detections[i].mask - tracked mask for each instance
 }
+
+// Reverse propagation (official propagate_in_video(reverse=True) alignment):
+// walks decreasing frame indices, never re-processes the prompt frame
+// (official range(start-1, ..., -1)), and is rejected at frame 0. Memory and
+// object pointers on the reverse side participate with tracking-order
+// temporal positions. Pass the frame whose index equals
+// (tracker.frame_index - 1).
+sam3_result back = sam3_propagate_frame(*tracker, *state, *model, frames[f - 1],
+                                       /*reverse=*/true);
 ```
 
 ```cpp
@@ -367,7 +392,92 @@ sam3_encode_image(*state, *model, frame0);
 sam3_mask seed = /* 0/255 binary mask, any resolution */;
 sam3_tracker_add_instance_from_mask(*tracker, *state, *model, seed);
 // then sam3_propagate_frame(...) on subsequent frames as above
+
+// Session editing: drop a mis-detected / stale instance by ID (official
+// remove_object alignment). Propagation skips it from the next frame on.
+sam3_tracker_remove_instance(*tracker, instance_id);
+
+// Rewind to an earlier frame to add a prompt there (official
+// add_prompt-at-earlier-frame + propagate_in_video(start_frame_idx=...)
+// alignment): memory recorded after that frame is dropped, instances that
+// first appeared after it are removed. Then re-prompt and replay frames.
+sam3_tracker_rewind(*tracker, frame_index);
+sam3_tracker_add_instance(*tracker, *state, *model, pvs);
+// ... sam3_propagate_frame(...) from frame_index onward
+
+// Clear one instance's prompt/conditioning at one frame (official
+// clear_all_points_in_frame alignment).
+sam3_tracker_clear_instance_frame(*tracker, instance_id, frame_index);
 ```
+
+```cpp
+// Batch image inference (official Sam3Processor::set_image_batch alignment):
+// encode a batch once, then query it with one text prompt. Results are
+// per-image and identical to encode-and-query-each separately (the detector
+// attends within each image only). SAM3 full checkpoints only.
+sam3_image imgs[2] = {img_a, img_b};
+sam3_encode_image_batch(*state, *model, imgs, 2);
+sam3_result results[2];
+sam3_segment_pcs_batch(*state, *model, pcs, results, 2);
+```
+
+#### Numerical alignment notes
+
+The tracker mirrors the official SAM3 video predictor's memory behavior:
+conditioning frames are selected with the official `select_closest_cond_frames`
+cap (4), non-conditioning memory and object pointers only participate from the
+tracking-order past side, and (SAM3 default, `use_memory_selection=1`) memory
+frames are filtered per frame by the official `frame_filter` (`eff_iou_score >
+0.01` plus the must-include adjacent frame). Pre-alignment checkpoints are
+repaired in place by `scripts/fix_gguf_merges.py` (merge table + these
+hparams; idempotent).
+
+### Offline Visualization (no GUI required)
+
+`sam3_vis` runs segmentation and renders the official-style full-scene PNG:
+per-instance colored mask overlay + box outlines + `id score` labels.
+
+```bash
+# Text-prompted detection (SAM 3)
+./examples/sam3_vis --model models/sam3-f16.gguf --image photo.jpg \
+    --prompt "cat" --out vis.png
+
+# Point/box segmentation (any model)
+./examples/sam3_vis --model models/sam2.1_hiera_tiny_f16.gguf \
+    --image photo.jpg --point 320,240 --out vis.png
+
+# Optional greedy IoM mask dedup (official agent default 0.3)
+./examples/sam3_vis --model models/sam3-f16.gguf --image photo.jpg \
+    --prompt "cat" --iom 0.3 --out vis.png
+
+# Video: render every tracked frame to vis_frames/frame_XXXXX.png
+./examples/sam3_vis --model models/sam3-f16.gguf --video input.mp4 \
+    --prompt "cat"
+```
+
+The same rendering primitives are exposed in the C++ API
+(`sam3_render_result`, `sam3_overlay_mask`, `sam3_draw_box`,
+`sam3_save_image`, `sam3_remove_overlapping_masks` in `sam3.h`).
+
+### Mask Prompt & Soft Logits (API)
+
+```cpp
+// Iterative refinement (SAM 1-task style): feed a previous prediction back.
+sam3_pvs_params p1 = p0;
+p1.return_logits = true;                      // get raw logits per detection
+sam3_result r1 = sam3_segment_pvs(*state, *model, p1);
+
+sam3_pvs_params p2 = p0;                       // same point prompt
+p2.use_mask_prompt = true;                     // low-res mask prompt branch
+p2.mask_prompt = r1.detections[0].mask;        // binary 0/255 convenience input
+// or: sam3_resize_mask_logits(logits, w, h, low, 256, 256);
+//     p2.mask_prompt_logits.assign(low, low + 256*256);  // official raw-logits path
+sam3_result r2 = sam3_segment_pvs(*state, *model, p2);
+```
+
+`ggml_upgrade_ab.sh` now A/B-fingerprints the PCS (text detection) and
+video-tracking paths in addition to PVS, so future ggml upgrades verify every
+inference path bit-for-bit, not just point prompts.
 
 ### Quantization
 

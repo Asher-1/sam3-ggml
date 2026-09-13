@@ -62,6 +62,11 @@ HPARAMS_FIELDS = [
     ("mem_attn_layers",          4),
     ("num_maskmem",              7),
     ("max_obj_ptrs",            16),
+    # Official tracker conditioning-frame cap (select_closest_cond_frames)
+    ("max_cond_frames_in_attn",     4),
+    # Official memory selection (apply_temporal_disambiguation, default on)
+    ("use_memory_selection",        1),
+    ("mf_threshold_x100",           1),
     ("n_amb_experts",            2),
     ("visual_only",              0),
 ]
@@ -204,8 +209,51 @@ def rename_key(k: str) -> str | None:
 # KVs, and every tensor into the GGUF tensor table — the same layout the other
 # ggml projects (face-detect-ggml, free-splatter.cpp, OpenPCDet-GGML) load via
 # gguf_init_from_file.
+def load_tokenizer_from_bpe_gz(gz_path: str):
+    """Build (vocab_list, merge_rows) exactly like the official SimpleTokenizer
+    (sam3/model/tokenizer_ve.py __init__): bytes_to_unicode vocab + merges +
+    2 special tokens. This is the authoritative tokenizer source — the
+    facebook/sam3 HF repo is gated, while this asset is public on GitHub
+    (facebookresearch/sam3, sam3/assets/bpe_simple_vocab_16e6.txt.gz)."""
+    import gzip
+
+    def bytes_to_unicode():
+        bs = (list(range(ord("!"), ord("~") + 1))
+              + list(range(ord("\u00a1"), ord("\u00ac") + 1))
+              + list(range(ord("\u00ae"), ord("\u00ff") + 1)))
+        cs = bs[:]
+        n = 0
+        for b in range(2 ** 8):
+            if b not in bs:
+                bs.append(b)
+                cs.append(2 ** 8 + n)
+                n += 1
+        return dict(zip(bs, [chr(c) for c in cs]))
+
+    with gzip.open(gz_path, "rb") as fh:
+        lines = fh.read().decode("utf-8").split("\n")
+    # Official slice: skip line 0 (file header), take 49152-256-2 rows.
+    merges = lines[1 : 49152 - 256 - 2 + 1]
+    vocab = list(bytes_to_unicode().values())
+    vocab = vocab + [v + "</w>" for v in vocab]
+    merge_rows = []
+    for m in merges:
+        parts = m.split()
+        if len(parts) != 2:
+            continue
+        vocab.append(parts[0] + parts[1])
+        merge_rows.append(f"{parts[0]} {parts[1]}")
+    # CLIP-style special token names, matching the tokens shipped in the
+    # existing checkpoints. Only the ids matter at runtime (the C++ loader
+    # hardcodes sot=49406/eot=49407 and these strings never appear in input),
+    # but keeping them identical makes re-converted files KV-equal to the
+    # shipped ones.
+    vocab.extend(["<|startoftext|>", "<|endoftext|>"])
+    return vocab, merge_rows
+
+
 def write_gguf(path: str, ftype: int, renamed: dict, visual_only: bool,
-               tokenizer_dir: str):
+               tokenizer_dir: str, bpe_gz: str = None):
     import sys as _sys
     import os as _os
     _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "scripts"))
@@ -250,22 +298,39 @@ def write_gguf(path: str, ftype: int, renamed: dict, visual_only: bool,
 
     # Tokenizer → string-array KV (vocab indexed by token id, merges as "a b")
     if not visual_only:
-        import json
-        with open(os.path.join(tokenizer_dir, "vocab.json"), "r", encoding="utf-8") as f:
-            vocab = json.load(f)
-        merges = []
-        with open(os.path.join(tokenizer_dir, "merges.txt"), "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.rstrip("\n")
-                if line.startswith("#") or not line:
-                    continue
-                parts = line.split(" ", 1)
-                if len(parts) == 2:
-                    merges.append(f"{parts[0]} {parts[1]}")
-        w.add_arr_str("sam3.tokenizer.vocab",
-                      [t for _, t in sorted(vocab.items(), key=lambda x: x[1])])
-        w.add_arr_str("sam3.tokenizer.merges", merges)
-        print(f"Embedded tokenizer: {len(vocab)} vocab entries, {len(merges)} merges")
+        if bpe_gz:
+            # Authoritative path: build the tokenizer straight from the
+            # official bpe_simple_vocab file (same slice the official
+            # SimpleTokenizer takes, so all 48894 merges land in the file,
+            # including the 6 that start with '#').
+            vocab_list, merges = load_tokenizer_from_bpe_gz(bpe_gz)
+            w.add_arr_str("sam3.tokenizer.vocab", vocab_list)
+            w.add_arr_str("sam3.tokenizer.merges", merges)
+            print(f"Embedded tokenizer from BPE gz: {len(vocab_list)} vocab entries, "
+                  f"{len(merges)} merges")
+        else:
+            import json
+            with open(os.path.join(tokenizer_dir, "vocab.json"), "r", encoding="utf-8") as f:
+                vocab = json.load(f)
+            merges = []
+            with open(os.path.join(tokenizer_dir, "merges.txt"), "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.rstrip("\n")
+                    # Only the "#version: x.y" header is a comment. BPE merge rows
+                    # may legitimately start with '#' (e.g. "# #</w>"): a blanket
+                    # startswith("#") silently drops 6 merges and breaks inputs like
+                    # "##" (caught by tests/diff_tokenizer.cpp). Non-space header
+                    # lines (plain bpe_simple_vocab extraction) fall through to the
+                    # split below and are skipped there.
+                    if not line or line.startswith("#version"):
+                        continue
+                    parts = line.split(" ", 1)
+                    if len(parts) == 2:
+                        merges.append(f"{parts[0]} {parts[1]}")
+            w.add_arr_str("sam3.tokenizer.vocab",
+                          [t for _, t in sorted(vocab.items(), key=lambda x: x[1])])
+            w.add_arr_str("sam3.tokenizer.merges", merges)
+            print(f"Embedded tokenizer: {len(vocab)} vocab entries, {len(merges)} merges")
 
     with open(path, "wb") as fout:
         w.write_header_and_meta(fout)
@@ -286,6 +351,10 @@ def main():
     parser.add_argument("--tokenizer", default=None,
                         help="Directory containing vocab.json + merges.txt "
                              "(default: same directory as --model)")
+    parser.add_argument("--bpe-gz", default=None,
+                        help="Official bpe_simple_vocab_16e6.txt.gz — build the "
+                             "tokenizer straight from it (authoritative; overrides "
+                             "--tokenizer). Public asset of facebookresearch/sam3.")
     args = parser.parse_args()
 
     import torch
@@ -361,7 +430,7 @@ def main():
 
     tok_dir = args.tokenizer if args.tokenizer else os.path.dirname(os.path.abspath(args.model))
     write_gguf(args.output, args.ftype, renamed, visual_only=args.visual_only,
-               tokenizer_dir=tok_dir)
+               tokenizer_dir=tok_dir, bpe_gz=args.bpe_gz)
 
     file_size = os.path.getsize(args.output)
     print(f"\nDone. {len(renamed)} tensors, {file_size / 1e9:.2f} GB")

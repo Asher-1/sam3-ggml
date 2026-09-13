@@ -28,6 +28,16 @@ files on Hugging Face — no PyTorch weights or conversion step needed:
 
 > **https://huggingface.co/Asher-1/sam3-gguf**
 
+> **Tracker/tokenizer alignment patch (2026-09, updated on HF)**: the `sam3-*`
+> checkpoints (f32/f16/q8_0/q4_1/q4_0) on the HF repo now carry the repaired
+> BPE merge table (all 48894 official rows — the old converter silently
+> dropped the 6 `#`-first merges) and the SAM3 tracker-alignment hparams
+> (`max_cond_frames_in_attn` / `use_memory_selection` / `mf_threshold_x100`).
+> Locally cached copies downloaded before 2026-09-13 can be repaired in place
+> with the idempotent `scripts/fix_gguf_merges.py` (a dry-run prints "already
+> patched; nothing to do" when current). `sam2*` / `sam3-visual-*` files are
+> unaffected (no tokenizer / SAM2-compatible defaults).
+
 The repo mirrors this directory 1:1 (40 files, ~14 GB total).
 
 ```bash

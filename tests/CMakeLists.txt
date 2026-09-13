@@ -1,6 +1,15 @@
 add_executable(test_load test_load.cpp)
 target_link_libraries(test_load PRIVATE sam3)
 
+add_executable(test_tracker_session_edit test_tracker_session_edit.cpp)
+target_link_libraries(test_tracker_session_edit PRIVATE sam3)
+
+add_executable(test_reverse_align test_reverse_align.cpp)
+target_link_libraries(test_reverse_align PRIVATE sam3)
+
+add_executable(test_batch_image test_batch_image.cpp)
+target_link_libraries(test_batch_image PRIVATE sam3)
+
 add_executable(test_tokenizer test_tokenizer.cpp)
 target_link_libraries(test_tokenizer PRIVATE sam3)
 

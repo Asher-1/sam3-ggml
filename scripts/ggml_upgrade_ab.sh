@@ -33,14 +33,49 @@ MODELS=(
     sam2.1_hiera_tiny_q4_0.gguf
 )
 
+# PCS covers the full-SAM3 detector path (text encoder + DETR + seg head);
+# only meaningful for full checkpoints.
+FULL_MODELS=(
+    sam3-f16.gguf
+    sam3-q8_0.gguf
+)
+
+# VIDEO covers the tracker chain (seed -> propagate x N, deterministic: the
+# same image is propagated repeatedly, no video file needed).
+VIDEO_FRAMES=4
+
 for model in "${MODELS[@]}"; do
     for dev in cuda cpu; do
-        echo "── $model @ $dev (n=$REPEAT)"
+        echo "── $model @ $dev (n=$REPEAT) [pvs]"
         echo -n "  base: "
-        "$BASE_BUILD/upgrade_probe"  "$ROOT/models/$model" "$IMG" "$dev" $PX $PY "$REPEAT" 2>/dev/null \
+        "$BASE_BUILD/upgrade_probe"  "$ROOT/models/$model" "$IMG" "$dev" $PX $PY "$REPEAT" pvs 2>/dev/null \
             | grep -E "timing|det\[" | tr '\n' ' '; echo
         echo -n "  cand: "
-        "$CAND_BUILD/upgrade_probe"  "$ROOT/models/$model" "$IMG" "$dev" $PX $PY "$REPEAT" 2>/dev/null \
+        "$CAND_BUILD/upgrade_probe"  "$ROOT/models/$model" "$IMG" "$dev" $PX $PY "$REPEAT" pvs 2>/dev/null \
             | grep -E "timing|det\[" | tr '\n' ' '; echo
+    done
+done
+
+for model in "${FULL_MODELS[@]}"; do
+    for dev in cuda cpu; do
+        echo "── $model @ $dev (n=$REPEAT) [pcs]"
+        echo -n "  base: "
+        "$BASE_BUILD/upgrade_probe"  "$ROOT/models/$model" "$IMG" "$dev" $PX $PY "$REPEAT" "pcs:cat" 2>/dev/null \
+            | grep -E "timing|det\[" | tr '\n' ' '; echo
+        echo -n "  cand: "
+        "$CAND_BUILD/upgrade_probe"  "$ROOT/models/$model" "$IMG" "$dev" $PX $PY "$REPEAT" "pcs:cat" 2>/dev/null \
+            | grep -E "timing|det\[" | tr '\n' ' '; echo
+    done
+done
+
+for model in "${MODELS[@]}"; do
+    for dev in cuda cpu; do
+        echo "── $model @ $dev [video x$VIDEO_FRAMES]"
+        echo -n "  base: "
+        "$BASE_BUILD/upgrade_probe"  "$ROOT/models/$model" "$IMG" "$dev" $PX $PY 1 "video:$VIDEO_FRAMES" 2>/dev/null \
+            | grep -E "timing|frame\[" | tr '\n' ' '; echo
+        echo -n "  cand: "
+        "$CAND_BUILD/upgrade_probe"  "$ROOT/models/$model" "$IMG" "$dev" $PX $PY 1 "video:$VIDEO_FRAMES" 2>/dev/null \
+            | grep -E "timing|frame\[" | tr '\n' ' '; echo
     done
 done

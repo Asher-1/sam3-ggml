@@ -7,6 +7,11 @@ target_link_libraries(sam3_quantize PRIVATE ggml)
 add_executable(sam3_benchmark benchmark.cpp)
 target_link_libraries(sam3_benchmark PRIVATE sam3)
 
+# Offline visualization tool (no GUI dependency): renders segmentation
+# results (image) or tracked frames (video) to PNG files.
+add_executable(sam3_vis main_vis.cpp)
+target_link_libraries(sam3_vis PRIVATE sam3)
+
 add_executable(sam3_profile_sam3 profile_sam3.cpp)
 target_link_libraries(sam3_profile_sam3 PRIVATE sam3)
 

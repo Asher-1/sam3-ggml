@@ -109,7 +109,10 @@ struct sam3_detection {
     float     iou_score = 0.0f;
     int       instance_id = -1;
     sam3_mask  mask;
-    std::vector<float> sam_token;  // raw SAM decoder output token (for obj_ptr)
+    std::vector<float> sam_token;   // raw SAM decoder output token (for obj_ptr)
+    std::vector<float> mask_logits; // opt-in: pre-binarization logits at mask
+                                    // resolution (width x height), filled only
+                                    // when return_logits is set; empty otherwise
 };
 
 struct sam3_result {
@@ -179,6 +182,7 @@ struct sam3_pcs_params {
     std::vector<sam3_box>  neg_exemplars;
     float                  score_threshold = 0.5f;
     float                  nms_threshold   = 0.1f;
+    bool                   return_logits   = false;  // fill mask_logits per detection
 };
 
 struct sam3_pvs_params {
@@ -187,6 +191,24 @@ struct sam3_pvs_params {
     sam3_box                box      = {0, 0, 0, 0};
     bool                    use_box  = false;
     bool                    multimask = false;
+    bool                    return_logits = false;  // fill mask_logits per detection
+    /*
+    ** Low-resolution mask prompt (SAM 1-task style refinement), matching the
+    ** official PromptEncoder mask branch (mask_input_size = 4x the embedding
+    ** grid, i.e. 256x256 for a 64x64 embedding; row-major, y*x_width + x).
+    ** mask_prompt_logits holds raw continuous logits (typically the previous
+    ** prediction's logits, as in the official iterative-refinement flow) and
+    ** takes precedence when non-empty. Otherwise the binary convenience mask
+    ** (0/255, any resolution) is bilinearly resampled to the same input size.
+    ** Either input replaces the no-mask dense embedding; composable with
+    ** points and boxes. Note: a mask-only prompt keeps the single trailing
+    ** padding token in the sparse stream (the official API emits an empty
+    ** sparse stream for that corner case), so mask+point/box combinations are
+    ** the exact-alignment path.
+    */
+    std::vector<float>      mask_prompt_logits;  // [4H x 4W] raw logits
+    sam3_mask               mask_prompt;         // binary 0/255 convenience input
+    bool                    use_mask_prompt = false;
 };
 
 struct sam3_video_params {
@@ -198,6 +220,11 @@ struct sam3_video_params {
     int         max_keep_alive      = 30;
     int         recondition_every   = 16;
     int         fill_hole_area      = 16;
+    /* Optional total video length hint. The official tracker normalizes the
+    ** object-pointer temporal encoding by min(num_frames, 16) - 1; when this
+    ** is <= 0 (unknown, e.g. streaming), max_obj_ptrs (16) is assumed, which
+    ** is exact for videos of 16+ frames. */
+    int         total_frames        = -1;
 };
 
 struct sam3_video_info {
@@ -280,6 +307,29 @@ SAM3_API sam3_result sam3_segment_pcs(sam3_state             & state,
                              const sam3_model       & model,
                              const sam3_pcs_params  & params);
 
+/*
+** Batch image inference (official Sam3Processor::set_image_batch flow).
+**
+** sam3_encode_image_batch encodes n images and keeps a per-image snapshot of
+** the detector neck features inside the state (a new call replaces the
+** previous batch). sam3_segment_pcs_batch then applies one text prompt to
+** every image of that batch and writes one sam3_result per image (masks at
+** each image's original resolution). The detector attends within each image
+** only, so batch results are identical to encode-and-query-each separately.
+**
+** Returns: number of images processed, or -1 on failure (also when the model
+** has no detector path — SAM2 / visual-only checkpoints).
+*/
+SAM3_API int sam3_encode_image_batch(sam3_state       & state,
+                            const sam3_model & model,
+                            const sam3_image * images,
+                            int                n);
+SAM3_API int sam3_segment_pcs_batch(sam3_state             & state,
+                           const sam3_model       & model,
+                           const sam3_pcs_params  & params,
+                           sam3_result            * results,
+                           int                      n);
+
 /* Segment using point/box prompts (PVS path). */
 SAM3_API sam3_result sam3_segment_pvs(sam3_state             & state,
                              const sam3_model       & model,
@@ -311,32 +361,50 @@ SAM3_API sam3_result sam3_track_frame(sam3_tracker     & tracker,
                              const sam3_model & model,
                              const sam3_image & frame);
 
-/* Refine a tracked instance with interactive point prompts. */
+/*
+** Refine a tracked instance with interactive point prompts. The image of the
+** refined frame must already be encoded. frame_idx selects the frame the
+** refinement applies to: -1 (default) = the frame just processed
+** (tracker.frame_index - 1); an explicit value must be < tracker.frame_index.
+** After the call, tracker.frame_index points at the refined frame, so the
+** next forward propagate re-processes it first (official
+** propagate_in_video(start_frame_idx) semantics).
+*/
 SAM3_API bool sam3_refine_instance(sam3_tracker                   & tracker,
                           sam3_state                     & state,
                           const sam3_model               & model,
                           int                              instance_id,
                           const std::vector<sam3_point>  & pos_points,
-                          const std::vector<sam3_point>  & neg_points);
+                          const std::vector<sam3_point>  & neg_points,
+                          int                              frame_idx = -1);
 
 /*
-** Add a new instance to the tracker from PVS prompts (points/box) on the
-** current frame.  The image must already be encoded (via sam3_track_frame
-** or sam3_encode_image).  Returns assigned instance_id, or -1 on failure.
+** Add a new instance to the tracker from PVS prompts (points/box).  The image
+** of the prompt frame must already be encoded (via sam3_track_frame,
+** sam3_encode_image, or sam3_propagate_frame).  frame_idx selects the
+** conditioning frame: -1 (default) = the frame just processed
+** (tracker.frame_index - 1, or frame 0 on a fresh tracker); an explicit
+** value conditions on that frame (the caller must have encoded its image)
+** and positions the tracker there — forward propagation then starts by
+** re-processing the prompt frame (official range(start, end]) and reverse
+** propagation starts at frame_idx-1 (official range(start-1, ..., -1)).
+** Returns assigned instance_id, or -1 on failure.
 */
 SAM3_API int sam3_tracker_add_instance(sam3_tracker         & tracker,
                               sam3_state            & state,
                               const sam3_model      & model,
-                              const sam3_pvs_params & pvs_params);
+                              const sam3_pvs_params & pvs_params,
+                              int                     frame_idx = -1);
 
 /*
-** Add a new instance to the tracker from an existing binary mask on the
-** current frame, bypassing the PVS prompt encoder / mask decoder.  The image
-** must already be encoded (via sam3_track_frame, sam3_propagate_frame, or
+** Add a new instance to the tracker from an existing binary mask, bypassing
+** the PVS prompt encoder / mask decoder.  The image of the prompt frame must
+** already be encoded (via sam3_track_frame, sam3_propagate_frame, or
 ** sam3_encode_image).  The mask (0/255, any resolution) is resampled to the
 ** tracker's memory resolution and written straight into the memory bank as a
 ** conditioning frame, so propagation tracks exactly the supplied mask rather
-** than a mask re-derived from points/box.
+** than a mask re-derived from points/box.  frame_idx follows the same
+** convention as sam3_tracker_add_instance.
 **
 ** The prompt path produces no SAM decoder token, so the object pointer is
 ** instead obtained by running one propagation decode against the just-written
@@ -351,13 +419,47 @@ SAM3_API int sam3_tracker_add_instance_from_mask(sam3_tracker     & tracker,
                                         sam3_state       & state,
                                         const sam3_model & model,
                                         const sam3_mask  & mask,
-                                        float              obj_score = 1.0f);
+                                        float              obj_score = 1.0f,
+                                        int                frame_idx = -1);
 
 /* Return the current frame index of the tracker. */
 SAM3_API int  sam3_tracker_frame_index(const sam3_tracker & tracker);
 
 /* Reset the tracker, clearing all instances and memory. */
 SAM3_API void sam3_tracker_reset(sam3_tracker & tracker);
+
+/*
+** Remove a tracked instance by ID (aligns with the official video predictor's
+** remove_object session edit): drops its confirmed masklet, pending hotstart
+** entry, memory bank and object-pointer bank. The instance's tensor buffers
+** are reclaimed together with the tracker's shared allocations on reset,
+** matching the sliding-window eviction policy used by the memory banks.
+** Returns true if the instance existed.
+*/
+SAM3_API bool sam3_tracker_remove_instance(sam3_tracker & tracker, int instance_id);
+
+/*
+** Rewind the tracker to an earlier frame so a prompt can be added there
+** (aligns with the official add_prompt-at-earlier-frame +
+** propagate_in_video(start_frame_idx=...) flow): drops every memory slot and
+** object pointer recorded after `frame_index`, removes instances that first
+** appeared after it (they do not exist at that frame yet), and repositions
+** the tracker so a following sam3_tracker_add_instance /
+** sam3_refine_instance (default frame_idx = -1) lands exactly on
+** `frame_index`, and the next forward propagate re-processes that frame
+** first, exactly like the official replay flow. Returns the number of
+** dropped memory slots, or -1 if the frame index is invalid.
+*/
+SAM3_API int sam3_tracker_rewind(sam3_tracker & tracker, int frame_index);
+
+/*
+** Clear the prompt/conditioning entry of one tracked instance at one frame
+** (aligns with the official clear_all_points_in_frame): drops that frame's
+** memory slot for the instance, so subsequent propagation is no longer
+** constrained by it. To rebuild the track, rewind to that frame, re-prompt
+** via sam3_refine_instance, and replay. Returns true if a slot was removed.
+*/
+SAM3_API bool sam3_tracker_clear_instance_frame(sam3_tracker & tracker, int instance_id, int frame_index);
 
 /*
 ** ── Visual-Only Video Tracking ──────────────────────────────────────────
@@ -368,6 +470,9 @@ struct sam3_visual_track_params {
     int   max_keep_alive      = 30;
     int   recondition_every   = 16;
     int   fill_hole_area      = 16;
+    /* Optional total video length hint for the object-pointer temporal
+    ** encoding (see sam3_video_params::total_frames). */
+    int   total_frames        = -1;
 };
 
 /*
@@ -382,12 +487,28 @@ SAM3_API sam3_tracker_ptr sam3_create_visual_tracker(
 ** Propagate all tracked instances to the next frame (no detection step).
 ** The image is encoded, then each tracked instance is propagated via
 ** memory attention + SAM mask decode, and the memory bank is updated.
+**
+** reverse=false (default): processes the frame at the tracker's current
+** index — on the first call this re-processes the prompt frame, exactly
+** like the official forward processing order range(start, end].
+**
+** reverse=true: aligned with the official propagate_in_video(reverse=True).
+** Processes the frame BEFORE the current index (the prompt frame itself is
+** never re-processed, matching the official reverse order
+** range(start-1, ..., -1)); memory slots and object pointers on the future
+** side of the current frame participate, with temporal positions folded to
+** non-negative distances in tracking order (official tpos_sign_mul).
+** frame_index decrements; hotstart/keep-alive are measured in tracking
+** order. Passing the frame image whose index equals
+** (tracker.frame_index - 1) for reverse, or tracker.frame_index for
+** forward, is the caller's responsibility.
 */
 SAM3_API sam3_result sam3_propagate_frame(
     sam3_tracker     & tracker,
     sam3_state       & state,
     const sam3_model & model,
-    const sam3_image & frame);
+    const sam3_image & frame,
+    bool               reverse = false);
 
 /*
 ** ── Utility ─────────────────────────────────────────────────────────────
@@ -398,6 +519,71 @@ SAM3_API bool            sam3_save_mask(const sam3_mask & mask, const std::strin
 SAM3_API sam3_image      sam3_decode_video_frame(const std::string & video_path, int frame_index);
 SAM3_API sam3_video_info sam3_get_video_info(const std::string & video_path);
 
+/*
+** ── Visualization ───────────────────────────────────────────────────────
+**
+** Zero-dependency rendering of segmentation results, aligned in content
+** with the official repo's visualization utilities (matplotlib-based):
+** per-instance colored mask overlay + box outlines + "id score" labels.
+** Implemented with plain pixel blending + a built-in 5x7 dot-matrix font.
+*/
+
+struct sam3_vis_params {
+    float mask_alpha    = 0.35f;  // mask tint opacity in [0,1]
+    bool  draw_boxes    = true;   // draw detection box outlines
+    bool  draw_labels   = true;   // draw "id score" labels above boxes
+    int   box_thickness = 2;      // box outline thickness in pixels
+    int   font_scale    = 2;      // label glyph scale (base glyph is 5x7)
+};
+
+/* Fixed perceptually-balanced instance palette (pre-generated table; the
+** official repo clusters LAB samples with k-means, which is a static
+** resource rather than a runtime feature — hard-coding removes the runtime
+** clustering entirely). instance_id 1 maps to the first color. */
+SAM3_API void sam3_instance_color(int instance_id, uint8_t & r, uint8_t & g, uint8_t & b);
+
+/* Blend one binary mask (0/255, any resolution — nearest-neighbour resampled
+** when its size differs from the image) onto the image with the given color. */
+SAM3_API void sam3_overlay_mask(sam3_image  & image,
+                       const sam3_mask & mask,
+                       uint8_t r, uint8_t g, uint8_t b,
+                       float alpha);
+
+/* Draw an axis-aligned box outline (clipped to image bounds). */
+SAM3_API void sam3_draw_box(sam3_image & image, const sam3_box & box,
+                   uint8_t r, uint8_t g, uint8_t b, int thickness);
+
+/* Full-scene render: copy of `image` with every detection's mask blended in
+** its instance color, then boxes and "id score" labels. This is the C++
+** counterpart of the official full-scene instance visualization. */
+SAM3_API sam3_image sam3_render_result(const sam3_image      & image,
+                              const sam3_result     & result,
+                              const sam3_vis_params & params);
+
+/* Save an RGB image as PNG. */
+SAM3_API bool sam3_save_image(const sam3_image & image, const std::string & path);
+
+/*
+** Bilinear-resize raw mask logits (e.g. a previous prediction's
+** detection.mask_logits, or any logits grid) to the low-resolution mask-prompt
+** input size (4x the embedding grid, i.e. 256x256 for the shipped models).
+** dst must hold dw*dh floats. This is the companion helper for
+** sam3_pvs_params::mask_prompt_logits, mirroring the official flow where the
+** previous prediction's logits feed the next prompt round.
+*/
+SAM3_API void sam3_resize_mask_logits(const float * src, int sw, int sh,
+                             float * dst, int dw, int dh);
+
+/*
+** Greedy IoM (intersection-over-min-area) mask dedup, matching the official
+** agent helper remove_overlapping_masks(): process detections by score
+** descending, keep a detection only if its mask IoM against every already
+** kept mask is <= iom_threshold (official default 0.3), then restore the
+** kept detections in their original relative order. Returns the number of
+** removed detections.
+*/
+SAM3_API int sam3_remove_overlapping_masks(sam3_result & result, float iom_threshold);
+
 /*****************************************************************************
 ** Test and Debug API
 **
@@ -407,6 +593,9 @@ SAM3_API sam3_video_info sam3_get_video_info(const std::string & video_path);
 
 SAM3_API bool                  sam3_test_load_tokenizer(const std::string & model_path);
 SAM3_API std::vector<int32_t>  sam3_test_tokenize(const std::string & text);
+/* Expose the official clean chain (whitespace_clean(basic_clean(t)).lower())
+** for differential testing against the Python tokenizer. */
+SAM3_API std::string           sam3_test_clean_text(const std::string & text);
 
 /*
 ** Run the text encoder on fixed token IDs and dump standard intermediate

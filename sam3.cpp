@@ -26,6 +26,11 @@
 #include "stb_image.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 
+/* Generated exact character tables for the tokenizer's text-cleaning pipeline
+** (Python html.unescape + ftfy + Unicode NFC/lower/whitespace). See
+** scripts/gen_text_tables.py. */
+#include "sam3_text_tables.h"
+
 #ifdef _WIN32
 #include <direct.h>
 #include <io.h>
@@ -120,6 +125,15 @@ struct sam3_hparams {
     int32_t mem_attn_layers = 4;
     int32_t num_maskmem     = 7;
     int32_t max_obj_ptrs    = 16;
+    // Official select_closest_cond_frames cap (SAM3 tracker: 4; SAM2 video
+    // predictor keeps every conditioning frame = -1).
+    int32_t max_cond_frames_in_attn = -1;
+    // Official memory selection (apply_temporal_disambiguation): when 1, the
+    // non-conditioning memory/pointer frames are chosen via the official
+    // frame_filter (eff_iou_score > mf_threshold + must-include adjacent
+    // frame). SAM3 enables it by default, SAM2 does not.
+    int32_t use_memory_selection    = 0;
+    int32_t mf_threshold_x100       = 1;  // 0.01
 
     int32_t n_amb_experts   = 2;
 
@@ -830,6 +844,22 @@ struct sam3_state {
     struct ggml_gallocr*  sam3_galloc   = nullptr;
     int                   sam3_img_size = 0;
     bool                  sam3_tracker_only = false;
+
+    // ── Batch image slots (official set_image_batch flow) ────────────────
+    // One full snapshot of the detector-path neck features + PE per image,
+    // written by sam3_encode_image_batch and swapped into
+    // neck_det[]/neck_det_pe[] by sam3_segment_pcs_batch (the detector
+    // attends within each image only, so per-image forwards are numerically
+    // identical to the official batched forward).
+    struct sam3_batch_slot {
+        struct ggml_tensor* neck_det[4]    = {};
+        struct ggml_tensor* neck_det_pe[4] = {};
+        int orig_width  = 0;
+        int orig_height = 0;
+    };
+    std::vector<sam3_batch_slot> batch_slots;
+    // Backend buffers backing the batch-slot tensors (freed with the state).
+    std::vector<ggml_backend_buffer_t> owned_buffers;
 };
 
 /*
@@ -854,18 +884,41 @@ struct sam3_memory_slot {
     struct ggml_tensor* spatial_pe     = nullptr;  // [64, 72, 72]
     int                 frame_index    = -1;
     bool                is_cond_frame  = false;
+    // Official eff_iou_score (cal_mem_score): sigmoid(obj_logit) rescaled to
+    // [0,1] and multiplied by the selected mask IoU — drives the
+    // memory-selection frame_filter. < 0 marks "not scored" (cond frames,
+    // mask-pinned seeds) so frame_filter skips them.
+    float               eff_iou_score  = -1.0f;
+};
+
+// One stored object pointer. `is_cond` mirrors the official
+// is_selected_cond_frame flag: prompt/seed frames keep the cond identity,
+// every propagated frame is a non-conditioning pointer.
+struct sam3_ptr_slot {
+    int                 frame_index = -1;
+    struct ggml_tensor* ptr         = nullptr;  // [256]
+    bool                is_cond     = false;
 };
 
 struct sam3_tracker {
     sam3_video_params params;
     int frame_index  = 0;
     int next_inst_id = 1;
+    // Optional caller hint for the official sine-PE normalization
+    // (min(num_frames, max_obj_ptrs) - 1). <=0 means "unknown" — the
+    // max_obj_ptrs-based default is used, exact for videos of 16+ frames.
+    int total_frames = -1;
 
     std::vector<sam3_masklet> masklets;
     std::vector<sam3_masklet> pending;
 
     std::map<int, std::vector<sam3_memory_slot>> mem_banks;
-    std::map<int, std::vector<std::pair<int, struct ggml_tensor*>>> ptr_banks;
+    std::map<int, std::vector<sam3_ptr_slot>> ptr_banks;
+    // Full-session eff_iou_score history (instance → frame → score). The
+    // official frame_filter scans the whole non-cond output dict, whose
+    // entries the memory bank's sliding window cannot retain — this map is
+    // the durable counterpart (a few floats per frame).
+    std::map<int, std::map<int, float>> eff_history;
 
     struct ggml_context* ctx = nullptr;
     ggml_backend_buffer_t buffer = nullptr;
@@ -1176,8 +1229,8 @@ static std::string sam3_codepoint_to_utf8(int cp) {
 }
 
 // Check if position i in s starts a Unicode letter.
-// Handles ASCII letters + treats any multibyte UTF-8 start byte as a letter.
-// This is a reasonable approximation without ICU.
+// Superseded by sam3_cp_in_ranges + LETTER_RANGES (exact \p{L}); kept as a
+// byte-level helper for callers outside the pre-tokenizer.
 static bool sam3_is_letter(const std::string& s, size_t i) {
     uint8_t c = (uint8_t)s[i];
     if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) return true;
@@ -1435,76 +1488,1061 @@ static std::string sam3_bpe_encode(sam3_bpe_tokenizer& tok, const std::string& t
 // Splits text into word tokens following the CLIP pattern:
 //   <|startoftext|> | <|endoftext|> | 's|'t|'re|'ve|'m|'ll|'d
 //   | [\p{L}]+ | [\p{N}] | [^\s\p{L}\p{N}]+
-static std::vector<std::string> sam3_pretokenize(const std::string& text) {
-    std::vector<std::string> tokens;
+/* *****************************************************************************
+** Text cleaning — exact port of the official tokenizer's clean chain
+**
+** Official (sam3/model/tokenizer_ve.py):
+**   basic_clean      = ftfy.fix_text + html.unescape x2 + strip
+**   whitespace_clean = regex-module \s+ -> " ", strip     (Unicode whitespace)
+**   _clean_lower     = whitespace_clean(basic_clean(text)).lower()
+**
+** The character tables live in sam3_text_tables.h, generated from the same
+** Python libraries the official tokenizer uses (html.entities, unicodedata,
+** ftfy) — exact by construction. ftfy's fixers are ported from ftfy 6.x
+** (fixes.py / __init__.py / chardata.py); the mojibake path covers the two
+** dominant charmaps (latin-1, sloppy-windows-1252) with the official
+** restore_byte_a0 transcoding and only rewrites text whose re-encoded bytes
+** form valid UTF-8, so it can never corrupt already-clean prompts.
+******************************************************************************/
+namespace sam3_text {
+
+using namespace sam3_text_tables;
+
+static const uint32_t CP_INVALID = 0x110000;  // raw-byte marker base
+
+// ── UTF-8 helpers ───────────────────────────────────────────────────────
+// Decode to codepoints; malformed bytes are preserved as raw-byte markers
+// (CP_INVALID + byte) so cleaning never destroys non-UTF-8 input.
+static std::vector<uint32_t> utf8_to_cps(const std::string& s) {
+    std::vector<uint32_t> cps;
+    cps.reserve(s.size());
+    size_t i = 0;
+    while (i < s.size()) {
+        const uint8_t b0 = (uint8_t)s[i];
+        if (b0 < 0x80) { cps.push_back(b0); ++i; continue; }
+        int len; uint32_t cp; uint32_t min_cp;
+        if      ((b0 & 0xE0) == 0xC0) { len = 2; cp = b0 & 0x1F; min_cp = 0x80; }
+        else if ((b0 & 0xF0) == 0xE0) { len = 3; cp = b0 & 0x0F; min_cp = 0x800; }
+        else if ((b0 & 0xF8) == 0xF0) { len = 4; cp = b0 & 0x07; min_cp = 0x10000; }
+        else { cps.push_back(CP_INVALID + b0); ++i; continue; }
+        if (i + (size_t)len > s.size()) {
+            for (; i < s.size(); ++i) cps.push_back(CP_INVALID + (uint8_t)s[i]);
+            break;
+        }
+        bool ok = true;
+        for (int k = 1; k < len; ++k) {
+            const uint8_t bk = (uint8_t)s[i + k];
+            if ((bk & 0xC0) != 0x80) { ok = false; break; }
+            cp = (cp << 6) | (bk & 0x3F);
+        }
+        if (!ok || cp < min_cp || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
+            for (int k = 0; k < len; ++k) cps.push_back(CP_INVALID + (uint8_t)s[i + k]);
+            i += len;
+            continue;
+        }
+        cps.push_back(cp);
+        i += len;
+    }
+    return cps;
+}
+
+static void utf8_push(std::string& out, uint32_t cp) {
+    if (cp < 0x80) { out += (char)cp; }
+    else if (cp < 0x800) {
+        out += (char)(0xC0 | (cp >> 6)); out += (char)(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        out += (char)(0xE0 | (cp >> 12)); out += (char)(0x80 | ((cp >> 6) & 0x3F));
+        out += (char)(0x80 | (cp & 0x3F));
+    } else {
+        out += (char)(0xF0 | (cp >> 18)); out += (char)(0x80 | ((cp >> 12) & 0x3F));
+        out += (char)(0x80 | ((cp >> 6) & 0x3F)); out += (char)(0x80 | (cp & 0x3F));
+    }
+}
+
+static std::string cps_to_utf8(const std::vector<uint32_t>& cps) {
+    std::string out;
+    out.reserve(cps.size() * 2);
+    for (uint32_t cp : cps) {
+        if (cp >= CP_INVALID) out += (char)(cp - CP_INVALID);  // raw byte
+        else utf8_push(out, cp);
+    }
+    return out;
+}
+
+// ── table lookups (tables are sorted by key) ───────────────────────────
+static const char* lookup_char_map(const sam3_char_map* tbl, int n, uint32_t cp) {
+    int lo = 0, hi = n - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (tbl[mid].cp == cp) return tbl[mid].text;
+        if (tbl[mid].cp < cp) lo = mid + 1; else hi = mid - 1;
+    }
+    return nullptr;
+}
+
+static bool u32_in_sorted(const uint32_t* tbl, int n, uint32_t cp) {
+    return std::binary_search(tbl, tbl + n, cp);
+}
+
+static uint8_t ccc_of(uint32_t cp) {
+    for (int i = 0; i < NUM_CCC; ++i)
+        if (CCC[i].cp == cp) return CCC[i].k;
+    return 0;
+}
+
+// ── Python stdlib html.unescape (3.10) ─────────────────────────────────
+static bool lookup_html5(const std::string& name, std::string& out) {
+    int lo = 0, hi = NUM_HTML5_ENTITIES - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        int c = name.compare(HTML5_ENTITIES[mid].name);
+        if (c == 0) { out = HTML5_ENTITIES[mid].text; return true; }
+        if (c > 0) lo = mid + 1; else hi = mid - 1;
+    }
+    return false;
+}
+
+// numeric character reference special cases (html/__init__.py)
+static bool stdlib_numeric_ref(uint32_t num, std::string& out) {
+    if (num == 0x00) { utf8_push(out, 0xFFFD); return true; }
+    if (num == 0x0d) { out += '\r'; return true; }
+    if (num >= 0x80 && num <= 0x9f) {
+        // cp1252 interpretation; undefined bytes map to themselves
+        static const uint32_t m[32] = {
+            0x20AC,0x81,0x201A,0x0192,0x201E,0x2026,0x2020,0x2021,0x02C6,0x2030,
+            0x0160,0x2039,0x0152,0x8D,0x017D,0x8F,0x90,0x2018,0x2019,0x201C,
+            0x201D,0x2022,0x2013,0x2014,0x02DC,0x2122,0x0161,0x203A,0x0153,0x9D,
+            0x017E,0x0178 };
+        utf8_push(out, m[num - 0x80]); return true;
+    }
+    if ((num >= 0xD800 && num <= 0xDFFF) || num > 0x10FFFF) {
+        utf8_push(out, 0xFFFD); return true;
+    }
+    // _invalid_codepoints -> removed entirely
+    if ((num >= 0x1 && num <= 0x8) || (num >= 0xE && num <= 0x1F) ||
+        (num >= 0x7F && num <= 0x9F) || (num >= 0xFDD0 && num <= 0xFDEF) ||
+        num == 0xB || (num >= 0xFFFE && (num & 0xFFFF) >= 0xFFFE)) {
+        return true;
+    }
+    return false;  // ordinary codepoint
+}
+
+static std::string html_unescape(const std::string& text) {
+    // _charref = &(#[0-9]+;? | #[xX][0-9a-fA-F]+;? | [^[tab formfeed <&#;]]{1,32};?)
+    std::string out;
+    out.reserve(text.size());
+    size_t i = 0;
+    while (i < text.size()) {
+        if (text[i] != '&') { out += text[i]; ++i; continue; }
+        const size_t n = text.size();
+        size_t j = i + 1;
+        if (j < n && text[j] == '#') {
+            size_t k = j + 1;
+            const bool hex = (k < n && (text[k] == 'x' || text[k] == 'X'));
+            if (hex) ++k;
+            const size_t dstart = k;
+            while (k < n) {
+                char c = text[k];
+                bool dig = hex ? ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                                  (c >= 'A' && c <= 'F')) : (c >= '0' && c <= '9');
+                if (!dig) break;
+                ++k;
+            }
+            if (k > dstart) {
+                if (k < n && text[k] == ';') ++k;
+                // strip trailing ';' as Python rstrip(';') would (regex ate at most one)
+                std::string d = text.substr(dstart, k - dstart);
+                while (!d.empty() && d.back() == ';') d.pop_back();
+                uint64_t num = hex
+                    ? strtoull(d.c_str(), nullptr, 16)
+                    : strtoull(d.c_str(), nullptr, 10);
+                std::string rep;
+                if (stdlib_numeric_ref((uint32_t)num, rep)) out += rep;
+                else utf8_push(out, (uint32_t)num);
+                i = k;
+                continue;
+            }
+            // fall through: not a numeric ref
+        } else if (j < n) {
+            // named entity: up to 32 chars not in {\t \n \f ' ' < & # ;}, then optional ';'
+            size_t k = j;
+            while (k < n && (size_t)(k - j) < 32) {
+                char c = text[k];
+                if (c == '\t' || c == '\n' || c == '\f' || c == ' ' ||
+                    c == '<' || c == '&' || c == '#' || c == ';') break;
+                ++k;
+            }
+            if (k > j) {
+                if (k < n && text[k] == ';') ++k;
+                const std::string s = text.substr(j, k - j);
+                std::string rep;
+                if (lookup_html5(s, rep)) { out += rep; i = k; continue; }
+                // longest matching prefix (Python: x from len-1 down to 2)
+                bool found = false;
+                for (size_t x = s.size() - 1; x >= 2; --x) {
+                    if (lookup_html5(s.substr(0, x), rep)) {
+                        out += rep;
+                        out += s.substr(x);
+                        // the ';' consumed by the regex belongs to the group
+                        // and stays in s only when it was captured; s includes
+                        // it only when lookup of the full name failed above.
+                        i = k;
+                        found = true;
+                        break;
+                    }
+                }
+                if (found) continue;
+                out += '&';
+                out += s;
+                i = k;
+                continue;
+            }
+        }
+        out += '&';
+        ++i;
+    }
+    return out;
+}
+
+// ── ftfy fixers ────────────────────────────────────────────────────────
+
+// ftfy unescape_html: r"&#?[0-9A-Za-z]{1,24};" against FTFY_ENTITIES
+// (semicolon required; includes the unambiguous ALL-CAPS variants).
+static std::string ftfy_unescape_html(const std::string& text) {
+    std::string out;
+    out.reserve(text.size());
+    size_t i = 0;
+    while (i < text.size()) {
+        if (text[i] != '&') { out += text[i]; ++i; continue; }
+        size_t j = i + 1;
+        if (j < text.size() && text[j] == '#') ++j;
+        size_t k = j;
+        while (k < text.size() && k - j < 24 &&
+               ((text[k] >= '0' && text[k] <= '9') ||
+                (text[k] >= 'A' && text[k] <= 'Z') ||
+                (text[k] >= 'a' && text[k] <= 'z'))) ++k;
+        if (k > j && k < text.size() && text[k] == ';') {
+            const std::string key = text.substr(i, k + 1 - i);
+            // binary search over FTFY_ENTITIES (sorted, keys include '&')
+            int lo = 0, hi = NUM_FTFY_ENTITIES - 1, c = 0;
+            while (lo <= hi) {
+                int mid = (lo + hi) / 2;
+                c = key.compare(FTFY_ENTITIES[mid].name);
+                if (c == 0) { out += FTFY_ENTITIES[mid].text; i = k + 1; goto next; }
+                if (c > 0) lo = mid + 1; else hi = mid - 1;
+            }
+            // official _unescape_fixup: numeric refs fall back to stdlib
+            // html.unescape, rejected if the ';' was not fully consumed
+            if (key.size() > 1 && key[1] == '#') {
+                const std::string unescaped = html_unescape(key);
+                if (unescaped.find(';') == std::string::npos) {
+                    out += unescaped;
+                    i = k + 1;
+                    goto next;
+                }
+            }
+        }
+        out += '&';
+        ++i;
+    next:;
+    }
+    return out;
+}
+
+// ftfy remove_terminal_escapes: r"\033\[((?:\d|;)*)([a-zA-Z])"
+static std::string remove_terminal_escapes(const std::string& text) {
+    std::string out;
+    out.reserve(text.size());
+    size_t i = 0;
+    while (i < text.size()) {
+        if (text[i] == '\033' && i + 1 < text.size() && text[i + 1] == '[') {
+            size_t k = i + 2;
+            while (k < text.size() && ((text[k] >= '0' && text[k] <= '9') || text[k] == ';')) ++k;
+            if (k < text.size() && ((text[k] >= 'a' && text[k] <= 'z') ||
+                                    (text[k] >= 'A' && text[k] <= 'Z'))) {
+                i = k + 1;
+                continue;
+            }
+        }
+        out += text[i];
+        ++i;
+    }
+    return out;
+}
+
+static std::string translate_map(const std::string& text, const sam3_char_map* tbl, int n) {
+    std::vector<uint32_t> cps = utf8_to_cps(text);
+    std::string out;
+    for (uint32_t cp : cps) {
+        if (cp < CP_INVALID) {
+            const char* rep = lookup_char_map(tbl, n, cp);
+            if (rep) { out += rep; continue; }
+        }
+        utf8_push(out, cp);
+    }
+    return out;
+}
+
+static std::string fix_latin_ligatures(const std::string& text) {
+    return translate_map(text, LIGATURES, NUM_LIGATURES);
+}
+
+static std::string fix_character_width(const std::string& text) {
+    return translate_map(text, WIDTH_MAP, NUM_WIDTH_MAP);
+}
+
+static std::string remove_control_chars(const std::string& text) {
+    std::vector<uint32_t> cps = utf8_to_cps(text);
+    std::string out;
+    for (uint32_t cp : cps) {
+        if (cp < CP_INVALID && u32_in_sorted(CONTROL_CHARS, NUM_CONTROL_CHARS, cp)) continue;
+        utf8_push(out, cp);
+    }
+    return out;
+}
+
+static std::string uncurl_quotes(const std::string& text) {
+    // SINGLE_QUOTE_RE [02BC, 2018-201B] -> "'"; DOUBLE_QUOTE_RE [201C-201F] -> '"'
+    std::vector<uint32_t> cps = utf8_to_cps(text);
+    std::string out;
+    for (uint32_t cp : cps) {
+        if (cp == 0x02BC || (cp >= 0x2018 && cp <= 0x201B)) out += '\'';
+        else if (cp >= 0x201C && cp <= 0x201F) out += '"';
+        else utf8_push(out, cp);
+    }
+    return out;
+}
+
+static std::string fix_line_breaks(const std::string& text) {
+    // Python: successive .replace() calls; port over codepoints for the
+    // multi-byte separators.
+    std::vector<uint32_t> cps = utf8_to_cps(text);
+    std::string out;
+    for (size_t i = 0; i < cps.size(); ++i) {
+        uint32_t cp = cps[i];
+        if (cp == '\r') {
+            if (i + 1 < cps.size() && cps[i + 1] == '\n') ++i;  // CRLF -> one \n
+            out += '\n';
+        } else if (cp == 0x2028 || cp == 0x2029 || cp == 0x85) {
+            out += '\n';
+        } else {
+            utf8_push(out, cp);
+        }
+    }
+    return out;
+}
+
+static std::string fix_surrogates(const std::string& text) {
+    // CESU-8 byte-level port: high surrogate ED A0-BF 80-BF, low ED B0-BF 80-BF.
+    std::string out;
+    out.reserve(text.size());
     size_t i = 0;
     const size_t n = text.size();
-
+    auto surr_at = [&](size_t p, bool high) -> bool {
+        return p + 2 < n && (uint8_t)text[p] == 0xED &&
+               ((uint8_t)text[p + 1] & 0xC0) == 0x80 &&
+               ((uint8_t)text[p + 2] & 0xC0) == 0x80 &&
+               (high ? ((uint8_t)text[p + 1] & 0x20) != 0
+                     : ((uint8_t)text[p + 1] & 0x20) == 0);
+    };
     while (i < n) {
-        uint8_t c = (uint8_t)text[i];
-
-        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
-            i++;
+        if (surr_at(i, true)) {
+            if (i + 3 <= n && i + 5 < n + 1 && surr_at(i + 3, false)) {
+                const uint32_t hi = 0xD800 + (((uint8_t)text[i+1] & 0x1F) << 6) + ((uint8_t)text[i+2] & 0x3F);
+                const uint32_t lo = 0xDC00 + (((uint8_t)text[i+4] & 0x1F) << 6) + ((uint8_t)text[i+5] & 0x3F);
+                utf8_push(out, 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00));
+                i += 6;
+                continue;
+            }
+            utf8_push(out, 0xFFFD);  // lone high surrogate
+            i += 3;
             continue;
         }
-
-        if (i + 15 <= n && text.compare(i, 15, "<|startoftext|>") == 0) {
-            tokens.push_back("<|startoftext|>");
-            i += 15;
+        if (surr_at(i, false)) {
+            utf8_push(out, 0xFFFD);  // lone low surrogate
+            i += 3;
             continue;
         }
-        if (i + 13 <= n && text.compare(i, 13, "<|endoftext|>") == 0) {
-            tokens.push_back("<|endoftext|>");
-            i += 13;
+        out += text[i];
+        ++i;
+    }
+    return out;
+}
+
+static std::string fix_c1_controls(const std::string& text) {
+    std::vector<uint32_t> cps = utf8_to_cps(text);
+    std::string out;
+    for (uint32_t cp : cps) {
+        if (cp >= 0x80 && cp <= 0x9F) {
+            bool hit = false;
+            for (int i = 0; i < NUM_C1_MAP; ++i)
+                if (C1_MAP[i].cp == cp) { out += C1_MAP[i].text; hit = true; break; }
+            if (!hit) utf8_push(out, cp);  // sloppy pass-through
             continue;
         }
+        utf8_push(out, cp);
+    }
+    return out;
+}
 
-        // Must check contractions before letters since ' isn't a letter
-        if (c == '\'') {
-            if (i + 2 <= n) {
-                char c2 = text[i + 1];
-                if (c2 == 's' || c2 == 't' || c2 == 'm' || c2 == 'd') {
-                    tokens.push_back(text.substr(i, 2));
-                    i += 2;
+// ── Unicode NFC (UAX #15) ──────────────────────────────────────────────
+static const sam3_nfd_idx* nfd_find(uint32_t cp) {
+    int lo = 0, hi = NUM_NFD - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (NFD_IDX[mid].cp == cp) return &NFD_IDX[mid];
+        if (NFD_IDX[mid].cp < cp) lo = mid + 1; else hi = mid - 1;
+    }
+    return nullptr;
+}
+
+static void nfd_decompose(uint32_t cp, std::vector<uint32_t>& out) {
+    const sam3_nfd_idx* e = nfd_find(cp);
+    if (!e) { out.push_back(cp); return; }
+    for (int i = 0; i < e->len; ++i)
+        nfd_decompose(NFD_FLAT[e->off + i], out);
+}
+
+static uint32_t compose_pair(uint32_t a, uint32_t b) {
+    int lo = 0, hi = NUM_COMPOSE - 1;
+    const uint64_t key = ((uint64_t)a << 32) | b;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        const uint64_t k = ((uint64_t)COMPOSE[mid].a << 32) | COMPOSE[mid].b;
+        if (k == key) return COMPOSE[mid].cp;
+        if (k < key) lo = mid + 1; else hi = mid - 1;
+    }
+    return 0;
+}
+
+static std::string nfc(const std::string& text) {
+    std::vector<uint32_t> seq;
+    {
+        std::vector<uint32_t> cps = utf8_to_cps(text);
+        for (uint32_t cp : cps) {
+            if (cp >= CP_INVALID || !nfd_find(cp)) { seq.push_back(cp); continue; }
+            nfd_decompose(cp, seq);
+        }
+    }
+    // canonical ordering (stable sort of non-starters between starters)
+    {
+        size_t i = 0;
+        while (i < seq.size()) {
+            if (ccc_of(seq[i]) != 0) { ++i; continue; }
+            size_t j = i + 1;
+            while (j < seq.size() && ccc_of(seq[j]) != 0) ++j;
+            if (j > i + 1)
+                std::stable_sort(seq.begin() + i + 1, seq.begin() + j,
+                                 [](uint32_t a, uint32_t b) { return ccc_of(a) < ccc_of(b); });
+            i = j;
+        }
+    }
+    // canonical composition
+    std::vector<uint32_t> out;
+    out.reserve(seq.size());
+    int starter = -1;
+    uint8_t last_cc = 0;
+    for (uint32_t cp : seq) {
+        const uint8_t cc = ccc_of(cp);
+        if (starter >= 0 && cc > last_cc) {
+            const uint32_t comp = compose_pair(out[starter], cp);
+            if (comp) { out[starter] = comp; continue; }
+        }
+        out.push_back(cp);
+        if (cc == 0) starter = (int)out.size() - 1;
+        last_cc = cc;
+    }
+    return cps_to_utf8(out);
+}
+
+// ── ftfy fix_encoding (mojibake core) ─────────────────────────────────
+
+static bool mojibake_gate(const std::vector<uint32_t>& cps) {
+    for (uint32_t cp : cps)
+        if (cp < CP_INVALID && u32_in_sorted(MOJIBAKE_CHARS, NUM_MOJIBAKE_CHARS, cp)) return true;
+    return false;
+}
+
+// encode to the single-byte charmap codec (index into the generated CODECS
+// table, in official CHARMAP_ENCODINGS order; ASCII encodes identity-wise)
+static bool charmap_encode(const std::vector<uint32_t>& cps, int enc, std::string& bytes) {
+    if (enc < 0 || enc >= NUM_CODECS) return false;
+    const sam3_codec& codec = CODECS[enc];
+    bytes.clear();
+    bytes.reserve(cps.size());
+    for (uint32_t cp : cps) {
+        if (cp >= CP_INVALID) return false;
+        if (cp <= 0x7F) { bytes += (char)cp; continue; }
+        int lo = 0, hi = codec.n - 1;
+        bool hit = false;
+        while (lo <= hi) {
+            const int mid = (lo + hi) / 2;
+            if (codec.cp[mid] == cp) { bytes += (char)codec.byte[mid]; hit = true; break; }
+            if (codec.cp[mid] < cp) lo = mid + 1; else hi = mid - 1;
+        }
+        if (!hit) return false;
+    }
+    return true;
+}
+
+static bool utf8_decode_strict(const std::string& s, std::vector<uint32_t>& cps) {
+    size_t i = 0;
+    while (i < s.size()) {
+        const uint8_t b0 = (uint8_t)s[i];
+        if (b0 < 0x80) { cps.push_back(b0); ++i; continue; }
+        int len; uint32_t cp; uint32_t min_cp;
+        if      ((b0 & 0xE0) == 0xC0) { len = 2; cp = b0 & 0x1F; min_cp = 0x80; }
+        else if ((b0 & 0xF0) == 0xE0) { len = 3; cp = b0 & 0x0F; min_cp = 0x800; }
+        else if ((b0 & 0xF8) == 0xF0) { len = 4; cp = b0 & 0x07; min_cp = 0x10000; }
+        else return false;
+        if (i + (size_t)len > s.size()) return false;
+        for (int k = 1; k < len; ++k) {
+            const uint8_t bk = (uint8_t)s[i + k];
+            if ((bk & 0xC0) != 0x80) return false;
+            cp = (cp << 6) | (bk & 0x3F);
+        }
+        if (cp < min_cp || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return false;
+        cps.push_back(cp);
+        i += len;
+    }
+    return true;
+}
+
+// ftfy restore_byte_a0: put byte A0 back where ASCII 20 breaks a UTF-8 seq
+static std::string restore_byte_a0(const std::string& b) {
+    std::string out;
+    out.reserve(b.size());
+    const size_t n = b.size();
+    size_t i = 0;
+    auto cont = [&](size_t p) -> bool {
+        return p < n && (uint8_t)b[p] >= 0x80 && (uint8_t)b[p] <= 0xBF;
+    };
+    auto cont_strict = [&](size_t p) -> bool {   // 80-84, 86-9F, A1-BF (no 85, no A0)
+        if (p >= n) return false;
+        const uint8_t v = (uint8_t)b[p];
+        return v >= 0x80 && v <= 0xBF && v != 0x85 && v != 0xA0;
+    };
+    while (i < n) {
+        const uint8_t b0 = (uint8_t)b[i];
+        // A_GRAVE_WORD_RE: \xc3 (?! |quele|quela|quilo|s ) -> \xc3\xa0
+        if (b0 == 0xC3 && i + 1 < n && (uint8_t)b[i + 1] == 0x20) {
+            // negative lookahead (?! |quele|quela|quilo|s ): at end-of-string the
+            // lookahead vacuously succeeds, so the replacement applies there too
+            bool except = false;
+            const std::string rest = b.substr(i + 2);
+            if (!rest.empty()) {
+                if (rest[0] == ' ') except = true;
+                else if (rest.compare(0, 5, "quele") == 0 || rest.compare(0, 5, "quela") == 0 ||
+                         rest.compare(0, 5, "quilo") == 0 ||
+                         (rest.size() >= 2 && rest[0] == 's' && rest[1] == ' ')) except = true;
+            }
+            if (!except) { out += "\xc3\xa0 "; i += 2; continue; }
+        }
+        // ALTERED_UTF8_RE (one 0x20 in a continuation slot)
+        size_t slot = 0, len = 0;
+        if ((b0 == 0xC2 || b0 == 0xC3 || b0 == 0xC5 || b0 == 0xCE || b0 == 0xD0 || b0 == 0xD9) &&
+            i + 1 < n && (uint8_t)b[i + 1] == 0x20) { slot = 1; len = 2; }
+        else if ((b0 == 0xE2 || b0 == 0xE3) && i + 1 < n && (uint8_t)b[i + 1] == 0x20 &&
+                 cont_strict(i + 2)) { slot = 1; len = 3; }
+        else if (b0 >= 0xE0 && b0 <= 0xE3 && cont_strict(i + 1) &&
+                 i + 2 < n && (uint8_t)b[i + 2] == 0x20) { slot = 2; len = 3; }
+        else if (b0 == 0xF0 && i + 1 < n && (uint8_t)b[i + 1] == 0x20 &&
+                 cont(i + 2) && cont(i + 3)) { slot = 1; len = 4; }
+        else if (b0 == 0xF0 && cont(i + 1) && i + 2 < n && (uint8_t)b[i + 2] == 0x20 &&
+                 cont(i + 3)) { slot = 2; len = 4; }
+        else if (b0 == 0xF0 && cont(i + 1) && cont(i + 2) && i + 3 < n &&
+                 (uint8_t)b[i + 3] == 0x20) { slot = 3; len = 4; }
+        if (len) {
+            for (size_t k = 0; k < len; ++k)
+                out += (k == slot) ? '\xa0' : b[i + k];
+            i += len;
+            continue;
+        }
+        out += b[i];
+        ++i;
+    }
+    return out;
+}
+
+// ── ftfy.badness BADNESS_RE port (re.VERBOSE: spaces outside character
+// classes are insignificant, so every alternation is a run of adjacent
+// character classes) ───────────────────────────────────────────────────
+static bool in_cat(int cat, uint32_t cp) {
+    const sam3_cp_set& s = CATEGORIES[cat];
+    return std::binary_search(s.cps, s.cps + s.n, cp);
+}
+
+static bool is_bad(const std::vector<uint32_t>& t) {
+    const int n = (int)t.size();
+    auto c1 = [&](uint32_t cp) { return cp < CP_INVALID && cp >= 0x80 && cp <= 0x9F; };
+    auto ltrz = [&](uint32_t cp) { return cp >= 'a' && cp <= 'z'; };
+    auto letter = [&](uint32_t cp) { return (cp >= 'a' && cp <= 'z') || (cp >= 'A' && cp <= 'Z'); };
+    auto ws = [&](uint32_t cp) { return cp < CP_INVALID && u32_in_sorted(UNICODE_WS, NUM_UNICODE_WS, cp); };
+    // \w approximation: ASCII word chars, or non-ASCII chars that are not in
+    // any punctuation/symbol category (the accented/common letter sets).
+    auto word = [&](uint32_t cp) {
+        if (cp >= CP_INVALID) return false;   // end-of-string: no word char
+        if (cp == '_' || (cp >= '0' && cp <= '9')) return true;
+        if (cp < 0x80) return letter(cp);
+        for (int c = 0; c < NUM_CATEGORIES; ++c) {
+            if (c == IDX_UPPER_ACCENTED || c == IDX_LOWER_ACCENTED ||
+                c == IDX_UPPER_COMMON || c == IDX_LOWER_COMMON) continue;
+            if (in_cat(c, cp)) return false;
+        }
+        return true;
+    };
+    auto one_of = [&](uint32_t cp, std::initializer_list<uint32_t> set) {
+        for (uint32_t v : set) if (cp == v) return true;
+        return false;
+    };
+    for (int i = 0; i < n; ++i) {
+        const uint32_t a = t[i];
+        const uint32_t b = i + 1 < n ? t[i + 1] : CP_INVALID;
+        const uint32_t c = i + 2 < n ? t[i + 2] : CP_INVALID;
+        const uint32_t d = i + 3 < n ? t[i + 3] : CP_INVALID;
+        if (c1(a)) return true;
+        // [big-set][bad]
+        if ((in_cat(IDX_BAD, a) || in_cat(IDX_LOWER_ACCENTED, a) || in_cat(IDX_UPPER_ACCENTED, a) ||
+             in_cat(IDX_BOX, a) || in_cat(IDX_START_PUNCTUATION, a) || in_cat(IDX_END_PUNCTUATION, a) ||
+             in_cat(IDX_CURRENCY, a) || in_cat(IDX_NUMERIC, a) || in_cat(IDX_LAW, a)) &&
+            in_cat(IDX_BAD, b)) return true;
+        // [a-zA-Z][lower/upper_common][bad]
+        if (letter(a) && (in_cat(IDX_LOWER_COMMON, b) || in_cat(IDX_UPPER_COMMON, b)) &&
+            in_cat(IDX_BAD, c)) return true;
+        // [bad][big-set2]
+        if (in_cat(IDX_BAD, a) &&
+            (in_cat(IDX_LOWER_ACCENTED, b) || in_cat(IDX_UPPER_ACCENTED, b) || in_cat(IDX_BOX, b) ||
+             in_cat(IDX_START_PUNCTUATION, b) || in_cat(IDX_END_PUNCTUATION, b) ||
+             in_cat(IDX_CURRENCY, b) || in_cat(IDX_NUMERIC, b) || in_cat(IDX_LAW, b))) return true;
+        // [lower_acc|lower_common|box|end|curr|num][upper_acc]
+        if ((in_cat(IDX_LOWER_ACCENTED, a) || in_cat(IDX_LOWER_COMMON, a) || in_cat(IDX_BOX, a) ||
+             in_cat(IDX_END_PUNCTUATION, a) || in_cat(IDX_CURRENCY, a) || in_cat(IDX_NUMERIC, a)) &&
+            in_cat(IDX_UPPER_ACCENTED, b)) return true;
+        // [box|end|curr|num][lower_acc]
+        if ((in_cat(IDX_BOX, a) || in_cat(IDX_END_PUNCTUATION, a) || in_cat(IDX_CURRENCY, a) ||
+             in_cat(IDX_NUMERIC, a)) && in_cat(IDX_LOWER_ACCENTED, b)) return true;
+        // [lower_acc|box|end][curr]
+        if ((in_cat(IDX_LOWER_ACCENTED, a) || in_cat(IDX_BOX, a) || in_cat(IDX_END_PUNCTUATION, a)) &&
+            in_cat(IDX_CURRENCY, b)) return true;
+        // \s[upper_acc][curr]
+        if (ws(a) && in_cat(IDX_UPPER_ACCENTED, b) && in_cat(IDX_CURRENCY, c)) return true;
+        // [upper_acc|box][num|law]
+        if ((in_cat(IDX_UPPER_ACCENTED, a) || in_cat(IDX_BOX, a)) &&
+            (in_cat(IDX_NUMERIC, b) || in_cat(IDX_LAW, b))) return true;
+        // [lower_acc|upper_acc|box|curr|end][start][num]
+        if ((in_cat(IDX_LOWER_ACCENTED, a) || in_cat(IDX_UPPER_ACCENTED, a) || in_cat(IDX_BOX, a) ||
+             in_cat(IDX_CURRENCY, a) || in_cat(IDX_END_PUNCTUATION, a)) &&
+            in_cat(IDX_START_PUNCTUATION, b) && in_cat(IDX_NUMERIC, c)) return true;
+        // [lower_acc|upper_acc|curr|num|box|law][end][start]
+        if ((in_cat(IDX_LOWER_ACCENTED, a) || in_cat(IDX_UPPER_ACCENTED, a) || in_cat(IDX_CURRENCY, a) ||
+             in_cat(IDX_NUMERIC, a) || in_cat(IDX_BOX, a) || in_cat(IDX_LAW, a)) &&
+            in_cat(IDX_END_PUNCTUATION, b) && in_cat(IDX_START_PUNCTUATION, c)) return true;
+        // [curr|num|box][start]
+        if ((in_cat(IDX_CURRENCY, a) || in_cat(IDX_NUMERIC, a) || in_cat(IDX_BOX, a)) &&
+            in_cat(IDX_START_PUNCTUATION, b)) return true;
+        // [a-z][upper_acc][start|curr]
+        if (ltrz(a) && in_cat(IDX_UPPER_ACCENTED, b) &&
+            (in_cat(IDX_START_PUNCTUATION, c) || in_cat(IDX_CURRENCY, c))) return true;
+        // [box][kaomoji]
+        if (in_cat(IDX_BOX, a) && in_cat(IDX_KAOMOJI, b)) return true;
+        // [lower_acc|upper_acc|curr|num|start|end|law][box]
+        if ((in_cat(IDX_LOWER_ACCENTED, a) || in_cat(IDX_UPPER_ACCENTED, a) || in_cat(IDX_CURRENCY, a) ||
+             in_cat(IDX_NUMERIC, a) || in_cat(IDX_START_PUNCTUATION, a) || in_cat(IDX_END_PUNCTUATION, a) ||
+             in_cat(IDX_LAW, a)) && in_cat(IDX_BOX, b)) return true;
+        // [box][end]
+        if (in_cat(IDX_BOX, a) && in_cat(IDX_END_PUNCTUATION, b)) return true;
+        // [lower_acc|upper_acc][start|end]\w
+        if ((in_cat(IDX_LOWER_ACCENTED, a) || in_cat(IDX_UPPER_ACCENTED, a)) &&
+            (in_cat(IDX_START_PUNCTUATION, b) || in_cat(IDX_END_PUNCTUATION, b)) && word(c)) return true;
+        // [Œœ][^A-Za-z]
+        if ((a == 0x152 || a == 0x153) && b != CP_INVALID && !letter(b)) return true;
+        // [upper_acc]°
+        if (in_cat(IDX_UPPER_ACCENTED, a) && b == 0xB0) return true;
+        // [ÂÃÎÐ][cp1252 mojibake followers]
+        if (one_of(a, {0xC2, 0xC3, 0xCE, 0xD0}) &&
+            (one_of(b, {0x20AC, 0x153, 0x160, 0x161, 0xA2, 0xA3, 0x178, 0x17E, 0xA0, 0xAD,
+                        0xAE, 0xA9, 0xB0, 0xB7, 0xBB, 0x2013, 0x2014, 0xB4}) ||
+             in_cat(IDX_START_PUNCTUATION, b) || in_cat(IDX_END_PUNCTUATION, b))) return true;
+        // ×[²³]
+        if (a == 0xD7 && one_of(b, {0xB2, 0xB3})) return true;
+        // [ØÙ][A][ØÙ][A] Arabic mojibake
+        if ((a == 0xD8 || a == 0xD9) &&
+            (in_cat(IDX_COMMON, b) || in_cat(IDX_CURRENCY, b) || in_cat(IDX_BAD, b) ||
+             in_cat(IDX_NUMERIC, b) || in_cat(IDX_START_PUNCTUATION, b) ||
+             one_of(b, {0x178, 0x160, 0xAE, 0xB0, 0xB5, 0xBB})) &&
+            (c == 0xD8 || c == 0xD9) &&
+            (in_cat(IDX_COMMON, d) || in_cat(IDX_CURRENCY, d) || in_cat(IDX_BAD, d) ||
+             in_cat(IDX_NUMERIC, d) || in_cat(IDX_START_PUNCTUATION, d) ||
+             one_of(d, {0x178, 0x160, 0xAE, 0xB0, 0xB5, 0xBB}))) return true;
+        // à[²µ¹¼½¾]
+        if (a == 0xE0 && one_of(b, {0xB2, 0xB5, 0xB9, 0xBC, 0xBD, 0xBE})) return true;
+        // √[±∂†≠®™´≤≥¥µø]
+        if (a == 0x221A && one_of(b, {0xB1, 0x2202, 0x2020, 0x2260, 0xAE, 0x2122, 0xB4,
+                                      0x2264, 0x2265, 0xA5, 0xB5, 0xF8})) return true;
+        // ≈[°¢]
+        if (a == 0x2248 && one_of(b, {0xB0, 0xA2})) return true;
+        // ‚Ä[ìîïòôúùû†°¢π]
+        if (a == 0x201A && b == 0xC4 &&
+            one_of(c, {0xEC, 0xEE, 0xEF, 0xF2, 0xF4, 0xFA, 0xF9, 0xFB, 0x2020, 0xB0, 0xA2, 0x3C0})) return true;
+        // ‚[âó][àä°ê]
+        if (a == 0x201A && one_of(b, {0xE2, 0xF3}) && one_of(c, {0xE0, 0xE4, 0xB0, 0xEA})) return true;
+        // вЂ
+        if (a == 0x432 && b == 0x402) return true;
+        // [ВГРС][c1|bad|start|end|curr + °µ][ВГРС]
+        if (one_of(a, {0x412, 0x413, 0x420, 0x421}) &&
+            (c1(b) || in_cat(IDX_BAD, b) || in_cat(IDX_START_PUNCTUATION, b) ||
+             in_cat(IDX_END_PUNCTUATION, b) || in_cat(IDX_CURRENCY, b) || b == 0xB0 || b == 0xB5) &&
+            one_of(c, {0x412, 0x413, 0x420, 0x421})) return true;
+        // ГўВЂВ.[A-Za-z ]
+        if (a == 0x413 && b == 0x45E && c == 0x412 && d == 0x402 &&
+            i + 6 < n + 1 && i + 4 < n && t[i + 4] == 0x412 && i + 6 < n &&
+            ((t[i + 6] >= 'A' && t[i + 6] <= 'Z') || (t[i + 6] >= 'a' && t[i + 6] <= 'z') || t[i + 6] == ' ')) return true;
+        // Ã[\xa0¡]
+        if (a == 0xC3 && one_of(b, {0xA0, 0xA1})) return true;
+        // [a-z]\s?[ÃÂ][ ]
+        if (ltrz(a) && b != CP_INVALID && (b == 0xC3 || b == 0xC2) && c == ' ') return true;
+        if (ltrz(a) && ws(b) && (c == 0xC3 || c == 0xC2) && d == ' ') return true;
+        // ^[ÃÂ][ ]
+        if (i == 0 && (a == 0xC3 || a == 0xC2) && b == ' ') return true;
+        // [a-z.,?! + end_punct][Â][ space + start|end punct]
+        if ((ltrz(a) || a == ',' || a == '.' || a == '?' || a == '!' || in_cat(IDX_END_PUNCTUATION, a)) &&
+            b == 0xC2 && (c == ' ' || in_cat(IDX_START_PUNCTUATION, c) || in_cat(IDX_END_PUNCTUATION, c))) return true;
+        // β€[™\xa0Ά\xad®°]
+        if (a == 0x3B2 && b == 0x20AC &&
+            one_of(c, {0x2122, 0xA0, 0x386, 0xAD, 0xAE, 0xB0})) return true;
+        // [ΒΓΞΟ][c1|bad|start|end|curr + °][ΒΓΞΟ]
+        if (one_of(a, {0x392, 0x393, 0x39E, 0x39F}) &&
+            (c1(b) || in_cat(IDX_BAD, b) || in_cat(IDX_START_PUNCTUATION, b) ||
+             in_cat(IDX_END_PUNCTUATION, b) || in_cat(IDX_CURRENCY, b) || b == 0xB0) &&
+            one_of(c, {0x392, 0x393, 0x39E, 0x39F})) return true;
+        // ā€
+        if (a == 0x101 && b == 0x20AC) return true;
+    }
+    return false;
+}
+
+// official decode_inconsistent_utf8: fix mojibake sub-sequences embedded in
+// otherwise-valid text (UTF8_DETECTOR_RE matches, fixed individually)
+static bool utf8_clue_in(const uint32_t* tbl, int n, uint32_t cp) {
+    return std::binary_search(tbl, tbl + n, cp);
+}
+
+static std::string fix_encoding(const std::string& text);  // fwd: recursion below
+
+static std::string decode_inconsistent_utf8(const std::string& text) {
+    const std::vector<uint32_t> t = utf8_to_cps(text);
+    const int n = (int)t.size();
+    std::string out;
+    size_t i = 0;
+    auto cont = [&](size_t p) { return p < t.size() && utf8_clue_in(UTF8_CONTINUATION, NUM_UTF8_CONTINUATION, t[p]); };
+    while (i < (size_t)n) {
+        // (?<!continuation_strict) lookbehind: a run may not start right after
+        // another mojibake continuation character
+        if (t[i] < CP_INVALID &&
+            (i == 0 || t[i - 1] >= CP_INVALID ||
+             !utf8_clue_in(UTF8_CONTINUATION_STRICT, NUM_UTF8_CONTINUATION_STRICT, t[i - 1]))) {
+            // match (first2 cont | first3 cont2 | first4 cont3)+ greedily
+            size_t j = i;
+            bool any = false;
+            while (j < t.size()) {
+                if (utf8_clue_in(UTF8_FIRST_OF_2, NUM_UTF8_FIRST_OF_2, t[j]) && cont(j + 1)) { j += 2; any = true; }
+                else if (utf8_clue_in(UTF8_FIRST_OF_3, NUM_UTF8_FIRST_OF_3, t[j]) && cont(j + 1) && cont(j + 2)) { j += 3; any = true; }
+                else if (utf8_clue_in(UTF8_FIRST_OF_4, NUM_UTF8_FIRST_OF_4, t[j]) && cont(j + 1) && cont(j + 2) && cont(j + 3)) { j += 4; any = true; }
+                else break;
+            }
+            if (any && j - i < t.size()) {
+                const std::string sub = cps_to_utf8(std::vector<uint32_t>(t.begin() + i, t.begin() + j));
+                if (is_bad(std::vector<uint32_t>(t.begin() + i, t.begin() + j))) {
+                    out += fix_encoding(sub);
+                    i = j;
                     continue;
                 }
             }
-            if (i + 3 <= n) {
-                std::string c3 = text.substr(i + 1, 2);
-                if (c3 == "re" || c3 == "ve" || c3 == "ll") {
-                    tokens.push_back(text.substr(i, 3));
+        }
+        utf8_push(out, t[i]);
+        ++i;
+    }
+    return out;
+}
+
+static std::string fix_encoding_one_step(const std::string& text) {
+    std::vector<uint32_t> cps = utf8_to_cps(text);
+    bool ascii = true, has_c1 = false;
+    for (uint32_t cp : cps) {
+        if (cp >= CP_INVALID) { ascii = false; continue; }
+        if (cp > 0x7F) { ascii = false; if (cp <= 0x9F) has_c1 = true; }
+    }
+    if (ascii) return text;
+    if (!is_bad(cps)) return text;   // official is_bad gate
+
+    for (int enc = 0; enc < NUM_CODECS; ++enc) {
+        std::string bytes;
+        if (!charmap_encode(cps, enc, bytes)) continue;
+        bytes = restore_byte_a0(bytes);
+        std::vector<uint32_t> decoded;
+        if (utf8_decode_strict(bytes, decoded) && decoded != cps)
+            return cps_to_utf8(decoded);
+    }
+    // official: fix a-hat-euro sequences that remain, in isolation
+    {
+        const std::string fixed = decode_inconsistent_utf8(text);
+        if (fixed != text) return fixed;
+    }
+    if (has_c1) return fix_c1_controls(text);   // official C1 fallback
+    return text;
+}
+
+static std::string fix_encoding(const std::string& text) {
+    std::string cur = text;
+    while (true) {
+        std::string next = fix_encoding_one_step(cur);
+        if (next == cur) return cur;
+        cur = std::move(next);
+    }
+}
+
+// ── ftfy.fix_text ──────────────────────────────────────────────────────
+static std::string fix_text_segment(const std::string& text) {
+    // one fixpoint pass of the official fixer list, in official order
+    std::string cur = text;
+    while (true) {
+        std::string orig = cur;
+        cur = ftfy_unescape_html(cur);        // config.unescape_html="auto": the
+                                              // "<" check is applied per segment
+        cur = fix_encoding(cur);
+        cur = fix_c1_controls(cur);
+        cur = fix_latin_ligatures(cur);
+        cur = fix_character_width(cur);
+        cur = uncurl_quotes(cur);
+        cur = fix_line_breaks(cur);
+        cur = fix_surrogates(cur);
+        cur = remove_terminal_escapes(cur);
+        cur = remove_control_chars(cur);
+        cur = nfc(cur);
+        if (cur == orig) return cur;
+    }
+}
+
+static std::string fix_text(const std::string& text) {
+    // official fix_text splits on '\n' and applies the "auto" html-unescape
+    // skip per segment when it contains '<'
+    std::string out;
+    out.reserve(text.size());
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t brk = text.find('\n', pos);
+        brk = (brk == std::string::npos) ? text.size() : brk + 1;
+        std::string seg = text.substr(pos, brk - pos);
+        if (seg.find('<') == std::string::npos)
+            seg = ftfy_unescape_html(seg);
+        out += fix_text_segment(seg);
+        pos = brk;
+    }
+    return out;
+}
+
+// ── official clean chain ───────────────────────────────────────────────
+static std::string basic_clean(const std::string& text) {
+    std::string t = fix_text(text);
+    t = html_unescape(t);
+    t = html_unescape(t);
+    // str.strip() removes Unicode whitespace on both ends
+    std::vector<uint32_t> cps = utf8_to_cps(t);
+    size_t a = 0, b = cps.size();
+    while (a < b && cps[a] < CP_INVALID && u32_in_sorted(UNICODE_WS, NUM_UNICODE_WS, cps[a])) ++a;
+    while (b > a && cps[b - 1] < CP_INVALID && u32_in_sorted(UNICODE_WS, NUM_UNICODE_WS, cps[b - 1])) --b;
+    return cps_to_utf8(std::vector<uint32_t>(cps.begin() + a, cps.begin() + b));
+}
+
+static std::string whitespace_clean(const std::string& text) {
+    // regex-module \s+ -> " " (Unicode whitespace), then strip
+    std::vector<uint32_t> cps = utf8_to_cps(text);
+    std::string out;
+    bool last_ws = true;
+    for (uint32_t cp : cps) {
+        const bool ws = cp < CP_INVALID && u32_in_sorted(UNICODE_WS, NUM_UNICODE_WS, cp);
+        if (ws) {
+            if (!last_ws) { out += ' '; last_ws = true; }
+        } else {
+            utf8_push(out, cp);
+            last_ws = false;
+        }
+    }
+    if (!out.empty() && out.back() == ' ') out.pop_back();
+    return out;
+}
+
+static std::string unicode_lower(const std::string& text) {
+    std::vector<uint32_t> cps = utf8_to_cps(text);
+    // Python str.lower applies the SpecialCasing Final_Sigma rule: capital
+    // sigma maps to final sigma (ς) when preceded by a cased character and
+    // not followed by one (case-ignorable chars in between ignored here —
+    // irrelevant for prompts).
+    auto cased = [&](uint32_t cp) {
+        if ((cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z')) return true;
+        if (cp < CP_INVALID && lookup_char_map(LOWER_MAP, NUM_LOWER_MAP, cp)) return true;
+        if (cp >= 0x391 && cp <= 0x3AB) return true;            // Greek capitals
+        if (cp >= 0x3B1 && cp <= 0x3C9) return true;            // Greek lowercase
+        if ((cp >= 0x400 && cp <= 0x45F)) return true;          // Cyrillic
+        if (cp >= 0xC0 && cp <= 0xFF && cp != 0xD7 && cp != 0xF7) return true;
+        return false;
+    };
+    std::string out;
+    for (size_t i = 0; i < cps.size(); ++i) {
+        const uint32_t cp = cps[i];
+        if (cp == 0x3A3) {  // Σ
+            bool prev_cased = false;
+            for (size_t k = i; k-- > 0;)
+                if (cps[k] < CP_INVALID) { prev_cased = cased(cps[k]); break; }
+            bool next_cased = false;
+            for (size_t k = i + 1; k < cps.size(); ++k)
+                if (cps[k] < CP_INVALID) { next_cased = cased(cps[k]); break; }
+            if (prev_cased && !next_cased) { utf8_push(out, 0x3C2); continue; }  // ς
+        }
+        if (cp < CP_INVALID) {
+            const char* rep = lookup_char_map(LOWER_MAP, NUM_LOWER_MAP, cp);
+            if (rep) { out += rep; continue; }
+        }
+        utf8_push(out, cp);
+    }
+    return out;
+}
+
+static std::string clean_lower(const std::string& text) {
+    return unicode_lower(whitespace_clean(basic_clean(text)));
+}
+
+} // namespace sam3_text
+
+using sam3_text_tables::LETTER_RANGES;
+using sam3_text_tables::NUM_LETTER_RANGES;
+using sam3_text_tables::NUMBER_RANGES;
+using sam3_text_tables::NUM_NUMBER_RANGES;
+
+// Unicode \p{L} / \p{N} membership over the generated closed ranges
+// (general categories L*/N*), replacing the old "any multibyte lead byte is a
+// letter" approximation which mis-classified symbols like ‡, ©, ….
+static bool sam3_cp_in_ranges(const sam3_text_tables::sam3_cp_range* tbl, int n, uint32_t cp) {
+    int lo = 0, hi = n - 1;
+    while (lo <= hi) {
+        const int mid = (lo + hi) / 2;
+        if (cp < tbl[mid].lo) hi = mid - 1;
+        else if (cp > tbl[mid].hi) lo = mid + 1;
+        else return true;
+    }
+    return false;
+}
+
+static std::vector<std::string> sam3_pretokenize(const std::string& text) {
+    const std::vector<uint32_t> cps = sam3_text::utf8_to_cps(text);
+    const int n = (int)cps.size();
+    std::vector<std::string> tokens;
+
+    auto is_letter = [&](uint32_t cp) {
+        return cp < sam3_text::CP_INVALID &&
+               sam3_cp_in_ranges(LETTER_RANGES, NUM_LETTER_RANGES, cp);
+    };
+    auto is_number = [&](uint32_t cp) {
+        return cp < sam3_text::CP_INVALID &&
+               sam3_cp_in_ranges(NUMBER_RANGES, NUM_NUMBER_RANGES, cp);
+    };
+    auto is_ws = [&](uint32_t cp) {
+        return cp < sam3_text::CP_INVALID &&
+               (cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r' ||
+                sam3_text::u32_in_sorted(sam3_text_tables::UNICODE_WS,
+                                         sam3_text_tables::NUM_UNICODE_WS, cp));
+    };
+    auto push_cp = [&](std::string& s, uint32_t cp) {
+        if (cp >= sam3_text::CP_INVALID) s += (char)(cp - sam3_text::CP_INVALID);
+        else sam3_text::utf8_push(s, cp);
+    };
+
+    int i = 0;
+    while (i < n) {
+        const uint32_t cp = cps[i];
+
+        if (is_ws(cp)) {
+            ++i;
+            continue;
+        }
+
+        // special tokens (byte-exact in the byte domain)
+        {
+            const int sn = n - i;
+            auto match_special = [&](const char* lit, int len) -> bool {
+                if (sn < len) return false;
+                for (int k = 0; k < len; ++k)
+                    if (cps[i + k] != (uint32_t)(unsigned char)lit[k]) return false;
+                return true;
+            };
+            if (match_special("<|startoftext|>", 15)) {
+                tokens.push_back("<|startoftext|>");
+                i += 15;
+                continue;
+            }
+            if (match_special("<|endoftext|>", 13)) {
+                tokens.push_back("<|endoftext|>");
+                i += 13;
+                continue;
+            }
+        }
+
+        // contractions before letters: 's|'t|'re|'ve|'m|'ll|'d (the pattern is
+        // compiled with re.IGNORECASE, but the clean chain already lowercased)
+        if (cp == '\'') {
+            bool two = (i + 2 < n) && cps[i + 1] < 0x80;
+            const uint32_t c1 = two ? cps[i + 1] : 0;
+            if (two && (c1 == 's' || c1 == 't' || c1 == 'm' || c1 == 'd')) {
+                std::string t = "'";
+                t += (char)c1;
+                tokens.push_back(std::move(t));
+                i += 2;
+                continue;
+            }
+            if (two && i + 3 <= n && cps[i + 2] < 0x80) {
+                const uint32_t c2 = cps[i + 2];
+                if ((c1 == 'r' && c2 == 'e') || (c1 == 'v' && c2 == 'e') ||
+                    (c1 == 'l' && c2 == 'l')) {
+                    std::string t = "'";
+                    t += (char)c1;
+                    t += (char)c2;
+                    tokens.push_back(std::move(t));
                     i += 3;
                     continue;
                 }
             }
-            // Fall through — not a contraction
+            // fall through — not a contraction
         }
 
-        if (sam3_is_letter(text, i)) {
-            size_t start = i;
-            while (i < n && sam3_is_letter(text, i)) {
-                i += sam3_utf8_len((uint8_t)text[i]);
+        if (is_letter(cp)) {
+            std::string tok;
+            const int start = i;
+            while (i < n && is_letter(cps[i])) {
+                push_cp(tok, cps[i]);
+                ++i;
             }
-            tokens.push_back(text.substr(start, i - start));
+            (void)start;
+            tokens.push_back(std::move(tok));
             continue;
         }
 
-        if (c >= '0' && c <= '9') {
-            tokens.push_back(text.substr(i, 1));
-            i++;
+        if (is_number(cp)) {
+            // [\p{N}] matches a single numeric character
+            std::string tok;
+            push_cp(tok, cp);
+            tokens.push_back(std::move(tok));
+            ++i;
             continue;
         }
 
         {
-            size_t start = i;
-            while (i < n) {
-                uint8_t ch = (uint8_t)text[i];
-                if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r') break;
-                if (sam3_is_letter(text, i)) break;
-                if (ch >= '0' && ch <= '9') break;
-                i++;
+            // [^\s\p{L}\p{N}]+
+            std::string tok;
+            while (i < n && !is_ws(cps[i]) && !is_letter(cps[i]) && !is_number(cps[i])) {
+                push_cp(tok, cps[i]);
+                ++i;
             }
-            if (i > start) tokens.push_back(text.substr(start, i - start));
+            if (!tok.empty()) tokens.push_back(std::move(tok));
         }
     }
 
@@ -1520,27 +2558,11 @@ static std::vector<std::string> sam3_pretokenize(const std::string& text) {
 static std::vector<int32_t> sam3_tokenize(sam3_bpe_tokenizer& tok,
                                           const std::string& text,
                                           int ctx_len) {
-    std::string lower;
-    lower.reserve(text.size());
-    for (char c : text) {
-        lower += (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
-    }
-
-    std::string clean;
-    clean.reserve(lower.size());
-    bool last_ws = true;
-    for (char c : lower) {
-        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
-            if (!last_ws) {
-                clean += ' ';
-                last_ws = true;
-            }
-        } else {
-            clean += c;
-            last_ws = false;
-        }
-    }
-    if (!clean.empty() && clean.back() == ' ') clean.pop_back();
+    // Official clean chain (tokenizer_ve.py clean="lower"):
+    //   whitespace_clean(basic_clean(text)).lower()
+    // basic_clean = ftfy.fix_text + html.unescape x2 + strip; see the
+    // sam3_text namespace above for the exact port.
+    const std::string clean = sam3_text::clean_lower(text);
 
     auto words = sam3_pretokenize(clean);
 
@@ -1644,6 +2666,9 @@ static bool sam3_load_hparams(const gguf_kv& r, sam3_hparams& hp) {
     hp.mem_attn_layers   = rd("sam3.hparams.mem_attn_layers",   hp.mem_attn_layers);
     hp.num_maskmem       = rd("sam3.hparams.num_maskmem",       hp.num_maskmem);
     hp.max_obj_ptrs      = rd("sam3.hparams.max_obj_ptrs",      hp.max_obj_ptrs);
+    hp.max_cond_frames_in_attn = rd("sam3.hparams.max_cond_frames_in_attn", hp.max_cond_frames_in_attn);
+    hp.use_memory_selection    = rd("sam3.hparams.use_memory_selection", hp.use_memory_selection);
+    hp.mf_threshold_x100       = rd("sam3.hparams.mf_threshold_x100", hp.mf_threshold_x100);
     hp.n_amb_experts     = rd("sam3.hparams.n_amb_experts",     hp.n_amb_experts);
     hp.visual_only       = rd("sam3.hparams.visual_only",       hp.visual_only);
     return r.err.empty();
@@ -1666,6 +2691,10 @@ static void sam3_print_hparams(const sam3_hparams& hp) {
     fprintf(stderr, "  sam_embed_dim  = %d\n", hp.sam_embed_dim);
     fprintf(stderr, "  mem_attn_lyrs  = %d\n", hp.mem_attn_layers);
     fprintf(stderr, "  num_maskmem    = %d\n", hp.num_maskmem);
+    fprintf(stderr, "  max_obj_ptrs   = %d\n", hp.max_obj_ptrs);
+    fprintf(stderr, "  max_cond_fram  = %d\n", hp.max_cond_frames_in_attn);
+    fprintf(stderr, "  mem_selection  = %d (mf_thr %.3f)\n", hp.use_memory_selection,
+            hp.mf_threshold_x100 / 100.0f);
     fprintf(stderr, "  visual_only    = %d\n", hp.visual_only);
 }
 
@@ -3163,6 +4192,11 @@ void sam3_free_state(sam3_state& state) {
         ggml_backend_buffer_free(state.pe_buf);
         state.pe_buf = nullptr;
     }
+    // Batch-slot tensor buffers (sam3_encode_image_batch).
+    for (auto* b : state.owned_buffers)
+        if (b) ggml_backend_buffer_free(b);
+    state.owned_buffers.clear();
+    state.batch_slots.clear();
     if (state.pe_ctx) {
         ggml_free(state.pe_ctx);
         state.pe_ctx = nullptr;
@@ -8050,7 +9084,10 @@ static sam3_prompt_data sam3_build_prompt_and_pos(
     // provided, the per-frame GPU reads are skipped (hot path only).
     const std::vector<float>* tpos_enc_cache = nullptr,
     const std::vector<float>* ptr_tpos_w_cache = nullptr,
-    const std::vector<float>* ptr_tpos_b_cache = nullptr) {
+    const std::vector<float>* ptr_tpos_b_cache = nullptr,
+    // Official sine-PE denominator: min(num_frames, max_obj_ptrs) - 1.
+    // Callers without a declared video length keep the 16-frame default.
+    int ptr_t_diff_max = 15) {
     const auto& hp = model.hparams;
     const int MD = hp.mem_out_dim;  // 64
     const int D = hp.neck_dim;      // 256
@@ -8112,9 +9149,10 @@ static sam3_prompt_data sam3_build_prompt_and_pos(
         int rel = ptr_tpos[p];
         if (rel < 0) continue;
 
-        // 1D sine PE for temporal position (normalized by max_obj_ptrs - 1 = 15)
+        // 1D sine PE for temporal position, normalized by the official
+        // t_diff_max (min(num_frames, max_obj_ptrs) - 1; 15 by default).
         std::vector<float> sine_pe(D);
-        sam3_get_1d_sine_pe(sine_pe.data(), (float)rel / 15.0f, D);
+        sam3_get_1d_sine_pe(sine_pe.data(), (float)rel / (float)ptr_t_diff_max, D);
 
         // Project 256-dim sine PE → 64-dim via obj_ptr_tpos_proj (CPU matmul)
         // W is [D=256, MD=64] in ggml; y[j] = sum_i W[i + j*D] * x[i] + b[j]
@@ -8591,6 +9629,147 @@ static sam3_box sam3_cxcywh_to_xyxy(float cx, float cy, float w, float h,
 /*****************************************************************************
 ** Image segmentation — PCS (text-prompted)
 *****************************************************************************/
+
+// ── Batch image inference (official set_image_batch flow) ───────────────────
+
+// Snapshot one tensor into a freshly allocated backend buffer owned by the
+// state (ggml_backend_tensor_copy does a direct device→device copy when the
+// backends match, else routes through the host).
+static struct ggml_tensor* sam3_clone_state_tensor(
+        sam3_state& state, const sam3_model& model, struct ggml_tensor* src) {
+    if (!src) return nullptr;
+    if (!state.ctx) {
+        struct ggml_init_params tp = {ggml_tensor_overhead() * 4096, nullptr, true};
+        state.ctx = ggml_init(tp);
+        if (!state.ctx) return nullptr;
+    }
+    auto* dst = ggml_new_tensor(state.ctx, src->type, ggml_n_dims(src), src->ne);
+    auto* buf = ggml_backend_alloc_buffer(model.backend, ggml_nbytes(src));
+    state.owned_buffers.push_back(buf);
+    struct ggml_tallocr ta = ggml_tallocr_new(buf);
+    ggml_tallocr_alloc(&ta, dst);
+    ggml_backend_tensor_copy(src, dst);
+    return dst;
+}
+
+/*
+** Encode a batch of images and keep a per-image snapshot of the detector-path
+** neck features inside the state (official set_image_batch semantics: one
+** state holds the whole batch, per-image sizes included). The detector
+** attends within each image only, so a subsequent sam3_segment_pcs_batch
+** produces exactly the same results as encoding and querying each image
+** separately.
+**
+** Returns the number of images encoded, or -1 on failure. A new call
+** replaces the previous batch (official reset_all_prompts + re-set flow).
+*/
+static int sam3_encode_image_batch_impl(sam3_state& state,
+                                        const sam3_model& model,
+                                        const sam3_image* images, int n) {
+    if (n <= 0 || !images) return -1;
+    if (model.hparams.visual_only || model.hparams.is_sam2()) {
+        fprintf(stderr, "%s: ERROR: batch detector path not available on %s model\n",
+                __func__, model.hparams.is_sam2() ? "SAM2" : "visual-only");
+        return -1;
+    }
+    // Drop the previous batch first so the buffers of a long-running session
+    // do not accumulate.
+    for (auto* b : state.owned_buffers)
+        if (b) ggml_backend_buffer_free(b);
+    state.owned_buffers.clear();
+    state.batch_slots.clear();
+
+    for (int i = 0; i < n; ++i) {
+        if (!sam3_encode_image(state, model, images[i])) {
+            fprintf(stderr, "%s: failed to encode image %d\n", __func__, i);
+            return -1;
+        }
+        sam3_state::sam3_batch_slot slot;
+        slot.orig_width  = state.orig_width;
+        slot.orig_height = state.orig_height;
+        for (int l = 0; l < 4; ++l) {
+            slot.neck_det[l]    = sam3_clone_state_tensor(state, model, state.neck_det[l]);
+            slot.neck_det_pe[l] = sam3_clone_state_tensor(state, model, state.neck_det_pe[l]);
+        }
+        state.batch_slots.push_back(slot);
+    }
+    return n;
+}
+
+/*
+** Run the PCS detector over a batch previously stored by
+** sam3_encode_image_batch (official set_image_batch + set_text_prompt flow).
+** The same text prompt is applied to every image of the batch; results[i]
+** corresponds to images[i] (masks are at that image's original resolution).
+** The detector graph is per-image (official img_ids select per-image features
+** out of the batched backbone output; attention never crosses images).
+**
+** Returns the number of processed images, or -1 on failure.
+*/
+static int sam3_segment_pcs_batch_impl(sam3_state& state,
+                                       const sam3_model& model,
+                                       const sam3_pcs_params& params,
+                                       sam3_result* results, int n) {
+    if (n <= 0 || !results) return -1;
+    if ((int)state.batch_slots.size() < n) {
+        fprintf(stderr, "%s: batch too small (%d slots < %d requested) — "
+                "call sam3_encode_image_batch first\n",
+                __func__, (int)state.batch_slots.size(), n);
+        return -1;
+    }
+    // Save the live single-image neck pointers and per-image geometry.
+    struct ggml_tensor* saved_det[4]    = {};
+    struct ggml_tensor* saved_pe[4]     = {};
+    const int saved_w = state.orig_width, saved_h = state.orig_height;
+    for (int l = 0; l < 4; ++l) {
+        saved_det[l] = state.neck_det[l];
+        saved_pe[l]  = state.neck_det_pe[l];
+    }
+
+    int done = 0;
+    for (int i = 0; i < n; ++i) {
+        results[i] = sam3_result{};
+        const auto& slot = state.batch_slots[i];
+        for (int l = 0; l < 4; ++l) {
+            state.neck_det[l]    = slot.neck_det[l];
+            state.neck_det_pe[l] = slot.neck_det_pe[l];
+        }
+        state.orig_width  = slot.orig_width;
+        state.orig_height = slot.orig_height;
+        results[i] = sam3_segment_pcs(state, model, params);
+        if (results[i].detections.empty())
+            SAM3_LOG(2, "%s: image %d: no detections above threshold\n", __func__, i);
+        ++done;
+    }
+
+    // Restore the live pointers so subsequent single-image calls behave as if
+    // the batch never happened.
+    for (int l = 0; l < 4; ++l) {
+        state.neck_det[l]    = saved_det[l];
+        state.neck_det_pe[l] = saved_pe[l];
+    }
+    state.orig_width  = saved_w;
+    state.orig_height = saved_h;
+    return done;
+}
+
+//**************************************************************************/**
+// Public wrappers (declared in sam3.h; kept out-of-line so the DLL surface
+// is identical to the rest of the API).
+//***************************************************************************/
+
+SAM3_API int sam3_encode_image_batch(sam3_state& state,
+                                     const sam3_model& model,
+                                     const sam3_image* images, int n) {
+    return sam3_encode_image_batch_impl(state, model, images, n);
+}
+
+SAM3_API int sam3_segment_pcs_batch(sam3_state& state,
+                                    const sam3_model& model,
+                                    const sam3_pcs_params& params,
+                                    sam3_result* results, int n) {
+    return sam3_segment_pcs_batch_impl(state, model, params, results, n);
+}
 
 sam3_result sam3_segment_pcs(sam3_state& state,
                              const sam3_model& model,
@@ -9076,6 +10255,7 @@ sam3_result sam3_segment_pcs(sam3_state& state,
         for (int i = 0; i < (int)mask_resized.size(); ++i)
             det.mask.data[i] = (mask_resized[i] > 0.0f) ? 255 : 0;
         det.mask.iou_score = score;
+        if (params.return_logits) det.mask_logits = std::move(mask_resized);
 
         dets.push_back(std::move(det));
     }
@@ -9701,6 +10881,109 @@ static sam3_dec_result sam3_build_sam_dec_graph(
 ** Image segmentation — PVS (visual-prompted) (Phase 6, Step 6.3)
 *****************************************************************************/
 
+// Encode a low-resolution mask prompt through the SAM prompt encoder's
+// mask_downscaling branch into a dense embedding [D, H, H], matching
+// PromptEncoder._embed_masks. Isolated sub-graph per the graph-isolation rule;
+// runs entirely on the model backend. The official mask input is 4x the
+// embedding grid (mask_input_size = 4 * image_embedding), row-major logits.
+// mask_logits (when non-empty) is used verbatim (official continuous-logits
+// semantics); otherwise the binary convenience mask is bilinearly resampled
+// and mapped to logit scale via l = 8*(2v-1) (sigmoid inverse: v=1 -> +8,
+// v=0 -> -8, interpolated edges in between). The logit scale matters: the
+// two LayerNorm2d stages cancel any GLOBAL scale of the conv output, but the
+// conv bias is scale-invariant, so a [0,1] input lets the bias dominate and
+// dilutes the mask's spatial signal — the official path feeds raw logits
+// with a ±10-class dynamic range, and the binary input must match it.
+static bool sam3_mask_prompt_dense(const sam3_model& model,
+                                   const sam3_pvs_params& params,
+                                   int D, int H,
+                                   std::vector<float>& out_dense) {
+    const int MI = H * 4;
+    std::vector<float> inp_data;
+
+    if (!params.mask_prompt_logits.empty()) {
+        if ((int)params.mask_prompt_logits.size() != MI * MI) {
+            fprintf(stderr, "%s: mask_prompt_logits must be %dx%d (got %zu)\n",
+                    __func__, MI, MI, params.mask_prompt_logits.size());
+            return false;
+        }
+        inp_data = params.mask_prompt_logits;   // official continuous-logits semantics
+    } else {
+        const sam3_mask& mp = params.mask_prompt;
+        if (mp.data.empty() || mp.width <= 0 || mp.height <= 0) return false;
+        std::vector<float> src((size_t)mp.width * mp.height);
+        for (size_t i = 0; i < src.size(); ++i) src[i] = mp.data[i] / 255.0f;
+        inp_data = sam3_bilinear_interpolate(
+            src.data(), mp.width, mp.height, MI, MI);
+        for (auto& v : inp_data) v = 8.0f * (2.0f * v - 1.0f);   // -> [-8, 8] logits
+    }
+
+    struct ggml_init_params gp = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * 128 + ggml_graph_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    struct ggml_context* ctx = ggml_init(gp);
+    if (!ctx) return false;
+
+    auto* inp = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, MI, MI, 1, 1);
+    ggml_set_name(inp, "mask_prompt_input");
+    ggml_set_input(inp);
+
+    const auto& pe = model.sam_pe;
+    // ggml conv_2d has no bias parameter — add it manually after each conv
+    // (bias [OC] reshaped to [1,1,OC,1] for broadcasting), matching the
+    // verified SAM2 encoder/decoder conv+bias patterns.
+    // ggml conv_2d output is [W, H, C, B] while sam3_layer_norm_2d normalizes
+    // over dim 0 (C). With ggml_permute's semantics (old dim i -> new dim A_i),
+    // (1,2,0,3) maps [W,H,C] to [C,W,H] (C at ne0) and (2,0,1,3) maps it back —
+    // the same verified pairing as the SAM2 decoder upscale path.
+    // NOTE: (2,0,1,3) instead yields [H,C,W], whose ne0 is H — normalizing
+    // spatial rows instead of channels (silently wrong; invisible on the
+    // no-mask path where the dense embedding is constant).
+    auto* x = ggml_conv_2d_sk_p0(ctx, pe.mask_ds_conv_w[0], inp);
+    x = ggml_add(ctx, x, ggml_reshape_4d(ctx, pe.mask_ds_conv_b[0], 1, 1, 4, 1));
+    x = ggml_cont(ctx, ggml_permute(ctx, x, 1, 2, 0, 3));   // [C, W, H, B]
+    x = sam3_layer_norm_2d(ctx, x, pe.mask_ds_norm_w[0], pe.mask_ds_norm_b[0]);
+    x = ggml_gelu(ctx, x);
+    x = ggml_cont(ctx, ggml_permute(ctx, x, 2, 0, 1, 3));   // back to [W, H, C, B]
+    x = ggml_conv_2d_sk_p0(ctx, pe.mask_ds_conv_w[1], x);
+    x = ggml_add(ctx, x, ggml_reshape_4d(ctx, pe.mask_ds_conv_b[1], 1, 1, 16, 1));
+    x = ggml_cont(ctx, ggml_permute(ctx, x, 1, 2, 0, 3));
+    x = sam3_layer_norm_2d(ctx, x, pe.mask_ds_norm_w[1], pe.mask_ds_norm_b[1]);
+    x = ggml_gelu(ctx, x);
+    x = ggml_cont(ctx, ggml_permute(ctx, x, 2, 0, 1, 3));
+    x = ggml_conv_2d_sk_p0(ctx, pe.mask_ds_conv_w[2], x);
+    x = ggml_add(ctx, x, ggml_reshape_4d(ctx, pe.mask_ds_conv_b[2], 1, 1, D, 1));
+    // conv output is [W, H, C, B]. (1,2,0,3) yields [C, W, H, B] — dim1 = x
+    // (col), dim2 = y (row), matching the dense-embedding cache layout
+    // idx = d + col*D + row*D*H.
+    x = ggml_cont(ctx, ggml_permute(ctx, x, 1, 2, 0, 3));
+    ggml_set_name(x, "mask_prompt_dense");
+    ggml_set_output(x);
+
+    struct ggml_cgraph* graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, x);
+
+    auto* galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+    bool ok = ggml_gallocr_reserve(galloc, graph) && ggml_gallocr_alloc_graph(galloc, graph);
+    if (ok) {
+        ggml_backend_tensor_set(inp, inp_data.data(), 0,
+                                (size_t)MI * MI * sizeof(float));
+        ok = sam3_graph_compute(model.backend, graph, 1);
+        if (ok) {
+            out_dense.resize((size_t)D * H * H);
+            ggml_backend_tensor_get(x, out_dense.data(), 0,
+                                    (size_t)D * H * H * sizeof(float));
+        }
+    }
+    ggml_gallocr_free(galloc);
+    ggml_free(ctx);
+    if (!ok)
+        fprintf(stderr, "%s: mask downscaling compute failed\n", __func__);
+    return ok;
+}
+
 sam3_result sam3_segment_pvs(sam3_state& state,
                              const sam3_model& model,
                              const sam3_pvs_params& params) {
@@ -9719,8 +11002,10 @@ sam3_result sam3_segment_pvs(sam3_state& state,
         fprintf(stderr, "%s: image not encoded — call sam3_encode_image first\n", __func__);
         return result;
     }
-    if (params.pos_points.empty() && !params.use_box) {
-        fprintf(stderr, "%s: no prompts provided (need at least one point or box)\n", __func__);
+    const bool has_mask_prompt = params.use_mask_prompt &&
+        (!params.mask_prompt_logits.empty() || !params.mask_prompt.data.empty());
+    if (params.pos_points.empty() && !params.use_box && !has_mask_prompt) {
+        fprintf(stderr, "%s: no prompts provided (need at least one point, box, or mask prompt)\n", __func__);
         return result;
     }
 
@@ -9854,11 +11139,24 @@ sam3_result sam3_segment_pvs(sam3_state& state,
             }
         }
 
-        // Dense PE grid and no-mask embedding — use pre-computed caches
+        // Dense PE grid and no-mask embedding — use pre-computed caches.
+        // A mask prompt replaces the no-mask dense embedding with the
+        // mask_downscaling branch output (official PromptEncoder semantics).
         ggml_backend_tensor_set(pe_out.image_pe, state.dense_pe_cache.data(),
                                 0, D * H * H * sizeof(float));
-        ggml_backend_tensor_set(pe_out.dense, state.dense_nomask_cache.data(),
-                                0, D * H * H * sizeof(float));
+        if (has_mask_prompt) {
+            std::vector<float> dense_mask;
+            if (sam3_mask_prompt_dense(model, params, D, H, dense_mask)) {
+                ggml_backend_tensor_set(pe_out.dense, dense_mask.data(),
+                                        0, D * H * H * sizeof(float));
+            } else {
+                ggml_backend_tensor_set(pe_out.dense, state.dense_nomask_cache.data(),
+                                        0, D * H * H * sizeof(float));
+            }
+        } else {
+            ggml_backend_tensor_set(pe_out.dense, state.dense_nomask_cache.data(),
+                                    0, D * H * H * sizeof(float));
+        }
     }
 
     // ── Copy tracker features from state to fresh input tensors ─────────
@@ -10013,6 +11311,7 @@ sam3_result sam3_segment_pvs(sam3_state& state,
         det.score = iou_data[m];
         det.iou_score = iou_data[m];
         det.instance_id = m;
+        if (params.return_logits) det.mask_logits = std::move(mask_resized);
 
         // Compute bounding box from mask
         int min_x = state.orig_width, min_y = state.orig_height;
@@ -10089,11 +11388,60 @@ static void sam3_ensure_tracker_pe_caches(sam3_tracker& tracker, const sam3_hpar
               tracker.cached_axial_cis_reord.size()) * sizeof(float) / 1024.0f);
 }
 
+// Official select_closest_cond_frames (sam3_tracker_utils.py): up to
+// `max_cond` conditioning frames closest to the current frame — the closest
+// one before it, the closest one at/after it, then the rest by |t - frame_idx|
+// ascending. max_cond < 0 (SAM2 video predictor) keeps every frame.
+static std::vector<int> sam3_select_closest_cond(const std::vector<int>& cond_frames,
+                                                 int frame_idx, int max_cond) {
+    if (max_cond < 0 || (int)cond_frames.size() <= max_cond)
+        return cond_frames;
+    int before = INT_MIN, after = INT_MAX;
+    for (int t : cond_frames) {
+        if (t < frame_idx && t > before) before = t;
+        if (t >= frame_idx && t < after)  after = t;
+    }
+    std::vector<int> selected;
+    if (before != INT_MIN) selected.push_back(before);
+    if (after  != INT_MAX) selected.push_back(after);
+    std::vector<int> rest;
+    for (int t : cond_frames)
+        if (t != before && t != after) rest.push_back(t);
+    std::stable_sort(rest.begin(), rest.end(), [&](int a, int b) {
+        return std::abs(a - frame_idx) < std::abs(b - frame_idx);
+    });
+    for (int t : rest) {
+        if ((int)selected.size() >= max_cond) break;
+        selected.push_back(t);
+    }
+    return selected;
+}
+
+// Official cal_mem_score (video_tracking_multiplex.py): per-frame memory
+// selection score — sigmoid(obj_logit) rescaled to [0,1] (0 when the object
+// is absent) times the best mask IoU — stored on the just-written
+// non-conditioning memory slot for the next frame's frame_filter.
+static void sam3_store_eff_iou_score(sam3_tracker& tracker, int inst_id,
+                                     int frame_idx, float obj_logit,
+                                     const std::vector<float>& iou_scores) {
+    float best_iou = 0.0f;
+    for (float v : iou_scores) best_iou = std::max(best_iou, v);
+    const float sig = 1.0f / (1.0f + std::exp(-obj_logit));
+    const float norm = obj_logit > 0.0f ? sig * 2.0f - 1.0f : 0.0f;
+    auto it = tracker.mem_banks.find(inst_id);
+    if (it != tracker.mem_banks.end()) {
+        for (auto s = it->second.rbegin(); s != it->second.rend(); ++s)
+            if (s->frame_index == frame_idx) { s->eff_iou_score = norm * best_iou; break; }
+    }
+    tracker.eff_history[inst_id][frame_idx] = norm * best_iou;
+}
+
 static sam3_prop_output sam3_propagate_single(
     sam3_tracker& tracker, sam3_state& state, const sam3_model& model,
     const sam3_masklet& masklet,
     const std::vector<sam3_memory_slot>& mem_bank,
-    const std::vector<std::pair<int, struct ggml_tensor*>>& ptr_bank) {
+    const std::vector<sam3_ptr_slot>& ptr_bank,
+    int frame_idx, bool reverse) {
     sam3_prop_output output = {};
     const auto& hp = model.hparams;
     const int D = hp.neck_dim, MD = hp.mem_out_dim;
@@ -10103,13 +11451,104 @@ static sam3_prop_output sam3_propagate_single(
     static const bool s_prof = getenv("SAM3_PROFILE_PROP") != nullptr;
     auto t_p0 = std::chrono::high_resolution_clock::now();
 
-    auto sel = sam3_select_memory_frames(mem_bank, hp.num_maskmem);
+    // ── Memory slot selection (official _prepare_memory_conditioned_features)
+    // Conditioning frames first (official select_closest_cond_frames — no
+    // directional filter: a reverse pass still attends to the prompt frame
+    // recorded on the other side of the current frame), then non-conditioning
+    // frames from the tracking-order past side, earliest first (t_pos = 1 ..
+    // num_maskmem-1). With use_memory_selection the non-conditioning set is
+    // the official frame_filter result (eff_iou_score threshold + adjacent
+    // must-include); without it the bank's sliding window applies.
+    std::vector<int> cond_slot_idx, nc_slot_idx;
+    for (int i = 0; i < (int)mem_bank.size(); ++i)
+        (mem_bank[i].is_cond_frame ? cond_slot_idx : nc_slot_idx).push_back(i);
+
+    auto side_dist = [&](int slot) {
+        return reverse ? mem_bank[slot].frame_index - frame_idx
+                       : frame_idx - mem_bank[slot].frame_index;
+    };
+
+    std::vector<int> sel;
+    {
+        std::vector<int> cond_frames;
+        for (int i : cond_slot_idx) cond_frames.push_back(mem_bank[i].frame_index);
+        for (int t : sam3_select_closest_cond(cond_frames, frame_idx,
+                                              hp.max_cond_frames_in_attn))
+            for (int i : cond_slot_idx)
+                if (mem_bank[i].frame_index == t) { sel.push_back(i); break; }
+    }
+    const int n_cond = (int)sel.size();
+
+    // frame_filter valid frame indices (ascending, nearest last) — shared by
+    // the non-conditioning memory slots and the object pointers, exactly as
+    // in the official track_step.
+    std::vector<int> ff_valid;
+    if (hp.use_memory_selection) {
+        const bool at_boundary = tracker.total_frames > 0 &&
+            ((frame_idx == 0 && !reverse) ||
+             (frame_idx == tracker.total_frames - 1 && reverse));
+        if (!at_boundary) {
+            const int max_num = std::min(tracker.total_frames > 0 ? tracker.total_frames
+                                                                  : hp.max_obj_ptrs,
+                                         (int)hp.max_obj_ptrs);
+            const float mf_thr = hp.mf_threshold_x100 / 100.0f;
+            const int must_include = reverse ? frame_idx + 1 : frame_idx - 1;
+            // Candidates: the full-session eff_iou_score history on the
+            // tracking-order past side. The official frame_filter scans the
+            // whole (untrimmed) non-cond output dict; the memory bank's
+            // sliding window alone would forget old frames, so the durable
+            // eff_history is the scan source. Frames whose memory slot or
+            // pointer has been evicted simply miss in the consumers below,
+            // exactly like an official dict miss.
+            std::vector<std::pair<int, float>> scan;  // (frame, eff), nearest first
+            auto hist = tracker.eff_history.find(masklet.instance_id);
+            if (hist != tracker.eff_history.end())
+                for (const auto& [t, e] : hist->second)
+                    if ((reverse ? t - frame_idx : frame_idx - t) >= 1)
+                        scan.push_back({t, e});
+            std::stable_sort(scan.begin(), scan.end(),
+                             [&](const std::pair<int, float>& a,
+                                 const std::pair<int, float>& b) {
+                                 const int da = reverse ? a.first - frame_idx
+                                                        : frame_idx - a.first;
+                                 const int db = reverse ? b.first - frame_idx
+                                                        : frame_idx - b.first;
+                                 return da < db;
+                             });
+            for (const auto& [t, e] : scan) {
+                if ((int)ff_valid.size() >= max_num - 1) break;
+                if (e > mf_thr) ff_valid.insert(ff_valid.begin(), t);
+            }
+            // The official filter appends the adjacent frame unconditionally
+            // when missing from the list (a frame that was never processed
+            // simply misses in the later dict lookup — same here).
+            bool has_must = false;
+            for (int t : ff_valid) if (t == must_include) { has_must = true; break; }
+            if (!has_must) ff_valid.push_back(must_include);
+        }
+    }
+
+    std::vector<int> nc;
+    if (hp.use_memory_selection) {
+        for (int t : ff_valid)
+            for (int i : nc_slot_idx)
+                if (mem_bank[i].frame_index == t) { nc.push_back(i); break; }
+    } else {
+        // Fixed sliding window: distance-ordered non-cond slots (earliest
+        // first, closest last) on the tracking-order past side only.
+        for (int i : nc_slot_idx)
+            if (side_dist(i) >= 0) nc.push_back(i);
+        std::stable_sort(nc.begin(), nc.end(),
+                         [&](int a, int b) { return side_dist(a) > side_dist(b); });
+    }
+    sel.insert(sel.end(), nc.begin(), nc.end());
     if (sel.empty()) return output;
 
     // ── Build prompt and prompt_pos via sam3_build_prompt_and_pos ─────────
     const int N_per_slot = N;
 
-    int n_sel = (int)sel.size();
+    const int n_sel = (int)sel.size();
+    const int L = n_sel - n_cond;  // non-cond slots, earliest-first
     std::vector<std::vector<float>> slot_feats(n_sel), slot_pes(n_sel);
     std::vector<int> spatial_tpos(n_sel, 1);  // default t_pos=1 for non-cond
     sam3_ensure_tracker_pe_caches(tracker, hp, H);
@@ -10120,24 +11559,95 @@ static sam3_prop_output sam3_propagate_single(
         // The stored spatial PE is the same sinusoidal grid, so reuse the CPU
         // cache instead of downloading it from the GPU for every memory slot.
         slot_pes[s] = tracker.cached_sinpe_64;
-        spatial_tpos[s] = mem_bank[sel[s]].is_cond_frame ? 0 : (n_sel - s);
+        // Official temporal position: cond -> 0; non-cond slot j (0-based,
+        // earliest first) -> num_maskmem - (L - j), i.e. POSITIONAL, not the
+        // raw frame distance. The closest non-cond slot gets t_pos =
+        // num_maskmem-1 -> maskmem_tpos_enc[0], exactly as in Python.
+        spatial_tpos[s] = (s < n_cond) ? 0 : (hp.num_maskmem - L + (s - n_cond));
     }
 
-    int P = std::min((int)ptr_bank.size(), hp.max_obj_ptrs);
+    // ── Object pointers (official use_obj_ptrs_in_encoder selection) ──────
+    // Conditioning-frame pointers first (same closest-cond set as the memory
+    // slots), then up to max_obj_ptrs-1 non-conditioning pointers from the
+    // tracking-order past side only (frame_idx-1, -2, ... forward;
+    // frame_idx+1, +2, ... reverse — official L1505-1527). Temporal positions
+    // are non-negative tracking-order distances; with memory selection they
+    // are the 1-based position in the frame_filter valid list (the raw frame
+    // distance changes meaning once the filter drops frames). 0 is legal (the
+    // conditioning frame itself, re-processed by the first forward call).
+    std::vector<const sam3_ptr_slot*> sel_ptrs;
+    {
+        // Per-identity lookup: the same frame may legitimately hold both a
+        // cond pointer (the prompt pass) and a non-cond one (its re-processed
+        // pass), mirroring the official cond/non-cond output dicts.
+        auto pick = [&](int t, bool cond) -> const sam3_ptr_slot* {
+            const sam3_ptr_slot* best = nullptr;
+            for (const auto& s : ptr_bank)
+                if (s.frame_index == t && s.is_cond == cond) best = &s;
+            return best;
+        };
+        std::vector<int> cond_frames;
+        for (const auto& s : ptr_bank)
+            if (s.is_cond) cond_frames.push_back(s.frame_index);
+        for (int t : sam3_select_closest_cond(cond_frames, frame_idx,
+                                              hp.max_cond_frames_in_attn)) {
+            const sam3_ptr_slot* s = pick(t, true);
+            if (s) sel_ptrs.push_back(s);
+        }
+        if (hp.use_memory_selection) {
+            for (int d = 1; d <= (int)ff_valid.size() && d < hp.max_obj_ptrs; ++d) {
+                const sam3_ptr_slot* s = pick(ff_valid[ff_valid.size() - d], false);
+                if (s) sel_ptrs.push_back(s);
+            }
+        } else {
+            std::vector<const sam3_ptr_slot*> cand;
+            for (const auto& s : ptr_bank) {
+                const int dist = reverse ? s.frame_index - frame_idx
+                                         : frame_idx - s.frame_index;
+                if (!s.is_cond && dist >= 1 && dist < hp.max_obj_ptrs)
+                    cand.push_back(&s);
+            }
+            std::stable_sort(cand.begin(), cand.end(),
+                             [&](const sam3_ptr_slot* a, const sam3_ptr_slot* b) {
+                                 const int da = reverse ? a->frame_index - frame_idx
+                                                        : frame_idx - a->frame_index;
+                                 const int db = reverse ? b->frame_index - frame_idx
+                                                        : frame_idx - b->frame_index;
+                                 return da < db;  // nearest first (t_diff order)
+                             });
+            sel_ptrs.insert(sel_ptrs.end(), cand.begin(), cand.end());
+        }
+    }
+    const int P = (int)sel_ptrs.size();
     std::vector<std::vector<float>> obj_ptrs(P);
     std::vector<int> ptr_tpos(P);
-    int cur_frame = tracker.frame_index;
     for (int p = 0; p < P; ++p) {
         obj_ptrs[p].resize(D);
-        ggml_backend_tensor_get(ptr_bank[p].second, obj_ptrs[p].data(), 0, D * sizeof(float));
-        // Use actual frame distance (matches Python: abs(frame_idx - t))
-        ptr_tpos[p] = std::abs(cur_frame - ptr_bank[p].first);
-        if (ptr_tpos[p] < 1) ptr_tpos[p] = 1;  // minimum distance of 1
+        ggml_backend_tensor_get(sel_ptrs[p]->ptr, obj_ptrs[p].data(), 0, D * sizeof(float));
+        if (hp.use_memory_selection && !sel_ptrs[p]->is_cond) {
+            // position in the frame_filter valid list, nearest = 1
+            const int t = sel_ptrs[p]->frame_index;
+            ptr_tpos[p] = (int)ff_valid.size()
+                          - (int)(std::find(ff_valid.begin(), ff_valid.end(), t)
+                                  - ff_valid.begin());
+        } else {
+            // Official: relative distance in tracking order, sign-folded by
+            // tpos_sign_mul — the non-negative distance is identical in both
+            // directions.
+            ptr_tpos[p] = std::abs(frame_idx - sel_ptrs[p]->frame_index);
+        }
     }
+
+    // Sine-PE normalization: official divides by (min(num_frames,
+    // max_obj_ptrs) - 1). Without a declared video length the denominator
+    // is max_obj_ptrs - 1, which is exact for videos of 16+ frames.
+    int t_diff_max = hp.max_obj_ptrs - 1;
+    if (tracker.total_frames > 0)
+        t_diff_max = std::min(tracker.total_frames, hp.max_obj_ptrs) - 1;
 
     auto pd = sam3_build_prompt_and_pos(model, slot_feats, slot_pes, spatial_tpos, obj_ptrs, ptr_tpos, H,
                                         &tracker.mem_tpos_enc, &tracker.mem_ptr_tpos_w,
-                                        &tracker.mem_ptr_tpos_b);
+                                        &tracker.mem_ptr_tpos_b, t_diff_max);
 
     // ── RoPE frequencies (cached) ──────────────────────────────────────
     sam3_ensure_tracker_pe_caches(tracker, hp, H);
@@ -10477,9 +11987,12 @@ static std::vector<std::pair<int, int>> sam3_match_detections(
     return matches;
 }
 
-static void sam3_update_tracker(sam3_tracker& tracker, int frame_idx) {
+static void sam3_update_tracker(sam3_tracker& tracker, int frame_idx, bool reverse) {
+    // Hotstart age / keep-alive staleness are measured in *tracking order*,
+    // so they fold to the frame distance in either direction.
     for (auto it = tracker.pending.begin(); it != tracker.pending.end();) {
-        int age = frame_idx - it->first_frame;
+        int age = reverse ? (it->first_frame - frame_idx)
+                          : (frame_idx - it->first_frame);
         if (age >= tracker.params.hotstart_delay && it->mds_sum > 0) {
             it->confirmed = true;
             tracker.masklets.push_back(std::move(*it));
@@ -10490,7 +12003,9 @@ static void sam3_update_tracker(sam3_tracker& tracker, int frame_idx) {
             ++it;
     }
     for (auto it = tracker.masklets.begin(); it != tracker.masklets.end();) {
-        if (frame_idx - it->last_seen > tracker.params.max_keep_alive) {
+        int idle = reverse ? (it->last_seen - frame_idx)
+                           : (frame_idx - it->last_seen);
+        if (idle > tracker.params.max_keep_alive) {
             tracker.mem_banks.erase(it->instance_id);
             tracker.ptr_banks.erase(it->instance_id);
             it = tracker.masklets.erase(it);
@@ -10705,7 +12220,7 @@ static bool sam3_encode_memory(
 
 static void sam3_store_obj_ptr(
     sam3_tracker& tracker, const sam3_model& model,
-    int inst_id, const float* pd, int frame_idx) {
+    int inst_id, const float* pd, int frame_idx, bool is_cond) {
     const int D = model.hparams.neck_dim;
     if (!tracker.ctx) {
         struct ggml_init_params tp = {ggml_tensor_overhead() * 4096, nullptr, true};
@@ -10718,8 +12233,33 @@ static void sam3_store_obj_ptr(
     tracker.owned_buffers.push_back(pb);
     ggml_backend_tensor_set(pt, pd, 0, D * sizeof(float));
     auto& bk = tracker.ptr_banks[inst_id];
-    bk.push_back({frame_idx, pt});
-    while ((int)bk.size() > model.hparams.max_obj_ptrs) bk.erase(bk.begin());
+    // Same frame + same conditioning identity → replace (official per-dict
+    // one-output-per-frame, e.g. refine re-prompting the same frame).
+    // Same frame with the OTHER identity → keep both: the official flow
+    // stores the re-processed prompt frame in non_cond_frame_outputs while
+    // cond_frame_outputs[0] remains, and both pointers participate in the
+    // encoder selection.
+    for (auto& s : bk)
+        if (s.frame_index == frame_idx && s.is_cond == is_cond) {
+            s.ptr = pt;
+            return;
+        }
+    bk.push_back({frame_idx, pt, is_cond});
+    // Evict oldest non-cond slots only: conditioning-frame pointers are kept
+    // for the whole session (the official cond_frame_outputs dict never
+    // evicts), so a long forward run cannot starve the prompt-frame pointer
+    // that reverse passes and the closest-cond selection rely on. With the
+    // closest-cond selection active (max_cond >= 0) the cap grows by the
+    // reserved cond budget; SAM2 (max_cond = -1) keeps the plain cap.
+    const int cap = model.hparams.max_obj_ptrs +
+                    (model.hparams.max_cond_frames_in_attn > 0
+                         ? model.hparams.max_cond_frames_in_attn : 0);
+    while ((int)bk.size() > cap) {
+        bool evicted = false;
+        for (auto it = bk.begin(); it != bk.end(); ++it)
+            if (!it->is_cond) { bk.erase(it); evicted = true; break; }
+        if (!evicted) bk.erase(bk.begin());
+    }
 }
 
 sam3_tracker_ptr sam3_create_tracker(const sam3_model& model,
@@ -10731,6 +12271,7 @@ sam3_tracker_ptr sam3_create_tracker(const sam3_model& model,
     }
     sam3_tracker_ptr tracker(new sam3_tracker());
     tracker->params = params;
+    tracker->total_frames = params.total_frames;
     fprintf(stderr, "%s: tracker created (hotstart=%d, max_keep_alive=%d)\n",
             __func__, params.hotstart_delay, params.max_keep_alive);
     return tracker;
@@ -10757,7 +12298,7 @@ sam3_result sam3_track_frame(sam3_tracker& tracker, sam3_state& state,
         int id = ml.instance_id;
         auto im = tracker.mem_banks.find(id);
         if (im == tracker.mem_banks.end() || im->second.empty()) continue;
-        po[id] = sam3_propagate_single(tracker, state, model, ml, im->second, tracker.ptr_banks[id]);
+        po[id] = sam3_propagate_single(tracker, state, model, ml, im->second, tracker.ptr_banks[id], fi, false);
         if (po[id].mask_logits.empty()) continue;
         auto rs = sam3_bilinear_interpolate(po[id].mask_logits.data(),
                                             po[id].mask_w, po[id].mask_h, state.orig_width, state.orig_height);
@@ -10779,7 +12320,7 @@ sam3_result sam3_track_frame(sam3_tracker& tracker, sam3_state& state,
         int id = ml.instance_id;
         auto im = tracker.mem_banks.find(id);
         if (im == tracker.mem_banks.end() || im->second.empty()) continue;
-        auto p2 = sam3_propagate_single(tracker, state, model, ml, im->second, tracker.ptr_banks[id]);
+        auto p2 = sam3_propagate_single(tracker, state, model, ml, im->second, tracker.ptr_banks[id], fi, false);
         if (!p2.mask_logits.empty()) {
             ml.last_score = p2.iou_scores[0];
             ml.last_seen = fi;
@@ -10792,9 +12333,11 @@ sam3_result sam3_track_frame(sam3_tracker& tracker, sam3_state& state,
             ml.mds_sum += (c2 > 0.001f && p2.obj_score > 0.0f) ? 1 : -1;
             sam3_encode_memory(tracker, state, model, id,
                                p2.mask_logits.data(), p2.mask_h, p2.mask_w, fi, false, p2.obj_score);
+            if (model.hparams.use_memory_selection)
+                sam3_store_eff_iou_score(tracker, id, fi, p2.obj_score, p2.iou_scores);
             std::vector<float> op(D);
             sam3_extract_obj_ptr_cpu(model, p2.sam_token.data(), p2.obj_score, op.data());
-            sam3_store_obj_ptr(tracker, model, id, op.data(), fi);
+            sam3_store_obj_ptr(tracker, model, id, op.data(), fi, false);
         }
     }
     sam3_result nd;
@@ -10885,7 +12428,7 @@ sam3_result sam3_track_frame(sam3_tracker& tracker, sam3_state& state,
             } else {
                 ggml_backend_tensor_get(nop, no_ptr.data(), 0, D * sizeof(float));
             }
-            sam3_store_obj_ptr(tracker, model, ml.instance_id, no_ptr.data(), fi);
+            sam3_store_obj_ptr(tracker, model, ml.instance_id, no_ptr.data(), fi, true);
         }
 
         tracker.pending.push_back(std::move(ml));
@@ -10896,11 +12439,13 @@ sam3_result sam3_track_frame(sam3_tracker& tracker, sam3_state& state,
         if (it == po.end() || it->second.mask_logits.empty()) continue;
         sam3_encode_memory(tracker, state, model, id,
                            it->second.mask_logits.data(), it->second.mask_h, it->second.mask_w, fi, false, it->second.obj_score);
+        if (model.hparams.use_memory_selection)
+            sam3_store_eff_iou_score(tracker, id, fi, it->second.obj_score, po[id].iou_scores);
         std::vector<float> op(D);
         sam3_extract_obj_ptr_cpu(model, it->second.sam_token.data(), it->second.obj_score, op.data());
-        sam3_store_obj_ptr(tracker, model, id, op.data(), fi);
+        sam3_store_obj_ptr(tracker, model, id, op.data(), fi, false);
     }
-    sam3_update_tracker(tracker, fi);
+    sam3_update_tracker(tracker, fi, false);
 
     // Helper: build detection from a mask and add to result
     auto add_mask_to_result = [&](int inst_id, float score, const sam3_mask& mask) {
@@ -10962,7 +12507,8 @@ sam3_result sam3_track_frame(sam3_tracker& tracker, sam3_state& state,
 bool sam3_refine_instance(sam3_tracker& tracker, sam3_state& state,
                           const sam3_model& model, int instance_id,
                           const std::vector<sam3_point>& pos_points,
-                          const std::vector<sam3_point>& neg_points) {
+                          const std::vector<sam3_point>& neg_points,
+                          int frame_idx) {
     const int D = model.hparams.neck_dim;
     sam3_masklet* tgt = nullptr;
     for (auto& ml : tracker.masklets)
@@ -10986,9 +12532,13 @@ bool sam3_refine_instance(sam3_tracker& tracker, sam3_state& state,
     pvs.multimask = false;
     auto r = sam3_segment_pvs(state, model, pvs);
     if (r.detections.empty()) return false;
-    // tracker.frame_index points to the *next* frame; the refinement applies
-    // to the frame that was last tracked / encoded.
-    int fi = std::max(0, tracker.frame_index - 1);
+    // Conditioning frame: -1 = the frame just tracked / encoded; an explicit
+    // value conditions on that frame (official add_prompt at any frame).
+    if (frame_idx < -1) {
+        fprintf(stderr, "%s: invalid frame_idx %d\n", __func__, frame_idx);
+        return false;
+    }
+    int fi = (frame_idx >= 0) ? frame_idx : std::max(0, tracker.frame_index - 1);
     const auto& rdet = r.detections[0];
     tgt->last_score = rdet.score;
     tgt->last_seen = fi;
@@ -10998,14 +12548,18 @@ bool sam3_refine_instance(sam3_tracker& tracker, sam3_state& state,
     } else {
         std::fill(op.begin(), op.end(), 0.0f);
     }
-    sam3_store_obj_ptr(tracker, model, instance_id, op.data(), fi);
+    sam3_store_obj_ptr(tracker, model, instance_id, op.data(), fi, false);
+    // Official propagate_in_video(start_frame_idx) semantics: the next
+    // forward propagate re-processes the refined frame first.
+    tracker.frame_index = fi;
     SAM3_LOG(2, "%s: refined instance %d\n", __func__, instance_id);
     return true;
 }
 
 int sam3_tracker_add_instance(sam3_tracker& tracker, sam3_state& state,
                               const sam3_model& model,
-                              const sam3_pvs_params& pvs_params) {
+                              const sam3_pvs_params& pvs_params,
+                              int frame_idx) {
     const int D = model.hparams.neck_dim;
     const int mask_hw = sam3_eff_feat_size(state, model.hparams) * 4;
 
@@ -11023,10 +12577,15 @@ int sam3_tracker_add_instance(sam3_tracker& tracker, sam3_state& state,
     }
 
     int inst_id = tracker.next_inst_id++;
-    // tracker.frame_index points to the *next* frame to process;
-    // the instance is being added on the frame that was just tracked.
-    int fi = tracker.frame_index - 1;
-    if (fi < 0) fi = 0;
+    // Conditioning frame: -1 = the frame just tracked / encoded (frame 0 on a
+    // fresh tracker); an explicit value conditions on that frame — the caller
+    // must have encoded its image. This is what enables starting a track at
+    // an arbitrary video position (e.g. reverse tracking from frame N).
+    if (frame_idx < -1) {
+        fprintf(stderr, "%s: invalid frame_idx %d\n", __func__, frame_idx);
+        return -1;
+    }
+    int fi = (frame_idx >= 0) ? frame_idx : std::max(0, tracker.frame_index - 1);
 
     // Create synthetic 288x288 logits from the binary mask.
     // sam3_encode_memory applies sigmoid then scale/bias, so +6/-6 gives
@@ -11060,7 +12619,7 @@ int sam3_tracker_add_instance(sam3_tracker& tracker, sam3_state& state,
     } else {
         std::fill(op.begin(), op.end(), 0.0f);
     }
-    sam3_store_obj_ptr(tracker, model, inst_id, op.data(), fi);
+    sam3_store_obj_ptr(tracker, model, inst_id, op.data(), fi, true);
 
     // Create confirmed masklet
     sam3_masklet ml;
@@ -11072,13 +12631,18 @@ int sam3_tracker_add_instance(sam3_tracker& tracker, sam3_state& state,
     ml.mds_sum = 1;
     tracker.masklets.push_back(std::move(ml));
 
+    // Official propagate_in_video semantics: forward propagation re-processes
+    // the prompt frame first (range(start, end]); reverse starts at fi-1
+    // (range(start-1, ..., -1)).
+    tracker.frame_index = fi;
     SAM3_LOG(2, "%s: added instance #%d (score=%.3f)\n", __func__, inst_id, det.score);
     return inst_id;
 }
 
 int sam3_tracker_add_instance_from_mask(sam3_tracker& tracker, sam3_state& state,
                                         const sam3_model& model,
-                                        const sam3_mask& mask, float obj_score) {
+                                        const sam3_mask& mask, float obj_score,
+                                        int frame_idx) {
     const int D = model.hparams.neck_dim;
     const int mask_hw = sam3_eff_feat_size(state, model.hparams) * 4;
 
@@ -11093,10 +12657,14 @@ int sam3_tracker_add_instance_from_mask(sam3_tracker& tracker, sam3_state& state
     }
 
     int inst_id = tracker.next_inst_id++;
-    // tracker.frame_index points to the *next* frame to process; the instance
-    // is being added on the frame that was just encoded.
-    int fi = tracker.frame_index - 1;
-    if (fi < 0) fi = 0;
+    // Conditioning frame: -1 = the frame just encoded (frame 0 on a fresh
+    // tracker); an explicit value conditions on that frame — the caller must
+    // have encoded its image (same convention as sam3_tracker_add_instance).
+    if (frame_idx < -1) {
+        fprintf(stderr, "%s: invalid frame_idx %d\n", __func__, frame_idx);
+        return -1;
+    }
+    int fi = (frame_idx >= 0) ? frame_idx : std::max(0, tracker.frame_index - 1);
 
     // Resample the supplied binary mask to the memory resolution and turn it
     // into synthetic logits. sam3_encode_memory applies sigmoid then scale/bias,
@@ -11139,11 +12707,12 @@ int sam3_tracker_add_instance_from_mask(sam3_tracker& tracker, sam3_state& state
         auto mb = tracker.mem_banks.find(inst_id);
         if (mb != tracker.mem_banks.end() && !mb->second.empty()) {
             // sam3_propagate_single reads no masklet fields; a default probe is fine.
-            const std::vector<std::pair<int, struct ggml_tensor*>> empty_ptr_bank;
+            const std::vector<sam3_ptr_slot> empty_ptr_bank;
             sam3_masklet probe;
             probe.instance_id = inst_id;
             sam3_prop_output seed = sam3_propagate_single(
-                tracker, state, model, probe, mb->second, empty_ptr_bank);
+                tracker, state, model, probe, mb->second, empty_ptr_bank,
+                fi, false);
             if ((int)seed.sam_token.size() == D) {
                 // seed.obj_score is the raw presence logit (thresholded at 0
                 // inside sam3_extract_obj_ptr_cpu), matching the propagate path.
@@ -11158,7 +12727,7 @@ int sam3_tracker_add_instance_from_mask(sam3_tracker& tracker, sam3_state& state
         fprintf(stderr, "%s: seed decode failed, falling back to no_obj_ptr\n", __func__);
         ggml_backend_tensor_get(model.no_obj_ptr, obj_ptr.data(), 0, D * sizeof(float));
     }
-    sam3_store_obj_ptr(tracker, model, inst_id, obj_ptr.data(), fi);
+    sam3_store_obj_ptr(tracker, model, inst_id, obj_ptr.data(), fi, true);
 
     // Create confirmed masklet
     sam3_masklet ml;
@@ -11170,6 +12739,9 @@ int sam3_tracker_add_instance_from_mask(sam3_tracker& tracker, sam3_state& state
     ml.mds_sum = 1;
     tracker.masklets.push_back(std::move(ml));
 
+    // Official propagate_in_video semantics: forward propagation re-processes
+    // the prompt frame first (range(start, end]); reverse starts at fi-1.
+    tracker.frame_index = fi;
     SAM3_LOG(2, "%s: added instance #%d from mask (obj_score=%.3f)\n",
              __func__, inst_id, obj_score);
     return inst_id;
@@ -11184,6 +12756,7 @@ void sam3_tracker_reset(sam3_tracker& tracker) {
     tracker.pending.clear();
     tracker.mem_banks.clear();
     tracker.ptr_banks.clear();
+    tracker.eff_history.clear();
     for (auto* b : tracker.owned_buffers)
         if (b) ggml_backend_buffer_free(b);
     tracker.owned_buffers.clear();
@@ -11213,6 +12786,100 @@ void sam3_tracker_reset(sam3_tracker& tracker) {
     tracker.prop_consts_uploaded = false;
 }
 
+bool sam3_tracker_remove_instance(sam3_tracker& tracker, int instance_id) {
+    bool removed = false;
+    for (auto it = tracker.masklets.begin(); it != tracker.masklets.end(); ++it)
+        if (it->instance_id == instance_id) { tracker.masklets.erase(it); removed = true; break; }
+    for (auto it = tracker.pending.begin(); it != tracker.pending.end(); ++it)
+        if (it->instance_id == instance_id) { tracker.pending.erase(it); removed = true; break; }
+    if (tracker.mem_banks.erase(instance_id) > 0) removed = true;
+    if (tracker.ptr_banks.erase(instance_id) > 0) removed = true;
+    tracker.eff_history.erase(instance_id);
+    if (removed)
+        SAM3_LOG(2, "%s: removed instance #%d (%zu active)\n", __func__,
+                 instance_id, tracker.masklets.size() + tracker.pending.size());
+    return removed;
+}
+
+int sam3_tracker_rewind(sam3_tracker& tracker, int frame_index) {
+    if (frame_index < 0 || frame_index >= tracker.frame_index) {
+        fprintf(stderr, "%s: invalid frame_index %d (current %d)\n",
+                __func__, frame_index, tracker.frame_index);
+        return -1;
+    }
+    int dropped = 0;
+    for (auto& mkb : tracker.mem_banks) {
+        for (auto it = mkb.second.begin(); it != mkb.second.end();) {
+            if (it->frame_index > frame_index) { it = mkb.second.erase(it); ++dropped; }
+            else ++it;
+        }
+    }
+    // eff history beyond the rewind point is dropped too (the replay rewrites
+    // those frames).
+    for (auto& eh : tracker.eff_history)
+        for (auto it = eh.second.begin(); it != eh.second.end();)
+            if (it->first > frame_index) it = eh.second.erase(it);
+            else ++it;
+    for (auto& ptb : tracker.ptr_banks) {
+        for (auto it = ptb.second.begin(); it != ptb.second.end();) {
+            if (it->frame_index > frame_index) it = ptb.second.erase(it);
+            else ++it;
+        }
+    }
+    // Instances that first appeared after the target frame do not exist at
+    // that frame yet — remove them entirely (official re-prompt semantics).
+    for (auto it = tracker.masklets.begin(); it != tracker.masklets.end();) {
+        if (it->first_frame > frame_index) {
+            tracker.mem_banks.erase(it->instance_id);
+            tracker.ptr_banks.erase(it->instance_id);
+            SAM3_LOG(2, "%s: dropped instance #%d (first_frame %d > %d)\n",
+                     __func__, it->instance_id, it->first_frame, frame_index);
+            it = tracker.masklets.erase(it);
+        } else {
+            // Keep-alive accounting must not see frames that were rewound.
+            if (it->last_seen > frame_index) it->last_seen = frame_index;
+            ++it;
+        }
+    }
+    for (auto it = tracker.pending.begin(); it != tracker.pending.end();) {
+        if (it->first_frame > frame_index) {
+            tracker.mem_banks.erase(it->instance_id);
+            tracker.ptr_banks.erase(it->instance_id);
+            tracker.eff_history.erase(it->instance_id);
+            it = tracker.pending.erase(it);
+        } else ++it;
+    }
+    // Reposition so a following add/refine with the default frame_idx = -1
+    // conditions exactly on `frame_index`, and the next forward propagate
+    // re-processes that frame first (official replay-from-prompt-frame flow).
+    tracker.frame_index = frame_index + 1;
+    SAM3_LOG(2, "%s: rewound to frame %d (%d memory slots dropped, %zu active)\n",
+             __func__, frame_index, dropped,
+             tracker.masklets.size() + tracker.pending.size());
+    return dropped;
+}
+
+bool sam3_tracker_clear_instance_frame(sam3_tracker& tracker, int instance_id, int frame_index) {
+    auto mb = tracker.mem_banks.find(instance_id);
+    if (mb == tracker.mem_banks.end()) return false;
+    bool removed = false;
+    for (auto it = mb->second.begin(); it != mb->second.end();) {
+        if (it->frame_index == frame_index) { it = mb->second.erase(it); removed = true; }
+        else ++it;
+    }
+    auto pb = tracker.ptr_banks.find(instance_id);
+    if (pb != tracker.ptr_banks.end()) {
+        for (auto it = pb->second.begin(); it != pb->second.end();) {
+            if (it->frame_index == frame_index) { it = pb->second.erase(it); removed = true; }
+            else ++it;
+        }
+    }
+    if (removed)
+        SAM3_LOG(2, "%s: cleared instance #%d @ frame %d\n",
+                 __func__, instance_id, frame_index);
+    return removed;
+}
+
 /*****************************************************************************
 ** Visual-only video tracking
 *****************************************************************************/
@@ -11226,8 +12893,10 @@ sam3_tracker_ptr sam3_create_visual_tracker(
     vp.max_keep_alive       = params.max_keep_alive;
     vp.recondition_every    = params.recondition_every;
     vp.fill_hole_area       = params.fill_hole_area;
+    vp.total_frames         = params.total_frames;
     sam3_tracker_ptr tracker(new sam3_tracker());
     tracker->params = vp;
+    tracker->total_frames = params.total_frames;
     fprintf(stderr, "%s: visual-only tracker created (max_keep_alive=%d)\n",
             __func__, params.max_keep_alive);
     return tracker;
@@ -11235,13 +12904,23 @@ sam3_tracker_ptr sam3_create_visual_tracker(
 
 sam3_result sam3_propagate_frame(
         sam3_tracker& tracker, sam3_state& state,
-        const sam3_model& model, const sam3_image& frame) {
+        const sam3_model& model, const sam3_image& frame, bool reverse) {
     sam3_result result;
     const int D = model.hparams.neck_dim;
     if (!sam3_encode_image(state, model, frame)) return result;
-    int fi = tracker.frame_index;
-    fprintf(stderr, "%s: frame %d (%zu active + %zu pending)\n",
-            __func__, fi, tracker.masklets.size(), tracker.pending.size());
+    // Official processing orders (propagate_in_video): forward covers
+    // range(start, end+1] — the prompt frame is re-processed first — while
+    // reverse covers range(start-1, ..., -1): it starts at the frame BEFORE
+    // the prompt frame and never re-processes the prompt frame itself.
+    if (reverse && tracker.frame_index <= 0) {
+        fprintf(stderr, "%s: cannot propagate in reverse from frame %d\n",
+                __func__, tracker.frame_index);
+        return result;
+    }
+    int fi = reverse ? tracker.frame_index - 1 : tracker.frame_index;
+    fprintf(stderr, "%s: frame %d%s (%zu active + %zu pending)\n",
+            __func__, fi, reverse ? " reverse" : "",
+            tracker.masklets.size(), tracker.pending.size());
 
     // ── Propagate active masklets ────────────────────────────────────────
     std::map<int, sam3_mask> pm;
@@ -11250,7 +12929,7 @@ sam3_result sam3_propagate_frame(
         int id = ml.instance_id;
         auto im = tracker.mem_banks.find(id);
         if (im == tracker.mem_banks.end() || im->second.empty()) continue;
-        po[id] = sam3_propagate_single(tracker, state, model, ml, im->second, tracker.ptr_banks[id]);
+        po[id] = sam3_propagate_single(tracker, state, model, ml, im->second, tracker.ptr_banks[id], fi, reverse);
         if (po[id].mask_logits.empty()) continue;
         auto rs = sam3_bilinear_interpolate(po[id].mask_logits.data(),
                                             po[id].mask_w, po[id].mask_h,
@@ -11275,7 +12954,7 @@ sam3_result sam3_propagate_frame(
         int id = ml.instance_id;
         auto im = tracker.mem_banks.find(id);
         if (im == tracker.mem_banks.end() || im->second.empty()) continue;
-        auto p2 = sam3_propagate_single(tracker, state, model, ml, im->second, tracker.ptr_banks[id]);
+        auto p2 = sam3_propagate_single(tracker, state, model, ml, im->second, tracker.ptr_banks[id], fi, reverse);
         if (!p2.mask_logits.empty()) {
             ml.last_score = p2.iou_scores[0];
             ml.last_seen = fi;
@@ -11295,9 +12974,11 @@ sam3_result sam3_propagate_frame(
             sam3_encode_memory(tracker, state, model, id,
                                p2.mask_logits.data(), p2.mask_h, p2.mask_w,
                                fi, false, p2.obj_score);
+            if (model.hparams.use_memory_selection)
+                sam3_store_eff_iou_score(tracker, id, fi, p2.obj_score, p2.iou_scores);
             std::vector<float> op(D);
             sam3_extract_obj_ptr_cpu(model, p2.sam_token.data(), p2.obj_score, op.data());
-            sam3_store_obj_ptr(tracker, model, id, op.data(), fi);
+            sam3_store_obj_ptr(tracker, model, id, op.data(), fi, false);
         }
     }
 
@@ -11309,14 +12990,16 @@ sam3_result sam3_propagate_frame(
         sam3_encode_memory(tracker, state, model, id,
                            it->second.mask_logits.data(), it->second.mask_h,
                            it->second.mask_w, fi, false, it->second.obj_score);
+        if (model.hparams.use_memory_selection)
+            sam3_store_eff_iou_score(tracker, id, fi, it->second.obj_score, po[id].iou_scores);
         std::vector<float> op(D);
         sam3_extract_obj_ptr_cpu(model, it->second.sam_token.data(),
                                  it->second.obj_score, op.data());
-        sam3_store_obj_ptr(tracker, model, id, op.data(), fi);
+        sam3_store_obj_ptr(tracker, model, id, op.data(), fi, false);
     }
 
     // ── Update tracker state (confirmation / eviction) ───────────────────
-    sam3_update_tracker(tracker, fi);
+    sam3_update_tracker(tracker, fi, reverse);
 
     // ── Build result ─────────────────────────────────────────────────────
     auto add_mask_to_result = [&](int inst_id, float score, const sam3_mask& mask) {
@@ -11357,7 +13040,7 @@ sam3_result sam3_propagate_frame(
         sam3_remove_sprinkles(d.mask.data.data(), d.mask.width, d.mask.height,
                               tracker.params.fill_hole_area);
     }
-    tracker.frame_index++;
+    tracker.frame_index += reverse ? -1 : 1;
     SAM3_LOG(2, "%s: frame %d done — %zu tracked\n",
              __func__, fi, result.detections.size());
     return result;
@@ -11387,6 +13070,270 @@ bool sam3_save_mask(const sam3_mask& mask, const std::string& path) {
     if (mask.data.empty()) return false;
     return stbi_write_png(path.c_str(), mask.width, mask.height, 1,
                           mask.data.data(), mask.width) != 0;
+}
+
+bool sam3_save_image(const sam3_image& image, const std::string& path) {
+    if (image.data.empty()) return false;
+    return stbi_write_png(path.c_str(), image.width, image.height, image.channels,
+                          image.data.data(), image.width * image.channels) != 0;
+}
+
+/*****************************************************************************
+** Visualization — zero-dependency result rendering
+**
+** C++ counterpart of the official repo's visualization utilities: colored
+** per-instance mask overlay + box outlines + "id score" labels. Built from
+** plain pixel blending and a 5x7 dot-matrix font (matplotlib/OpenCV are not
+** available in a ggml-ecosystem library).
+*****************************************************************************/
+
+// Pre-generated instance palette. The official visualization utils cluster
+// random LAB samples with k-means to obtain a fixed color table — a static
+// resource, not a runtime feature, so the table is baked in here instead of
+// clustering at startup. Alternating light/dark hues keep N instances
+// distinguishable with i % 16.
+static const uint8_t SAM3_PALETTE[16][3] = {
+    {230,  57,  70},   // red
+    { 42, 157, 244},   // blue
+    { 42, 232, 132},   // green
+    {255, 202,  58},   // yellow
+    {181,  92, 245},   // purple
+    {255, 127,  80},   // coral
+    {  0, 206, 209},   // teal
+    {244, 162,  97},   // orange
+    {131, 232,  90},   // lime
+    {233,  84, 192},   // magenta
+    { 89, 105, 243},   // indigo
+    {142,  76,  44},   // brown
+    { 60, 220, 220},   // cyan
+    {240, 110, 160},   // pink
+    {150, 210,  60},   // olive
+    {120, 120, 240},   // periwinkle
+};
+
+void sam3_instance_color(int instance_id, uint8_t& r, uint8_t& g, uint8_t& b) {
+    const int i = (instance_id > 0) ? (instance_id - 1) : 0;
+    r = SAM3_PALETTE[i % 16][0];
+    g = SAM3_PALETTE[i % 16][1];
+    b = SAM3_PALETTE[i % 16][2];
+}
+
+// 5x7 dot-matrix font, column bytes, bit 0 = top row. Covers the digits and
+// the separators needed for "id score" labels.
+static const uint8_t SAM3_FONT5X7[][5] = {
+    {0x3E, 0x51, 0x49, 0x45, 0x3E},   // '0'
+    {0x00, 0x42, 0x7F, 0x40, 0x00},   // '1'
+    {0x42, 0x61, 0x51, 0x49, 0x46},   // '2'
+    {0x21, 0x41, 0x45, 0x4B, 0x31},   // '3'
+    {0x18, 0x14, 0x12, 0x7F, 0x10},   // '4'
+    {0x27, 0x45, 0x45, 0x45, 0x39},   // '5'
+    {0x3C, 0x4A, 0x49, 0x49, 0x30},   // '6'
+    {0x01, 0x71, 0x09, 0x05, 0x03},   // '7'
+    {0x36, 0x49, 0x49, 0x49, 0x36},   // '8'
+    {0x06, 0x49, 0x49, 0x29, 0x1E},   // '9'
+    {0x00, 0x60, 0x60, 0x00, 0x00},   // '.'
+    {0x00, 0x00, 0x00, 0x00, 0x00},   // ' '
+};
+
+static const uint8_t* sam3_font_glyph(char ch) {
+    static const char kChars[] = "0123456789. ";
+    for (int i = 0; kChars[i]; ++i)
+        if (kChars[i] == ch) return SAM3_FONT5X7[i];
+    return nullptr;
+}
+
+static void sam3_blend_px(sam3_image& img, int x, int y,
+                          uint8_t r, uint8_t g, uint8_t b, float a) {
+    if (x < 0 || y < 0 || x >= img.width || y >= img.height) return;
+    uint8_t* p = img.data.data() + ((size_t)y * img.width + x) * 3;
+    p[0] = (uint8_t)(r * a + p[0] * (1.0f - a));
+    p[1] = (uint8_t)(g * a + p[1] * (1.0f - a));
+    p[2] = (uint8_t)(b * a + p[2] * (1.0f - a));
+}
+
+void sam3_overlay_mask(sam3_image& image, const sam3_mask& mask,
+                       uint8_t r, uint8_t g, uint8_t b, float alpha) {
+    if (image.data.empty() || mask.data.empty() || alpha <= 0.0f) return;
+    if (alpha > 1.0f) alpha = 1.0f;
+    const int iw = image.width, ih = image.height;
+    if (mask.width == iw && mask.height == ih) {
+        const size_t n = (size_t)iw * ih;
+        for (size_t i = 0; i < n; ++i) {
+            if (mask.data[i] > 127)
+                sam3_blend_px(image, (int)(i % iw), (int)(i / iw), r, g, b, alpha);
+        }
+    } else {
+        // Masks produced by tracking/propagation always match the frame, but
+        // user-supplied masks (sam3_tracker_add_instance_from_mask callers)
+        // may differ — nearest-neighbour resample keeps the API total.
+        for (int y = 0; y < ih; ++y) {
+            const int my = (int)((int64_t)y * mask.height / ih);
+            for (int x = 0; x < iw; ++x) {
+                const int mx = (int)((int64_t)x * mask.width / iw);
+                if (mask.data[(size_t)my * mask.width + mx] > 127)
+                    sam3_blend_px(image, x, y, r, g, b, alpha);
+            }
+        }
+    }
+}
+
+void sam3_draw_box(sam3_image& image, const sam3_box& box,
+                   uint8_t r, uint8_t g, uint8_t b, int thickness) {
+    if (image.data.empty() || thickness <= 0) return;
+    int x0 = (int)box.x0, y0 = (int)box.y0;
+    int x1 = (int)box.x1, y1 = (int)box.y1;
+    if (x0 > x1) std::swap(x0, x1);
+    if (y0 > y1) std::swap(y0, y1);
+    for (int t = 0; t < thickness; ++t) {
+        // Top and bottom edges
+        for (int x = x0; x <= x1; ++x) {
+            sam3_blend_px(image, x, y0 + t, r, g, b, 1.0f);
+            sam3_blend_px(image, x, y1 - t, r, g, b, 1.0f);
+        }
+        // Left and right edges
+        for (int y = y0; y <= y1; ++y) {
+            sam3_blend_px(image, x0 + t, y, r, g, b, 1.0f);
+            sam3_blend_px(image, x1 - t, y, r, g, b, 1.0f);
+        }
+    }
+}
+
+// Draw an "id score" tag: white semi-transparent plate (matches the official
+// plot_bbox label background, alpha 0.75) with instance-colored glyphs.
+static void sam3_draw_label(sam3_image& image, const sam3_detection& det,
+                            int font_scale) {
+    char text[32];
+    snprintf(text, sizeof(text), "%d %.2f", det.instance_id, det.score);
+    const int s = font_scale > 0 ? font_scale : 1;
+    const int glyph_w = 5 * s, glyph_h = 7 * s, spacing = s;
+    int text_w = 0;
+    for (const char* c = text; *c; ++c)
+        if (sam3_font_glyph(*c)) text_w += glyph_w + spacing;
+    if (text_w == 0) return;
+
+    // Plate sits just above the box top-left corner, clipped into view.
+    const int pad = 2 * s;
+    int px = (int)det.box.x0;
+    int py = (int)det.box.y0 - glyph_h - 2 * pad;
+    if (py < 0) py = std::max(0, (int)det.box.y0);
+
+    for (int y = 0; y < glyph_h + 2 * pad; ++y)
+        for (int x = 0; x < text_w + pad; ++x)
+            sam3_blend_px(image, px + x, py + y, 255, 255, 255, 0.75f);
+
+    uint8_t r, g, b;
+    sam3_instance_color(det.instance_id, r, g, b);
+    int cx = px + pad / 2;
+    for (const char* c = text; *c; ++c) {
+        const uint8_t* glyph = sam3_font_glyph(*c);
+        if (!glyph) continue;
+        for (int col = 0; col < 5; ++col) {
+            for (int row = 0; row < 7; ++row) {
+                if ((glyph[col] >> row) & 1) {
+                    for (int dy = 0; dy < s; ++dy)
+                        for (int dx = 0; dx < s; ++dx)
+                            sam3_blend_px(image, cx + col * s + dx,
+                                          py + pad + row * s + dy, r, g, b, 1.0f);
+                }
+            }
+        }
+        cx += glyph_w + spacing;
+    }
+}
+
+sam3_image sam3_render_result(const sam3_image& image, const sam3_result& result,
+                              const sam3_vis_params& params) {
+    sam3_image out = image;   // single copy; all passes mutate it in place
+    if (out.data.empty()) return out;
+
+    // Pass 1: mask overlays (labels drawn after boxes so plates stay clean)
+    for (const auto& det : result.detections) {
+        uint8_t r, g, b;
+        sam3_instance_color(det.instance_id, r, g, b);
+        sam3_overlay_mask(out, det.mask, r, g, b, params.mask_alpha);
+    }
+    // Pass 2: boxes + labels
+    for (const auto& det : result.detections) {
+        uint8_t r, g, b;
+        sam3_instance_color(det.instance_id, r, g, b);
+        if (params.draw_boxes)
+            sam3_draw_box(out, det.box, r, g, b, params.box_thickness);
+        if (params.draw_labels)
+            sam3_draw_label(out, det, params.font_scale);
+    }
+    return out;
+}
+
+void sam3_resize_mask_logits(const float* src, int sw, int sh,
+                             float* dst, int dw, int dh) {
+    if (!src || !dst || sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return;
+    auto resized = sam3_bilinear_interpolate(src, sw, sh, dw, dh);
+    std::copy(resized.begin(), resized.end(), dst);
+}
+
+/*****************************************************************************
+** IoM mask dedup — official agent remove_overlapping_masks alignment
+*****************************************************************************/
+
+int sam3_remove_overlapping_masks(sam3_result& result, float iom_threshold) {
+    auto& dets = result.detections;
+    const int n = (int)dets.size();
+    if (n <= 1) return 0;
+
+    // Pre-compute mask areas once: the greedy pass is O(N^2) candidate/kept
+    // pair checks, each a single O(HW) intersection scan.
+    std::vector<long long> area(n, 0);
+    for (int i = 0; i < n; ++i) {
+        if (dets[i].mask.data.empty()) continue;
+        for (uint8_t v : dets[i].mask.data)
+            if (v > 127) ++area[i];
+    }
+
+    // Greedy keep in score-descending order (stable: score ties keep the
+    // original relative order, as in the official sorted() semantics).
+    std::vector<int> order(n);
+    for (int i = 0; i < n; ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(),
+                     [&](int a, int b) { return dets[a].score > dets[b].score; });
+
+    std::vector<char> keep(n, 0);
+    std::vector<int> kept;
+    kept.reserve(n);
+    for (int idx : order) {
+        const auto& m = dets[idx].mask.data;
+        if (m.empty() || area[idx] == 0) {
+            // Empty masks cannot overlap anything — official semantics keep them.
+            keep[idx] = 1;
+            kept.push_back(idx);
+            continue;
+        }
+        bool suppressed = false;
+        for (int k : kept) {
+            const auto& mk = dets[k].mask.data;
+            if (mk.empty() || area[k] == 0) continue;
+            if (dets[k].mask.width != dets[idx].mask.width ||
+                dets[k].mask.height != dets[idx].mask.height)
+                continue;   // official path assumes same-size masks
+            long long inter = 0;
+            for (size_t i = 0; i < m.size(); ++i)
+                if (m[i] > 127 && mk[i] > 127) ++inter;
+            // IoM = intersection / min(area): denominator clamped to >= 1,
+            // matching the official clamp_min(1) (+1e-8 is negligible).
+            const long long min_area = std::min(area[idx], area[k]);
+            const float iom = (float)inter / (float)std::max(min_area, 1LL);
+            if (iom > iom_threshold) { suppressed = true; break; }
+        }
+        if (!suppressed) { keep[idx] = 1; kept.push_back(idx); }
+    }
+
+    // Rebuild in the original relative order (official kept_idx_sorted).
+    std::vector<sam3_detection> out;
+    out.reserve(kept.size());
+    for (int i = 0; i < n; ++i)
+        if (keep[i]) out.push_back(std::move(dets[i]));
+    const int removed = n - (int)out.size();
+    result.detections = std::move(out);
+    return removed;
 }
 
 sam3_image sam3_decode_video_frame(const std::string& video_path, int frame_index) {
@@ -11494,6 +13441,10 @@ bool sam3_test_load_tokenizer(const std::string& model_path) {
 std::vector<int32_t> sam3_test_tokenize(const std::string& text) {
     if (!g_test_tokenizer_loaded) return {};
     return sam3_tokenize(g_test_tokenizer, text, 32);
+}
+
+std::string sam3_test_clean_text(const std::string& text) {
+    return sam3_text::clean_lower(text);
 }
 
 static bool sam3_dump_tensor_to_path(struct ggml_tensor* t,

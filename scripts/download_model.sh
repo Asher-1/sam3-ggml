@@ -23,12 +23,27 @@ print(f'Saved to {dst}/sam3.pt')
 "
 
 echo ""
-echo "=== Converting to ggml format ==="
-python3 "${PROJECT_DIR}/convert_sam3_to_ggml.py" \
-    --model "${MODEL_DIR}/sam3.pt" \
-    --output "${MODEL_DIR}/sam3-f16.ggml" \
-    --ftype 1
+echo "=== Downloading the official BPE vocab (tokenizer source) ==="
+# The converter embeds the tokenizer into the GGUF from this single
+# authoritative asset (the official SimpleTokenizer input). The
+# facebook/sam3 HF repo is gated; this GitHub asset is public. The converter
+# takes the official 48894-row slice verbatim, so all merges — including the
+# 6 that start with '#' — land in the file.
+BPE_GZ="${MODEL_DIR}/bpe_simple_vocab_16e6.txt.gz"
+if [ ! -f "${BPE_GZ}" ]; then
+    curl -L --fail -o "${BPE_GZ}" \
+        "https://github.com/facebookresearch/sam3/raw/main/sam3/assets/bpe_simple_vocab_16e6.txt.gz"
+fi
+ls -lh "${BPE_GZ}"
 
 echo ""
-echo "Done. Model saved to ${MODEL_DIR}/sam3-f16.ggml"
-ls -lh "${MODEL_DIR}/sam3-f16.ggml"
+echo "=== Converting to GGUF ==="
+python3 "${PROJECT_DIR}/convert_sam3_to_ggml.py" \
+    --model "${MODEL_DIR}/sam3.pt" \
+    --output "${MODEL_DIR}/sam3-f16.gguf" \
+    --ftype 1 \
+    --bpe-gz "${BPE_GZ}"
+
+echo ""
+echo "Done. Model saved to ${MODEL_DIR}/sam3-f16.gguf"
+ls -lh "${MODEL_DIR}/sam3-f16.gguf"
