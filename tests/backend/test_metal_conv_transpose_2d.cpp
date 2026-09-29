@@ -7,7 +7,7 @@
 #include "ggml-metal.h"
 #endif
 
-#include "test_utils.h"
+#include "../test_utils.h"
 
 #include <algorithm>
 #include <cmath>
@@ -27,6 +27,7 @@ struct options {
     std::string case_name = "all";
     std::string backend = "metal";
     bool dump_mismatch = false;
+    bool dump_small = false;  // dump first 48 outputs of small cases (debug aid)
     int n_threads = 8;
     int max_wall_ms = 30000;
 };
@@ -75,6 +76,8 @@ static bool parse_args(int argc, char ** argv, options & opts) {
             opts.case_name = argv[++i];
         } else if (strcmp(argv[i], "--dump-mismatch") == 0) {
             opts.dump_mismatch = true;
+        } else if (strcmp(argv[i], "--dump-small") == 0) {
+            opts.dump_small = true;
         } else if (strcmp(argv[i], "--backend") == 0) {
             if (i + 1 >= argc) return false;
             opts.backend = argv[++i];
@@ -340,7 +343,7 @@ int main(int argc, char ** argv) {
         run_result cpu = run_case(tc, "cpu", opts.n_threads, weight_f16, input_data);
         run_result metal = run_case(tc, opts.backend, opts.n_threads, weight_f16, input_data);
 
-        if (getenv("GGML_VK_FAST_DEBUG") && (tc.in_w <= 8 && tc.in_h <= 8)) {
+        if (opts.dump_small && (tc.in_w <= 8 && tc.in_h <= 8)) {
             fprintf(stderr, "[tst] %s cpu[0..47]: ", tc.name);
             for (int i = 0; i < std::min<int>(48, (int)cpu.output.size()); ++i) fprintf(stderr, "%.4f ", cpu.output[i]);
             fprintf(stderr, "\n[tst] %s gpu[0..47]: ", tc.name);

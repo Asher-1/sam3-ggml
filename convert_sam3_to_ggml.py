@@ -78,6 +78,26 @@ VISUAL_ONLY_STRIP_PREFIXES = (
     "text.", "fenc.", "ddec.", "seg.", "geom.", "scoring.", "neck.det.",
 )
 
+# Extra hparams written only for SAM 3.1 multiplex checkpoints (detected by
+# the `tracker.model.` key prefix). The C++ loader defaults every one of
+# these to the SAM 3 values, so old files are unaffected.
+MULTIPLEX_HPARAMS = [
+    ("multiplex_count",          16),
+    ("mem_out_dim",             256),  # 3.1 keeps mem_dim == hidden_dim (no out_proj)
+    ("mem_attn_heads",            8),
+    ("mem_attn_gelu",             1),
+    ("maskmem_tpos_v2",           1),
+    ("use_memory_selection",      0),
+    ("save_image_features",       1),
+    ("output_suppress_embed",     1),
+    ("cond_as_mask_input",        1),
+    ("use_linear_no_obj_ptr",     1),
+    ("non_overlap_masks_for_mem_enc", 0),
+    ("iou_prediction_use_sigmoid", 0),
+    ("mem_sig_scale_x100",      200),  # sigmoid_scale_for_mem_enc = 2.0
+    ("mem_sig_bias_x100",      -100),  # sigmoid_bias_for_mem_enc  = -1.0
+]
+
 # Tensor prefixes that MUST be present in a visual-only model.
 VISUAL_ONLY_REQUIRED_PREFIXES = (
     "vit.", "neck.trk.", "sam_pe.", "sam_dec.", "mem_enc.", "mem_attn.", "obj_ptr_proj.",
@@ -104,6 +124,12 @@ def rename_key(k: str) -> str | None:
         if pat in k:
             return None
 
+    # ── SAM 3.1 multiplex wrapper ─────────────────────────────────────────
+    # The 3.1 checkpoint nests the whole tracker one level deeper
+    # (`tracker.model.<module>`); strip the wrapper so the mapping below
+    # sees the same shape as the SAM 3 checkpoint.
+    k = k.replace("tracker.model.", "tracker.")
+
     # ── Detector path ─────────────────────────────────────────────────────
     # ViT backbone
     k = k.replace("detector.backbone.vision_backbone.trunk.", "vit.")
@@ -114,9 +140,15 @@ def rename_key(k: str) -> str | None:
     k = k.replace(".attn.qkv.", ".attn.qkv.")
     k = k.replace(".attn.proj.", ".attn.proj.")
 
-    # Detector neck
+    # Detector neck.  SAM 3.1 splits the old `sam2_convs` tracker neck into
+    # two structural clones: `propagation_convs` (memory-conditioned
+    # tracking) and `interactive_convs` (point-prompt interaction).  The
+    # propagation neck keeps the established `neck.trk.` names so every
+    # existing graph reuses it; the interactive neck gets `neck.trk_int.`.
     k = k.replace("detector.backbone.vision_backbone.convs.", "neck.det.")
     k = k.replace("detector.backbone.vision_backbone.sam2_convs.", "neck.trk.")
+    k = k.replace("detector.backbone.vision_backbone.propagation_convs.", "neck.trk.")
+    k = k.replace("detector.backbone.vision_backbone.interactive_convs.", "neck.trk_int.")
 
     # Text encoder
     k = k.replace("detector.backbone.language_backbone.encoder.transformer.resblocks.",
@@ -159,7 +191,11 @@ def rename_key(k: str) -> str | None:
     k = k.replace("detector.dot_prod_scoring.", "scoring.")
 
     # ── Tracker path ──────────────────────────────────────────────────────
-    # Memory attention transformer
+    # Memory attention transformer.
+    # SAM 3  : DecoupledTransformerDecoderLayer      → `sa.q_proj` style keys
+    # SAM 3.1: DecoupledTransformerDecoderLayerv2    → flat `self_attn_q_proj`,
+    #          `cross_attn_*` and `image_cross_attn_*` keys — left as-is, the
+    #          C++ 3.1 loader registers exactly these names.
     k = k.replace("tracker.transformer.encoder.layers.", "mem_attn.layers.")
     k = k.replace("tracker.transformer.encoder.norm.", "mem_attn.norm.")
     # RoPE attention: already uses q_proj/k_proj/v_proj/out_proj
@@ -188,12 +224,43 @@ def rename_key(k: str) -> str | None:
     # Object pointer projection
     k = k.replace("tracker.obj_ptr_proj.", "obj_ptr_proj.")
     k = k.replace("tracker.obj_ptr_tpos_proj.", "obj_ptr_tpos_proj.")
+    k = k.replace("tracker.maskmem_tpos_enc", "mem_enc.tpos_enc")
+    k = k.replace("tracker.mask_downsample.", "trk_mask_ds.")
+
+    # ── SAM 3.1 interactive-path modules ─────────────────────────────────
+    # Point/mask prompts never touch the propagation decoder in 3.1; they
+    # run through a structurally identical interactive copy instead.
+    k = k.replace("tracker.interactive_sam_prompt_encoder.pe_layer.positional_encoding_gaussian_matrix",
+                   "sam_pe_int.pe_gaussian")
+    k = k.replace("tracker.interactive_sam_prompt_encoder.mask_downscaling.", "sam_pe_int.mask_ds.")
+    k = k.replace("tracker.interactive_sam_prompt_encoder.", "sam_pe_int.")
+    k = k.replace("tracker.interactive_sam_mask_decoder.transformer.layers.", "sam_dec_int.twoway.")
+    k = k.replace("tracker.interactive_sam_mask_decoder.transformer.final_attn_token_to_image.",
+                   "sam_dec_int.final_attn.")
+    k = k.replace("tracker.interactive_sam_mask_decoder.transformer.norm_final_attn.",
+                   "sam_dec_int.final_norm.")
+    k = k.replace("tracker.interactive_sam_mask_decoder.output_upscaling.", "sam_dec_int.upscale.")
+    k = k.replace("tracker.interactive_sam_mask_decoder.output_hypernetworks_mlps.", "sam_dec_int.hyper.")
+    k = k.replace("tracker.interactive_sam_mask_decoder.", "sam_dec_int.")
+    k = k.replace("tracker.interactive_obj_ptr_proj.", "obj_ptr_proj_int.")
+    k = k.replace("tracker.interactivity_no_mem_embed", "no_mem_embed_int")
+    k = k.replace("tracker.interactive_mask_downsample.", "trk_mask_ds_int.")
+    # Linear "no object" pointer (3.1): gating is (1-λ)·Linear(obj_ptr) —
+    # replaces SAM 3's constant `no_obj_ptr` vector.  Must run before the
+    # `tracker.no_obj_ptr` replacement below (prefix collision).
+    k = k.replace("tracker.no_obj_ptr_linear.", "no_obj_ptr_lin.")
+    # Per-slot suppression embeddings for the joint propagation decoder.
+    k = k.replace("tracker.output_valid_embed", "out_valid_embed")
+    k = k.replace("tracker.output_invalid_embed", "out_invalid_embed")
+    # Propagation-decoder dense PE (PositionEmbeddingRandom owned by the
+    # tracker itself, distinct from both prompt encoders).
+    k = k.replace("tracker.image_pe_layer.positional_encoding_gaussian_matrix",
+                   "sam_pe.prop_pe_gaussian")
+
     k = k.replace("tracker.no_obj_ptr", "no_obj_ptr")
     k = k.replace("tracker.no_mem_embed", "no_mem_embed")
     k = k.replace("tracker.no_mem_pos_enc", "no_mem_pos_enc")
     k = k.replace("tracker.no_obj_embed_spatial", "no_obj_embed_spatial")
-    k = k.replace("tracker.maskmem_tpos_enc", "mem_enc.tpos_enc")
-    k = k.replace("tracker.mask_downsample.", "trk_mask_ds.")
 
     # ── Catch-all: remove any remaining prefixes ──────────────────────────
     k = k.replace("detector.", "det.")
@@ -253,7 +320,7 @@ def load_tokenizer_from_bpe_gz(gz_path: str):
 
 
 def write_gguf(path: str, ftype: int, renamed: dict, visual_only: bool,
-               tokenizer_dir: str, bpe_gz: str = None):
+               tokenizer_dir: str, bpe_gz: str = None, multiplex: bool = False):
     import sys as _sys
     import os as _os
     _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "scripts"))
@@ -266,6 +333,7 @@ def write_gguf(path: str, ftype: int, renamed: dict, visual_only: bool,
     w.add_i32("sam3.ftype", ftype)
 
     # Hparams → KV (global_attn_idx_0..3 merge into one INT32 array)
+    mx_names = {name for name, _ in MULTIPLEX_HPARAMS} if multiplex else set()
     ga_idx = []
     for name, val in HPARAMS_FIELDS:
         if name.startswith("global_attn_idx_"):
@@ -273,11 +341,20 @@ def write_gguf(path: str, ftype: int, renamed: dict, visual_only: bool,
             continue
         if name == "visual_only" and visual_only:
             val = 1
+        if name in mx_names:
+            continue  # written from MULTIPLEX_HPARAMS below (no duplicate KVs)
         # Converter field name -> loader KV name
         kv_name = {"n_global_attn_blocks": "n_global_attn"}.get(name, name)
         w.add_i32(f"sam3.hparams.{kv_name}", val)
     w.add_arr_i32("sam3.hparams.global_attn_idx",
                   [v for _, v in sorted(ga_idx)])
+
+    # SAM 3.1 multiplex hparams (loader defaults keep SAM 3 values when the
+    # key is absent, so this block is what switches the loader to the
+    # bucket-space tracker path).
+    if multiplex:
+        for name, val in MULTIPLEX_HPARAMS:
+            w.add_i32(f"sam3.hparams.{name}", val)
 
     # Tensors (ggml column-major ne = reversed PyTorch shape)
     for name, data in renamed.items():
@@ -328,7 +405,7 @@ def write_gguf(path: str, ftype: int, renamed: dict, visual_only: bool,
                     if len(parts) == 2:
                         merges.append(f"{parts[0]} {parts[1]}")
             w.add_arr_str("sam3.tokenizer.vocab",
-                          [t for _, t in sorted(vocab.items(), key=lambda x: x[1])])
+                          [t for t, _ in sorted(vocab.items(), key=lambda x: x[1])])
             w.add_arr_str("sam3.tokenizer.merges", merges)
             print(f"Embedded tokenizer: {len(vocab)} vocab entries, {len(merges)} merges")
 
@@ -367,6 +444,11 @@ def main():
         ckpt = ckpt["model"]
 
     print(f"Checkpoint has {len(ckpt)} tensors")
+
+    # SAM 3.1 multiplex detection: the tracker is nested under `tracker.model.`
+    multiplex = any(k.startswith("tracker.model.") for k in ckpt)
+    if multiplex:
+        print("Detected SAM 3.1 multiplex checkpoint (Object Multiplex tracker)")
 
     # ── First pass: rename keys, skip unwanted tensors ────────────────────
     renamed = {}
@@ -430,7 +512,7 @@ def main():
 
     tok_dir = args.tokenizer if args.tokenizer else os.path.dirname(os.path.abspath(args.model))
     write_gguf(args.output, args.ftype, renamed, visual_only=args.visual_only,
-               tokenizer_dir=tok_dir, bpe_gz=args.bpe_gz)
+               tokenizer_dir=tok_dir, bpe_gz=args.bpe_gz, multiplex=multiplex)
 
     file_size = os.path.getsize(args.output)
     print(f"\nDone. {len(renamed)} tensors, {file_size / 1e9:.2f} GB")

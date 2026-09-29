@@ -22,7 +22,7 @@ target_link_libraries(test_phase5 PRIVATE sam3)
 add_executable(test_phase6 test_phase6.cpp)
 target_link_libraries(test_phase6 PRIVATE sam3)
 
-add_executable(test_metal_phase6 test_metal_phase6.cpp)
+add_executable(test_metal_phase6 backend/test_metal_phase6.cpp)
 target_link_libraries(test_metal_phase6 PRIVATE sam3)
 
 add_executable(test_phase3 test_phase3.cpp)
@@ -73,52 +73,52 @@ target_link_libraries(test_video_2frame PRIVATE sam3)
 add_executable(test_video_text test_video_text.cpp)
 target_link_libraries(test_video_text PRIVATE sam3)
 
-add_executable(test_metal_win test_metal_win.cpp)
+add_executable(test_metal_win backend/test_metal_win.cpp)
 target_link_libraries(test_metal_win PRIVATE sam3)
 
-add_executable(test_metal_vit test_metal_vit.cpp)
+add_executable(test_metal_vit backend/test_metal_vit.cpp)
 target_link_libraries(test_metal_vit PRIVATE sam3)
 
-add_executable(test_metal_encoder_checkpoints test_metal_encoder_checkpoints.cpp)
+add_executable(test_metal_encoder_checkpoints backend/test_metal_encoder_checkpoints.cpp)
 target_link_libraries(test_metal_encoder_checkpoints PRIVATE sam3)
 
-add_executable(test_metal_flash_attn_ext_block15_compare test_metal_flash_attn_ext_block15_compare.cpp)
+add_executable(test_metal_flash_attn_ext_block15_compare backend/test_metal_flash_attn_ext_block15_compare.cpp)
 target_link_libraries(test_metal_flash_attn_ext_block15_compare PRIVATE sam3)
 
-add_executable(test_metal_vit_upstream_compare test_metal_vit_upstream_compare.cpp)
+add_executable(test_metal_vit_upstream_compare backend/test_metal_vit_upstream_compare.cpp)
 target_link_libraries(test_metal_vit_upstream_compare PRIVATE sam3)
 
-add_executable(test_metal_vit_prefix_compare test_metal_vit_prefix_compare.cpp)
+add_executable(test_metal_vit_prefix_compare backend/test_metal_vit_prefix_compare.cpp)
 target_link_libraries(test_metal_vit_prefix_compare PRIVATE sam3)
 
-add_executable(test_metal_block0_stage_compare test_metal_block0_stage_compare.cpp)
+add_executable(test_metal_block0_stage_compare backend/test_metal_block0_stage_compare.cpp)
 target_link_libraries(test_metal_block0_stage_compare PRIVATE sam3)
 
-add_executable(test_metal_block_stage_compare test_metal_block_stage_compare.cpp)
+add_executable(test_metal_block_stage_compare backend/test_metal_block_stage_compare.cpp)
 target_link_libraries(test_metal_block_stage_compare PRIVATE sam3)
 
-add_executable(test_metal_python_ref_compare test_metal_python_ref_compare.cpp)
+add_executable(test_metal_python_ref_compare backend/test_metal_python_ref_compare.cpp)
 target_link_libraries(test_metal_python_ref_compare PRIVATE sam3)
 
-add_executable(test_metal_conv_dw test_metal_conv_dw.cpp)
+add_executable(test_metal_conv_dw backend/test_metal_conv_dw.cpp)
 target_link_libraries(test_metal_conv_dw PRIVATE sam3)
 
-add_executable(test_metal_profile test_metal_profile.cpp)
+add_executable(test_metal_profile backend/test_metal_profile.cpp)
 target_link_libraries(test_metal_profile PRIVATE sam3)
 
-add_executable(test_metal_overhead test_metal_overhead.cpp)
+add_executable(test_metal_overhead backend/test_metal_overhead.cpp)
 target_link_libraries(test_metal_overhead PRIVATE sam3)
 
 add_executable(test_v_cont_removal test_v_cont_removal.cpp)
 target_link_libraries(test_v_cont_removal PRIVATE sam3)
 
-add_executable(test_metal_real_profile test_metal_real_profile.cpp)
+add_executable(test_metal_real_profile backend/test_metal_real_profile.cpp)
 target_link_libraries(test_metal_real_profile PRIVATE sam3)
 
-add_executable(test_metal_conv_transpose_2d_stress test_metal_conv_transpose_2d_stress.cpp)
+add_executable(test_metal_conv_transpose_2d_stress backend/test_metal_conv_transpose_2d_stress.cpp)
 target_link_libraries(test_metal_conv_transpose_2d_stress PRIVATE sam3)
 
-add_executable(test_metal_conv_transpose_2d test_metal_conv_transpose_2d.cpp)
+add_executable(test_metal_conv_transpose_2d backend/test_metal_conv_transpose_2d.cpp)
 target_link_libraries(test_metal_conv_transpose_2d PRIVATE sam3)
 
 add_executable(test_visual_only test_visual_only.cpp)

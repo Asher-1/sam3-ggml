@@ -10,6 +10,7 @@ Each file name encodes three things:
 | Part | Meaning |
 |------|---------|
 | `sam3` / `sam3-visual` | **SAM 3** — ViT-32 backbone + text encoder + DETR detector (850M params) |
+| `sam3.1` | **SAM 3.1** — tracker-aligned SAM 3 (repaired BPE merges + tracker hparams; see note below) |
 | `sam2` / `sam2.1` | **SAM 2 / SAM 2.1** — Meta's Hiera-backbone segmentation models (visual only) |
 | `tiny` / `small` / `base_plus` / `large` | Backbone size (39M / 46M / 81M / 224M params) |
 | `f32` / `f16` / `q8_0` / `q4_1` / `q4_0` | Weight precision (see [Precision guide](#precision-guide)) |
@@ -38,10 +39,16 @@ files on Hugging Face — no PyTorch weights or conversion step needed:
 > patched; nothing to do" when current). `sam2*` / `sam3-visual-*` files are
 > unaffected (no tokenizer / SAM2-compatible defaults).
 
-The repo mirrors this directory 1:1 (40 files, ~14 GB total).
+> **SAM 3.1 (2026-09-22/23)**: converted from the `sam3_1_multiplex.pt`
+> checkpoint with the repaired tokenizer and tracker hparams baked in —
+> this is the checkpoint all recent perf/quality baselines
+> ([perf report](../tests/reports/regression_report_perf.md)) are built on.
+> The HF repo mirrors the trimmed family exactly: the 4-bit/K-quant variants
+> (`sam3.1-q4_0/q4_1/q4_K/q6_K`) were culled before publication and are
+> **not** on HF (see [Precision guide](#precision-guide)).
 
 ```bash
-# All 40 models into models/
+# All 36 models into models/
 huggingface-cli download Asher-1/sam3-gguf --local-dir models
 
 # Or just one file
@@ -68,7 +75,7 @@ curl -L -o models/sam3-f16.gguf \
 
 Sizes below are the actual `.gguf` files in this directory. Latency is a
 single-image PVS run (encode + segment) at 1008×1008 on **RTX 3060 CUDA**,
-point (315,250) on `tests/cat.jpg`. The current SAM 3 F16 result uses
+point (315,250) on `tests/data/cat.jpg`. The current SAM 3 F16 result uses
 `sam3_encode_image_pvs()`, 2 warmups and 7 timed runs (p50); the remaining
 rows are the earlier all-model snapshot. `score` = mask IoU confidence.
 
@@ -85,6 +92,22 @@ rows are the earlier all-model snapshot. `score` = mask IoU confidence.
 **Best for**: text-prompted detection (PCS) + point/box segmentation (PVS) +
 video tracking in one model. The full SAM 3 is the only family here that
 supports text prompts; the visual path matches `sam3-visual` exactly.
+
+### SAM 3.1 (850M params — tracker-aligned SAM 3, multiplex tracker)
+
+| File | Size | 70f×2 tracking quality (vs f16) | Verdict |
+|------|-----:|----------------------------------|---------|
+| `sam3.1-f16.gguf` | 1.8 GB | baseline | **Default choice** — all current perf/quality baselines |
+| `sam3.1-q8_0.gguf` | 1.1 GB | 0 flips / 0 cracks, max \|Δscore\| 0.043, max \|Δfg\| 4 px | **-40% size, quality bar met** |
+| `sam3.1-f32.gguf` | 3.4 GB | — | **Local only, not on HF** — PyTorch-parity reference build (2026-09-28, see [parity report](../tests/reports/regression_report_sam31_parity.md)); regenerable via `convert_sam3_to_ggml.py --ftype 0` |
+| ~~`sam3.1-q6_K.gguf`~~ | ~~1113 MB~~ | 0 flips but max \|Δscore\| 0.062 | **Removed** — strictly dominated by q8_0 (only 8 MB smaller, lower precision) |
+| ~~`sam3.1-q4_K.gguf`~~ | ~~949 MB~~ | 2 flips / 3 cracks | **Removed** — object loss in recovery frames |
+| ~~`sam3.1-q4_1.gguf`~~ | ~~775 MB~~ | 3 flips / 6 cracks | **Removed** — object loss + mask shattering |
+| ~~`sam3.1-q4_0.gguf`~~ | ~~725 MB~~ | 7 flips / 9 cracks | **Removed** — worst: all 8 present frames shattered to ~10% fg |
+
+Per-frame data and cull rationale: [q8_0 regression report §10](../tests/reports/regression_report_q8_0.md).
+All models in this family support text-prompted detection (PCS) + PVS +
+tracking; the visual path matches `sam3` exactly.
 
 ### SAM 3 Visual (no text encoder — PVS + tracking only)
 
@@ -151,9 +174,17 @@ size and ~40% faster than full SAM 3. Same PVS + tracking capabilities as
 |-----------|---------------|---------|-----|
 | `f32` | 1.0× | reference | Debugging, numerical checks only — never deploy |
 | `f16` | 0.5× | ≈ f32 | **Recommended default** — near-lossless, half the size |
-| `q8_0` | 0.25× | very close to f16 | Big models (large/`sam3`) when f16 is too big |
-| `q4_1` | ~0.14× | good (retains scale + offset) | Aggressive size cuts with better fidelity than q4_0 |
-| `q4_0` | ~0.13× | acceptable for interactive use | Smallest files; quality gap is visible on thin structures |
+| `q8_0` | 0.25× | very close to f16 | Big models (large/`sam3*`) when f16 is too big |
+| `q4_1` | ~0.14× | good (retains scale + offset) | Aggressive size cuts with better fidelity than q4_0; **not for sam3.1 tracking** (see below) |
+| `q4_0` | ~0.13× | acceptable for interactive use | Smallest files; quality gap is visible on thin structures; **not for sam3.1 tracking** (see below) |
+| `q4_K` / `q6_K` | ~0.20× / ~0.24× | between q4_1 and q8_0 | K-quant family; **culled for sam3.1** — q6_K dominated by q8_0 (no size win), q4_K shatters in tracking like the rest of the 4-bit family (q8_0 report §10) |
+
+> **sam3.1 quantization lesson (measured, 70f×2)**: K-quant superblock structure
+> does not rescue ViT-weight tracking at 4-bit — q4_0/q4_1/q4_K all shatter or
+> drop objects, and severity tracks theoretical precision (q4_0 worst). q6_K's
+> promised 23% size reduction over q8_0 collapses to 0.7% once the converter's
+> ~60% F32/F16 tensor share and K-quant metadata are factored in. Keep 4-bit
+> for the small SAM 2 interactive models only; sam3.1 ships f16 + q8_0.
 
 ## Size selection guide
 

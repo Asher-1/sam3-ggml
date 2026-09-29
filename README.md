@@ -119,7 +119,7 @@ alternative (AMD/Intel/NVIDIA) at roughly 1.5x the CUDA latency.
 
 ### SAM 3 PVS CUDA latency (RTX 3060, Linux)
 
-Full `sam3-f16.gguf`, 1008x1008 input, point `(315,250)` on `tests/cat.jpg`,
+Full `sam3-f16.gguf`, 1008x1008 input, point `(315,250)` on `tests/data/cat.jpg`,
 2 warmups followed by 7 timed runs. Model loading is excluded.
 
 | Encode p50 | Segment p50 | Inference p50 | Mask score |
@@ -292,7 +292,7 @@ make -j
 ./sam3_image --model models/sam2.1_hiera_tiny_f16.gguf --image photo.jpg
 
 # Text-prompted detection (SAM 3 only)
-./sam3_image --model models/sam3-f16.gguf --image photo.jpg
+./sam3_image --model models/sam3.1-f16.gguf --image photo.jpg
 # → Type "cat" in the text field, click [Segment]
 ```
 
@@ -310,7 +310,7 @@ make -j
 ./sam3_video --model models/sam2.1_hiera_small_f16.gguf --video input.mp4
 
 # Text-prompted tracking (SAM 3 only)
-./sam3_video --model models/sam3-f16.gguf --video input.mp4
+./sam3_video --model models/sam3.1-f16.gguf --video input.mp4
 ```
 
 **Controls:**

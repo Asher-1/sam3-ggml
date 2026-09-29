@@ -16,9 +16,13 @@
  *   --n-warmup <n>      Warmup iterations (default: 2)
  *   --n-iter <n>        Timed iterations  (default: 5)
  *   --block <idx>       Only profile this block (default: all)
+ *   + diagnostics (see --help output from example_debug.h):
+ *     --census / --census=2 / --profile-prop / --pcs-prof /
+ *     --encode-timing / --dump-vit-blocks / --sam2-dump-dir=DIR
  */
 
 #include "sam3.h"
+#include "example_debug.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -66,6 +70,7 @@ int main(int argc, char ** argv) {
     std::string model_path = "models/sam3-visual-f16.gguf";
     sam3_device device     = SAM3_DEVICE_AUTO;
     int n_threads = 4, n_warmup = 2, n_iter = 5, only_block = -1;
+    sam3_debug_options debug;
 
     for (int i = 1; i < argc; ++i) {
         if      (strcmp(argv[i], "--model")   == 0 && i + 1 < argc) { model_path = argv[++i]; }
@@ -81,6 +86,7 @@ int main(int argc, char ** argv) {
         else if (strcmp(argv[i], "--n-warmup")  == 0 && i + 1 < argc) { n_warmup  = atoi(argv[++i]); }
         else if (strcmp(argv[i], "--n-iter")    == 0 && i + 1 < argc) { n_iter    = atoi(argv[++i]); }
         else if (strcmp(argv[i], "--block")     == 0 && i + 1 < argc) { only_block = atoi(argv[++i]); }
+        else if (sam3_example_debug_flag(argv[i], debug)) { /* diagnostics flag consumed */ }
         else {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
             return 1;
@@ -92,6 +98,7 @@ int main(int argc, char ** argv) {
     params.use_gpu    = true;
     params.n_threads  = n_threads;
     params.device     = device;
+    params.debug      = debug;
 
     fprintf(stderr, "Loading %s ...\n", model_path.c_str());
     auto model = sam3_load_model(params);

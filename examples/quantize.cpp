@@ -103,7 +103,9 @@ static bool sam3_quantize_model(const std::string & fname_inp,
          || name_contains("obj_score_token")
          || name_contains("pe_gaussian")   || name_contains("freqs_cis")
          || name_contains("gamma")         || name_contains("tpos_enc")
-         || name_contains("no_obj_ptr")    || name_contains("no_mem_pos_enc")
+         || strcmp(name, "no_obj_ptr") == 0  // exact: "no_obj_ptr_lin.weight"
+                                             // is a T2 Linear and quantizable
+         || name_contains("no_mem_pos_enc")
          || name_contains("trk_mask_ds")   || name_contains("latents");
         // 1D parameters (biases, layer-norm scale/shift) are registered as F32
         // via T1f and must stay unquantized.
@@ -191,7 +193,7 @@ static bool sam3_quantize_model(const std::string & fname_inp,
 int main(int argc, char ** argv) {
     if (argc != 4) {
         fprintf(stderr, "usage: %s <input.gguf> <output.gguf> <type>\n", argv[0]);
-        fprintf(stderr, "  types: q4_0, q4_1, q8_0\n");
+        fprintf(stderr, "  types: q4_0, q4_1, q4_K_S, q4_K_M, q5_K_M, q6_K, q8_0\n");
         return 1;
     }
 
@@ -200,9 +202,16 @@ int main(int argc, char ** argv) {
     const std::string type_str   = argv[3];
 
     ggml_type qtype;
-    if      (type_str == "q4_0") qtype = GGML_TYPE_Q4_0;
-    else if (type_str == "q4_1") qtype = GGML_TYPE_Q4_1;
-    else if (type_str == "q8_0") qtype = GGML_TYPE_Q8_0;
+    if      (type_str == "q4_0")   qtype = GGML_TYPE_Q4_0;
+    else if (type_str == "q4_1")   qtype = GGML_TYPE_Q4_1;
+    else if (type_str == "q4_K_S") qtype = GGML_TYPE_Q4_K;
+    else if (type_str == "q4_K_M") qtype = GGML_TYPE_Q4_K;   // same lattice; the
+                                                             // _M variant differs
+                                                             // only via imatrix,
+                                                             // which we don't use
+    else if (type_str == "q5_K_M") qtype = GGML_TYPE_Q5_K;
+    else if (type_str == "q6_K")   qtype = GGML_TYPE_Q6_K;
+    else if (type_str == "q8_0")   qtype = GGML_TYPE_Q8_0;
     else {
         fprintf(stderr, "unknown type: %s\n", type_str.c_str());
         return 1;

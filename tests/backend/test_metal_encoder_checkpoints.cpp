@@ -1,5 +1,5 @@
 #include "sam3.h"
-#include "test_utils.h"
+#include "../test_utils.h"
 
 #include <chrono>
 #include <cstdio>

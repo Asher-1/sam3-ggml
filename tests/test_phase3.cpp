@@ -2,7 +2,7 @@
 // against Python reference tensors dumped by dump_phase3_reference.py.
 //
 // Usage:
-//   ./test_phase3 tests/ref_phase3 models/sam3-f16.ggml tests/test_random.jpg
+//   ./test_phase3 tests/ref_phase3 models/sam3-f16.ggml tests/data/test_random.jpg
 //
 // Tests:
 //   1. RoPE computation (pure math, no model needed)

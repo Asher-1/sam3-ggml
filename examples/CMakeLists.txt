@@ -15,6 +15,10 @@ target_link_libraries(sam3_vis PRIVATE sam3)
 add_executable(sam3_profile_sam3 profile_sam3.cpp)
 target_link_libraries(sam3_profile_sam3 PRIVATE sam3)
 
+# Multi-instance tracking benchmark (mux bucket vs per-instance scaling).
+add_executable(sam3_multi_bench multi_inst_bench.cpp)
+target_link_libraries(sam3_multi_bench PRIVATE sam3)
+
 # SDL2 + ImGui are optional — build only if SDL2 is found.
 find_package(SDL2 QUIET)
 

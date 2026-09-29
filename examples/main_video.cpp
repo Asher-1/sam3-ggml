@@ -280,6 +280,54 @@ static void decode_and_track(vapp_state& app, int fi) {
     }
 }
 
+// Seek the view to `target` while keeping the tracker's internal index
+// consistent with the displayed frame.
+//
+//  - target < tracker position (backward): rewind drops all memory slots
+//    after the target and repositions so the target frame is re-processed
+//    first, exactly like the official replay flow.  Rewinding onto the seed
+//    frame itself (target == 0) is the exception: the seed's conditioning
+//    memory anchors the whole session and cannot be re-derived, so it is
+//    kept and the view just clears the displayed result.
+//  - target == tracker position (next unprocessed frame): track directly.
+//  - target > tracker position (forward jump): sequentially process the
+//    skipped frames so the memory chain stays contiguous (the timeline
+//    records them too), then track the target.
+static void seek_to_frame(vapp_state& app, int target) {
+    if (target < 0) return;
+    if (!app.tracker_created || !app.state) {
+        app.frame = sam3_decode_video_frame(app.video_path, target);
+        app.frame_index = target;
+        app.frame_encoded = false;
+        app.result = {};
+        return;
+    }
+    int tpos = sam3_tracker_frame_index(*app.tracker);  // next unprocessed frame
+    if (target < tpos) {
+        if (target == 0) {
+            sam3_tracker_rewind(*app.tracker, 0);
+            app.frame = sam3_decode_video_frame(app.video_path, 0);
+            app.frame_index = 0;
+            app.frame_encoded = false;  // state features belong to a later frame
+            app.result = {};
+            app.timeline.resize(1);
+            app.timeline_max_frame = 0;
+            snprintf(app.status, sizeof(app.status),
+                     "Rewound to seed frame 0 — playback re-tracks from frame 1.");
+            return;
+        }
+        sam3_tracker_rewind(*app.tracker, target - 1);
+        tpos = target;
+        // Timeline entries for the rewound frames are stale until playback
+        // re-reaches them.
+        app.timeline.resize(target + 1);
+        if (app.timeline_max_frame > target) app.timeline_max_frame = target;
+    }
+    for (int f = tpos; f < target; ++f)
+        decode_and_track(app, f);  // silent catch-up of a forward gap
+    decode_and_track(app, target);
+}
+
 // Check if a click position lands on any tracked instance mask.
 // Returns the instance_id or -1.
 static int find_instance_at(const vapp_state& app, float ix, float iy) {
@@ -610,19 +658,14 @@ int main(int argc, char** argv) {
                     if (app.playing) app.last_frame_time = SDL_GetTicks();
                 } else if (event.key.keysym.sym == SDLK_RIGHT) {
                     if (app.frame_index + 1 < app.video_info.n_frames) {
-                        decode_and_track(app, app.frame_index + 1);
+                        seek_to_frame(app, app.frame_index + 1);
                     }
                 } else if (event.key.keysym.sym == SDLK_LEFT) {
                     if (app.frame_index > 0) {
-                        app.frame = sam3_decode_video_frame(app.video_path, app.frame_index - 1);
-                        app.frame_index--;
-                        // The state's encoded features are now stale (they belong
-                        // to the old frame).  Clear frame_encoded so that
-                        // interactions like box-draw or refine won't operate on
-                        // the wrong features.  Also clear displayed results since
-                        // they correspond to the old frame.
-                        app.frame_encoded = false;
-                        app.result = {};
+                        // Step back with a full tracker re-anchor: rewind drops
+                        // the memory after the target frame so the following
+                        // step forward re-tracks it with the correct image.
+                        seek_to_frame(app, app.frame_index - 1);
                     }
                 }
             }
@@ -636,7 +679,7 @@ int main(int argc, char** argv) {
             if (now - app.last_frame_time >= (Uint32)interval_ms) {
                 int next = app.frame_index + 1;
                 if (next < app.video_info.n_frames) {
-                    decode_and_track(app, next);
+                    seek_to_frame(app, next);
                     app.last_frame_time = now;
                 } else {
                     app.playing = false;
@@ -1041,14 +1084,7 @@ int main(int argc, char** argv) {
                 int target = (int)(rel * (n_frames - 1) + 0.5f);
                 if (target != app.frame_index && target >= 0 && target < n_frames) {
                     app.playing = false;
-                    if (app.tracker_created) {
-                        decode_and_track(app, target);
-                    } else {
-                        app.frame = sam3_decode_video_frame(app.video_path, target);
-                        app.frame_index = target;
-                        app.frame_encoded = false;
-                        app.result = {};
-                    }
+                    seek_to_frame(app, target);
                 }
             }
 

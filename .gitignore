@@ -41,3 +41,5 @@ raw_weights/
 
 # Test data
 data/
+pytorch
+*.lock

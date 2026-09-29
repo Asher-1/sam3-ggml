@@ -52,7 +52,8 @@ static bool b64_decode(const std::string& in, std::string& out) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s <model.gguf> <corpus-dir>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <model.gguf> <corpus-dir> [--text]\n", argv[0]);
+        fprintf(stderr, "  --text  compare against expected_clean.txt (clean-layer expectations)\n");
         return 1;
     }
     if (!sam3_test_load_tokenizer(argv[1])) {
@@ -67,7 +68,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    const bool diff_text = getenv("DIFF_TEXT") != nullptr;
+    const bool diff_text = argc > 3 && std::string(argv[3]) == "--text";
     if (diff_text) {
         // clean-layer comparison: expectations produced by the official
         // tokenizer's _clean_lower (expected_clean.txt)

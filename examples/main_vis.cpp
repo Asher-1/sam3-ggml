@@ -282,7 +282,13 @@ int main(int argc, char** argv) {
                     fprintf(stderr, "error: failed to add tracking instance\n");
                     return 1;
                 }
-                result = sam3_propagate_frame(*tracker, *state, *model, frame);
+                // add_instance consolidates the seed frame and positions the
+                // tracker at frame 1; propagate_frame expects the next
+                // *unprocessed* frame's image, so the seed frame renders the
+                // interactive segmentation result itself (official flow: the
+                // prompt frame's mask comes from the SAM decoder, propagation
+                // starts at the following frame).
+                result = sam3_segment_pvs(*state, *model, pvs);
             } else {
                 result = sam3_propagate_frame(*tracker, *state, *model, frame);
             }

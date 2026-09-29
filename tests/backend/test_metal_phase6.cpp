@@ -1,6 +1,6 @@
 #include "sam3.h"
 
-#include "test_utils.h"
+#include "../test_utils.h"
 
 #include <cstdio>
 #include <fstream>

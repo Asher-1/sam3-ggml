@@ -52,6 +52,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
 #include <fstream>
 #include <map>
 #include <thread>
@@ -174,6 +177,16 @@ struct sam3_hparams {
     int32_t multimask_output_in_sam             = 1;
     int32_t is_sam2_1                           = 1;  // 0 = SAM2.0, 1 = SAM2.1
 
+    // ── SAM 3.1 multiplex (Object Multiplex) flags ──────────────────────
+    // 0 = per-object tracker (SAM 3); 16 = bucket-space tracker (SAM 3.1).
+    int32_t multiplex_count        = 0;
+    int32_t mem_attn_heads         = 1;   // 3.1: 8
+    int32_t mem_attn_gelu          = 0;   // 3.1 FFN activation: gelu (SAM3: relu)
+    int32_t save_image_features    = 0;   // 3.1: raw image features join the memory bank
+    int32_t output_suppress_embed  = 0;   // 3.1: per-slot valid/invalid embeds
+    int32_t cond_as_mask_input     = 0;   // 3.1: +16 conditioning channels into mem enc
+    int32_t use_linear_no_obj_ptr  = 0;   // 3.1: (1-λ)·Linear(obj_ptr) gating
+
     int32_t backbone_type             = 1;   // SAM2 Hiera
 
     // ── SAM3 derived helpers ────────────────────────────────────────────
@@ -190,6 +203,9 @@ struct sam3_hparams {
 
     // ── SAM2 derived helpers ────────────────────────────────────────────
     bool is_sam2() const { return model_type == SAM3_MODEL_SAM2; }
+
+    bool is_multiplex() const { return multiplex_count > 0; }
+    int32_t mem_head_dim() const { return neck_dim / mem_attn_heads; }
 
     int32_t hiera_total_blocks() const {
         int s = 0;
@@ -514,6 +530,9 @@ struct sam3_seg_head {
 
 struct sam3_sam_prompt_enc {
     struct ggml_tensor* pe_gaussian         = nullptr;  // [2, 128]
+    // SAM 3.1: separate PositionEmbeddingRandom owned by the tracker itself,
+    // used as the propagation decoder's dense PE (image_pe_layer).
+    struct ggml_tensor* prop_pe_gaussian    = nullptr;  // [2, 128] or nullptr
     struct ggml_tensor* point_embed[4]      = {};       // neg, pos, box_tl, box_br
     struct ggml_tensor* not_a_point_embed   = nullptr;  // [256]
     struct ggml_tensor* no_mask_embed       = nullptr;  // [256]
@@ -629,7 +648,7 @@ struct sam3_mem_enc {
 */
 
 struct sam3_mem_attn_layer {
-    // self-attention (RoPE, 1 head, 256-dim)
+    // self-attention (RoPE; SAM3: 1 head, SAM3.1: 8 heads)
     struct ggml_tensor* sa_q_w    = nullptr;
     struct ggml_tensor* sa_q_b    = nullptr;
     struct ggml_tensor* sa_k_w    = nullptr;
@@ -640,15 +659,23 @@ struct sam3_mem_attn_layer {
     struct ggml_tensor* sa_out_b  = nullptr;
     struct ggml_tensor* norm1_w   = nullptr;
     struct ggml_tensor* norm1_b   = nullptr;
-    // cross-attention (RoPE, kv_dim=64)
+    // cross-attention (RoPE; SAM3: kv_dim=64, SAM3.1: kv_dim=256)
     struct ggml_tensor* ca_q_w    = nullptr;
     struct ggml_tensor* ca_q_b    = nullptr;
-    struct ggml_tensor* ca_k_w    = nullptr;  // [256, 64]
+    struct ggml_tensor* ca_k_w    = nullptr;  // [256, kv_dim]
     struct ggml_tensor* ca_k_b    = nullptr;
-    struct ggml_tensor* ca_v_w    = nullptr;  // [256, 64]
+    struct ggml_tensor* ca_v_w    = nullptr;  // [256, kv_dim]
     struct ggml_tensor* ca_v_b    = nullptr;
     struct ggml_tensor* ca_out_w  = nullptr;
     struct ggml_tensor* ca_out_b  = nullptr;
+    // SAM3.1 (DecoupledTransformerDecoderLayerv2) dual projections: the
+    // query mixes the raw current-frame features with the self-attention
+    // output; the key mixes the raw past-frame image features with the
+    // spatial memories.
+    struct ggml_tensor* img_ca_q_w = nullptr;
+    struct ggml_tensor* img_ca_q_b = nullptr;
+    struct ggml_tensor* img_ca_k_w = nullptr;
+    struct ggml_tensor* img_ca_k_b = nullptr;
     struct ggml_tensor* norm2_w   = nullptr;
     struct ggml_tensor* norm2_b   = nullptr;
     // FFN
@@ -735,6 +762,7 @@ struct sam2_fpn_neck {
 struct sam3_model {
     sam3_hparams        hparams;
     ggml_type           weight_type = GGML_TYPE_F16;
+    sam3_debug_options  debug;  // explicit diagnostics, copied from sam3_params at load
 
     // ── SAM3-specific (loaded only when model_type != SAM2) ──────────────
     sam3_vit            vit;
@@ -770,6 +798,22 @@ struct sam3_model {
     struct ggml_tensor* mem_attn_norm_w    = nullptr;
     struct ggml_tensor* mem_attn_norm_b    = nullptr;
 
+    // ── SAM 3.1 multiplex (Object Multiplex) ─────────────────────────────
+    // Interactive path: point/mask prompts run through a structural clone of
+    // the tracker SAM heads with separate weights.
+    sam3_neck           neck_trk_int;      // interactive neck (vs neck_trk = propagation)
+    sam3_sam_prompt_enc sam_pe_int;        // interactive prompt encoder
+    sam3_sam_mask_dec   sam_dec_int;       // interactive mask decoder
+    struct ggml_tensor* obj_ptr_proj_int_w[3] = {};
+    struct ggml_tensor* obj_ptr_proj_int_b[3] = {};
+    struct ggml_tensor* no_mem_embed_int   = nullptr;  // interactivity_no_mem_embed
+    struct ggml_tensor* no_obj_ptr_lin_w   = nullptr;  // no_obj_ptr_linear
+    struct ggml_tensor* no_obj_ptr_lin_b   = nullptr;
+    struct ggml_tensor* out_valid_embed    = nullptr;  // [multiplex_count, 256]
+    struct ggml_tensor* out_invalid_embed  = nullptr;  // [multiplex_count, 256]
+    struct ggml_tensor* trk_mask_ds_int_w  = nullptr;  // interactive_mask_downsample
+    struct ggml_tensor* trk_mask_ds_int_b  = nullptr;
+
     // precomputed RoPE frequencies (SAM3 only)
     struct ggml_tensor* rope_freqs         = nullptr;  // [n_img_tokens, head_dim]
 
@@ -792,6 +836,8 @@ struct sam3_state {
     struct ggml_tensor* neck_trk[4]      = {};       // FPN levels (trk path)
     struct ggml_tensor* neck_det_pe[4]   = {};       // sinusoidal PE
     struct ggml_tensor* neck_trk_pe[4]   = {};
+    // SAM 3.1 interactive-path neck (point/mask prompts)
+    struct ggml_tensor* neck_trk_int[4]  = {};
 
     int orig_width  = 0;
     int orig_height = 0;
@@ -817,6 +863,25 @@ struct sam3_state {
     float no_mask_emb_cache[256]    = {};
     std::vector<float> dense_pe_cache;      // [D * H * H] -- PE grid
     std::vector<float> dense_nomask_cache;  // [D * H * H] -- no-mask tiled
+
+    // ── SAM 3.1 PE caches ──────────────────────────────────────────────────
+    bool prop_pe_cache_valid = false;
+    std::vector<float> prop_dense_pe_cache;   // [D * H * H] from sam_pe.prop_pe_gaussian
+    bool int_pe_cache_valid = false;
+    std::vector<float> int_pe_gauss_cache;    // [2 * num_pos_feats]
+    float int_point_emb_cache[4][256] = {};
+    float int_not_a_point_cache[256]  = {};
+    float int_no_mask_emb_cache[256]  = {};
+    std::vector<float> int_dense_pe_cache;    // [D * H * H]
+    std::vector<float> int_dense_nomask_cache;// [D * H * H]
+
+    // Cached text-encoder features: a pure function of the prompt string
+    // (tokenize + 24-layer transformer with fixed weights). Keyed by exact
+    // prompt so repeated PCS calls with the same prompt skip the text
+    // sub-graph entirely (~230 ms per hit avoided).
+    std::string text_cache_prompt;
+    std::vector<float> text_cache_feats;   // [D * text_ctx_len]
+    bool text_cache_valid = false;
 
     // Cached Hiera encode graph: the graph topology is a pure function of
     // (model hparams, img_size), so rebuild it only when img_size changes and
@@ -844,6 +909,20 @@ struct sam3_state {
     struct ggml_gallocr*  sam3_galloc   = nullptr;
     int                   sam3_img_size = 0;
     bool                  sam3_tracker_only = false;
+
+    // Cached text-encoder graph (same rationale as enc_*): the topology is a
+    // pure function of model hparams (L = text_ctx_len is fixed), so it is
+    // built once and reused across sam3_segment_pcs calls. Per-prompt cost is
+    // then just the token-id upload + compute (~24 ms instead of ~230 ms of
+    // graph building); the feature cache below additionally makes repeated
+    // same-prompt calls a plain memcpy. The graph references model weights and
+    // owns its tensors in text_ctx — freed in sam3_free_state before the model.
+    struct ggml_context*  text_ctx    = nullptr;
+    struct ggml_cgraph*   text_graph  = nullptr;
+    struct ggml_gallocr*  text_galloc = nullptr;
+    struct ggml_tensor*   text_inp    = nullptr;   // token ids input (I32 [L])
+    struct ggml_tensor*   text_out    = nullptr;   // features output (F32 [D*L])
+    struct ggml_tensor*   text_causal = nullptr;   // causal mask input (F16 [L,L])
 
     // ── Batch image slots (official set_image_batch flow) ────────────────
     // One full snapshot of the detector-path neck features + PE per image,
@@ -877,6 +956,9 @@ struct sam3_masklet {
     // last predicted mask logits (owned by tracker ctx)
     struct ggml_tensor* mask_logits = nullptr;  // [1, 1, 288, 288]
     struct ggml_tensor* obj_ptr = nullptr;      // [1, 256]
+    // object-score logit of the last prediction (drives the memory encoder's
+    // per-slot no_obj gate when this instance is re-conditioned on a frame)
+    float last_obj_logit = 0.0f;
 };
 
 struct sam3_memory_slot {
@@ -889,7 +971,18 @@ struct sam3_memory_slot {
     // memory-selection frame_filter. < 0 marks "not scored" (cond frames,
     // mask-pinned seeds) so frame_filter skips them.
     float               eff_iou_score  = -1.0f;
+    // SAM 3.1: raw past-frame image features (save_image_features), [256,72,72].
+    // Their PE is the same sinusoidal grid as spatial_pe (mem_dim == 256).
+    struct ggml_tensor* image_feats    = nullptr;
+    // Device buffers backing the tensors above — owned by the slot so a
+    // trimmed/replaced/erased slot releases its VRAM immediately.
+    ggml_backend_buffer_t bufs[3] = {};
 };
+
+static void sam3_memory_slot_release(sam3_memory_slot& s) {
+    for (int i = 0; i < 3; ++i)
+        if (s.bufs[i]) { ggml_backend_buffer_free(s.bufs[i]); s.bufs[i] = nullptr; }
+}
 
 // One stored object pointer. `is_cond` mirrors the official
 // is_selected_cond_frame flag: prompt/seed frames keep the cond identity,
@@ -898,7 +991,28 @@ struct sam3_ptr_slot {
     int                 frame_index = -1;
     struct ggml_tensor* ptr         = nullptr;  // [256]
     bool                is_cond     = false;
+    ggml_backend_buffer_t buf       = nullptr;
 };
+
+static void sam3_ptr_slot_release(sam3_ptr_slot& s) {
+    if (s.buf) { ggml_backend_buffer_free(s.buf); s.buf = nullptr; }
+}
+
+// Release every slot of an instance's memory + pointer banks (device buffers).
+static void sam3_release_banks(std::map<int, std::vector<sam3_memory_slot>>& mem_banks,
+                               std::map<int, std::vector<sam3_ptr_slot>>& ptr_banks,
+                               int instance_id) {
+    auto mb = mem_banks.find(instance_id);
+    if (mb != mem_banks.end()) {
+        for (auto& s : mb->second) sam3_memory_slot_release(s);
+        mem_banks.erase(mb);
+    }
+    auto pb = ptr_banks.find(instance_id);
+    if (pb != ptr_banks.end()) {
+        for (auto& s : pb->second) sam3_ptr_slot_release(s);
+        ptr_banks.erase(pb);
+    }
+}
 
 struct sam3_tracker {
     sam3_video_params params;
@@ -974,6 +1088,13 @@ struct sam3_tracker {
     struct ggml_tensor*   mem_inp_pix  = nullptr;  // [D, H, H, 1]
     struct ggml_tensor*   mem_out      = nullptr;  // [MD, H, H, 1]
 
+    // Persistent host scratch for the muxed memory-encoder input (and its
+    // resampled copy) — per-frame allocation + zeroing of ~300 MB dominated
+    // the muxed memenc path. Reused across frames; every consumed element is
+    // rewritten each frame except empty-slot channels, which are zeroed.
+    std::vector<float> mem_muxed_scratch;     // [C_IN * HIGH_RES^2]
+    std::vector<float> mem_interp_scratch;    // [C_IN * INTERPOL^2]
+
     // Cached memory-encoder weight reads — the tensors are immutable model
     // weights, so read them once instead of every frame.
     bool mem_w_cache_valid = false;
@@ -981,10 +1102,43 @@ struct sam3_tracker {
     std::vector<float> mem_ptr_tpos_w;  // [D * MD]
     std::vector<float> mem_ptr_tpos_b;  // [MD]
 
+    // Per-enc_idx device cache of spatial-PE + temporal-PE rows for the muxed
+    // prompt position stream. enc_idx = num_maskmem - t_pos - 1 takes only
+    // num_maskmem distinct values, so re-adding the tpos row onto the spatial
+    // PE every frame (and re-uploading the result) is pure waste: the rows are
+    // computed once (bit-identical adds) and streamed D2D per slot.
+    bool pe_tpos_cache_valid = false;
+    int  pe_tpos_cache_n     = 0;
+    ggml_backend_buffer_t pe_tpos_buf = nullptr;
+    std::vector<struct ggml_tensor*> pe_tpos_rows;  // [num_maskmem] x [MD, H, H, 1]
+
     // Frame-invariant inputs of the cached propagate graph (rope_q/rope_k,
     // src_pos, sparse prompt, image_pe, dense_emb) are uploaded once after
     // each graph rebuild and reused afterwards.
     bool prop_consts_uploaded = false;
+
+    // ── SAM 3.1 mux caches ────────────────────────────────────────────────
+    int mem_C = -1;   // memory-encoder input channels (32 for 3.1, 1 otherwise)
+    // propagated-frame stash for the bucket memory encode (frame → per-slot
+    // logits/obj-logits). Only the most recent frame is kept.
+    struct sam3_mux_frame_stash {
+        std::vector<float> logits[16];   // 288×288 raw mask logits (empty = padding)
+        float obj_logit[16] = {};
+        bool  valid[16] = {};
+        bool  used = false;
+    };
+    int stash_frame = -1;
+    sam3_mux_frame_stash stash;
+
+    // cached mux propagate graph inputs (3.1 only; separate from prop_inp_*)
+    struct ggml_tensor*   mux_inp_prompt_img  = nullptr;
+    struct ggml_tensor*   mux_inp_prompt_ipos = nullptr;
+    struct ggml_tensor*   mux_inp_image_pe    = nullptr;
+    struct ggml_tensor*   mux_inp_extra       = nullptr;
+    struct ggml_tensor*   mux_out_masks       = nullptr;
+    struct ggml_tensor*   mux_out_iou         = nullptr;
+    struct ggml_tensor*   mux_out_obj         = nullptr;
+    struct ggml_tensor*   mux_out_mask_toks   = nullptr;
 };
 
 // Resolve effective img_size / feat_size from state (which may override hp defaults).
@@ -2671,6 +2825,24 @@ static bool sam3_load_hparams(const gguf_kv& r, sam3_hparams& hp) {
     hp.mf_threshold_x100       = rd("sam3.hparams.mf_threshold_x100", hp.mf_threshold_x100);
     hp.n_amb_experts     = rd("sam3.hparams.n_amb_experts",     hp.n_amb_experts);
     hp.visual_only       = rd("sam3.hparams.visual_only",       hp.visual_only);
+
+    // ── SAM 3.1 multiplex (absent in SAM 3 files → defaults keep SAM 3) ──
+    hp.multiplex_count       = rd("sam3.hparams.multiplex_count",       hp.multiplex_count);
+    hp.mem_attn_heads        = rd("sam3.hparams.mem_attn_heads",        hp.mem_attn_heads);
+    hp.mem_attn_gelu         = rd("sam3.hparams.mem_attn_gelu",         hp.mem_attn_gelu);
+    hp.save_image_features   = rd("sam3.hparams.save_image_features",   hp.save_image_features);
+    hp.output_suppress_embed = rd("sam3.hparams.output_suppress_embed", hp.output_suppress_embed);
+    hp.cond_as_mask_input    = rd("sam3.hparams.cond_as_mask_input",    hp.cond_as_mask_input);
+    hp.use_linear_no_obj_ptr = rd("sam3.hparams.use_linear_no_obj_ptr", hp.use_linear_no_obj_ptr);
+    if (hp.is_multiplex()) {
+        // 3.1 overrides written by the converter (different defaults).
+        hp.sigmoid_scale_x100 = rd("sam3.hparams.mem_sig_scale_x100", hp.sigmoid_scale_x100);
+        hp.sigmoid_bias_x100  = rd("sam3.hparams.mem_sig_bias_x100",  hp.sigmoid_bias_x100);
+        hp.non_overlap_masks_for_mem_enc =
+            rd("sam3.hparams.non_overlap_masks_for_mem_enc", hp.non_overlap_masks_for_mem_enc);
+        hp.iou_prediction_use_sigmoid =
+            rd("sam3.hparams.iou_prediction_use_sigmoid", hp.iou_prediction_use_sigmoid);
+    }
     return r.err.empty();
 }
 
@@ -3093,7 +3265,8 @@ static void sam2_register_tensors(sam3_model& model) {
         model.mem_enc.ds_norm_w[s] = T1f("mem_enc.ds." + ni + ".weight", ds_channels[s + 1]);
         model.mem_enc.ds_norm_b[s] = T1f("mem_enc.ds." + ni + ".bias", ds_channels[s + 1]);
     }
-    model.mem_enc.ds_conv_w[4] = T4("mem_enc.ds.12.weight", 1, 1, D, D);
+    model.mem_enc.ds_conv_w[4] = T4("mem_enc.ds.12.weight", 1, 1,
+                                    hp.is_multiplex() ? 1024 : D, D);
     model.mem_enc.ds_conv_b[4] = T1f("mem_enc.ds.12.bias", D);
 
     model.mem_enc.pix_proj_w = T4("mem_enc.pix_feat_proj.weight", 1, 1, D, D);
@@ -3305,10 +3478,13 @@ static void sam3_register_tensors(sam3_model& model) {
         neck.scales[2].conv3x3_b = T1f(prefix + "2.conv_3x3.bias", D);
 
         // scale 3 (0.5x): MaxPool(k=2, s=2), Conv1x1(E→D), Conv3x3(D→D)
-        neck.scales[3].conv1x1_w = T4(prefix + "3.conv_1x1.weight", 1, 1, E, D);
-        neck.scales[3].conv1x1_b = T1f(prefix + "3.conv_1x1.bias", D);
-        neck.scales[3].conv3x3_w = T4(prefix + "3.conv_3x3.weight", 3, 3, D, D);
-        neck.scales[3].conv3x3_b = T1f(prefix + "3.conv_3x3.bias", D);
+        // Absent in SAM 3.1 (3-level FPN: scale_factors [4, 2, 1]).
+        if (!hp.is_multiplex()) {
+            neck.scales[3].conv1x1_w = T4(prefix + "3.conv_1x1.weight", 1, 1, E, D);
+            neck.scales[3].conv1x1_b = T1f(prefix + "3.conv_1x1.bias", D);
+            neck.scales[3].conv3x3_w = T4(prefix + "3.conv_3x3.weight", 3, 3, D, D);
+            neck.scales[3].conv3x3_b = T1f(prefix + "3.conv_3x3.bias", D);
+        }
     };
     if (!hp.visual_only) {
         register_neck(model.neck_det, "neck.det.");
@@ -3598,7 +3774,15 @@ static void sam3_register_tensors(sam3_model& model) {
     } // end if (!hp.visual_only) — detector-only tensors
 
     // ── SAM prompt encoder ───────────────────────────────────────────────
-    model.sam_pe.pe_gaussian = T2f("sam_pe.pe_gaussian", 2, 128);
+    // SAM 3.1 has no propagation prompt encoder; the propagation decoder's
+    // dense PE comes from the tracker-owned image_pe_layer instead.  The
+    // interactive path carries the full prompt-encoder clone (sam_pe_int).
+    model.sam_pe.pe_gaussian = hp.is_multiplex()
+        ? nullptr  // 3.1: only the tracker-owned image_pe_layer PE exists
+        : T2f("sam_pe.pe_gaussian", 2, 128);
+    if (hp.is_multiplex()) {
+        model.sam_pe.prop_pe_gaussian = T2f("sam_pe.prop_pe_gaussian", 2, 128);
+    } else {
     for (int i = 0; i < 4; ++i)
         model.sam_pe.point_embed[i] = T2f("sam_pe.point_embeddings." + std::to_string(i) + ".weight", D, 1);
     model.sam_pe.not_a_point_embed = T2f("sam_pe.not_a_point_embed.weight", D, 1);
@@ -3615,11 +3799,18 @@ static void sam3_register_tensors(sam3_model& model) {
     model.sam_pe.mask_ds_norm_b[1] = T1f("sam_pe.mask_ds.4.bias", 16);
     model.sam_pe.mask_ds_conv_w[2] = T4("sam_pe.mask_ds.6.weight", 1, 1, 16, D);
     model.sam_pe.mask_ds_conv_b[2] = T1f("sam_pe.mask_ds.6.bias", D);
+    } // end if (!hp.is_multiplex())
 
     // ── SAM mask decoder ─────────────────────────────────────────────────
-    model.sam_dec.iou_token = T2f("sam_dec.iou_token.weight", D, 1);
-    model.sam_dec.mask_tokens = T2f("sam_dec.mask_tokens.weight", D, 4);
-    model.sam_dec.obj_score_token = T2f("sam_dec.obj_score_token.weight", D, 1);
+    // SAM 3.1 propagation decoder: 16 multiplex slots × 3 multimask-only
+    // outputs (multimask_outputs_only=True, no single-mask token), token
+    // layout [obj(16) | iou(16) | masks(48)] = 80 tokens joint decode.
+    // SAM 3 / SAM 2: single slot with 4 outputs (1 single + 3 multimask).
+    const int n_mux = hp.is_multiplex() ? hp.multiplex_count : 1;
+    const int n_mask_out = hp.is_multiplex() ? 3 : 4;
+    model.sam_dec.iou_token = T2f("sam_dec.iou_token.weight", D, n_mux);
+    model.sam_dec.mask_tokens = T2f("sam_dec.mask_tokens.weight", D, n_mux * n_mask_out);
+    model.sam_dec.obj_score_token = T2f("sam_dec.obj_score_token.weight", D, n_mux);
 
     model.sam_dec.twoway_blocks.resize(hp.sam_dec_depth);
     for (int i = 0; i < hp.sam_dec_depth; ++i) {
@@ -3685,8 +3876,8 @@ static void sam3_register_tensors(sam3_model& model) {
     model.sam_dec.conv_s1_w = T4("sam_dec.conv_s1.weight", 1, 1, D, 64);
     model.sam_dec.conv_s1_b = T1f("sam_dec.conv_s1.bias", 64);
 
-    // hypernetwork MLPs (4 × 3 layers: 256→256→256→32)
-    for (int m = 0; m < 4; ++m) {
+    // hypernetwork MLPs (SAM3: 4 × 3 layers: 256→256→256→32; 3.1: 3 sets)
+    for (int m = 0; m < n_mask_out; ++m) {
         for (int j = 0; j < 3; ++j) {
             int in_d = D, out_d = (j == 2) ? 32 : D;
             auto bp = "sam_dec.hyper." + std::to_string(m) + ".layers." + std::to_string(j);
@@ -3695,9 +3886,9 @@ static void sam3_register_tensors(sam3_model& model) {
         }
     }
 
-    // IoU prediction head (3 layers: 256→256→256→4)
+    // IoU prediction head (3 layers: 256→256→256→n_mask_out)
     for (int j = 0; j < 3; ++j) {
-        int out_d = (j == 2) ? 4 : D;
+        int out_d = (j == 2) ? n_mask_out : D;
         auto bp = "sam_dec.iou_prediction_head.layers." + std::to_string(j);
         model.sam_dec.iou_head_w[j] = T2(bp + ".weight", D, out_d);
         model.sam_dec.iou_head_b[j] = T1f(bp + ".bias", out_d);
@@ -3713,7 +3904,12 @@ static void sam3_register_tensors(sam3_model& model) {
 
     // ── Memory encoder ───────────────────────────────────────────────────
     // mask_downsampler: sequential encoder.{0,1,3,4,6,7,9,10,12}
-    int ds_channels[] = {1, 4, 16, 64, 256};
+    // SAM 3.1: input is 32 channels (16 muxed masks + 16 cond channels) and
+    // the channel chain is 32→16→64→256→1024→(ln)→256 with no out_proj
+    // (mem_dim == hidden_dim).
+    int ds_channels_m3[] = {32, 16, 64, 256, 1024};
+    int ds_channels_s[]  = {1, 4, 16, 64, 256};
+    int* ds_channels = hp.is_multiplex() ? ds_channels_m3 : ds_channels_s;
     int ds_indices[] = {0, 3, 6, 9, 12};
     int norm_indices[] = {1, 4, 7, 10};
     for (int s = 0; s < 4; ++s) {
@@ -3724,7 +3920,8 @@ static void sam3_register_tensors(sam3_model& model) {
         model.mem_enc.ds_norm_w[s] = T1f("mem_enc.ds." + ni + ".weight", ds_channels[s + 1]);
         model.mem_enc.ds_norm_b[s] = T1f("mem_enc.ds." + ni + ".bias", ds_channels[s + 1]);
     }
-    model.mem_enc.ds_conv_w[4] = T4("mem_enc.ds.12.weight", 1, 1, D, D);
+    model.mem_enc.ds_conv_w[4] = T4("mem_enc.ds.12.weight", 1, 1,
+                                    hp.is_multiplex() ? 1024 : D, D);
     model.mem_enc.ds_conv_b[4] = T1f("mem_enc.ds.12.bias", D);
 
     model.mem_enc.pix_proj_w = T4("mem_enc.pix_feat_proj.weight", 1, 1, D, D);
@@ -3744,8 +3941,11 @@ static void sam3_register_tensors(sam3_model& model) {
         model.mem_enc.fuser_gamma[i] = T1f(p + ".gamma", D);
     }
 
-    model.mem_enc.out_proj_w = T4("mem_enc.out_proj.weight", 1, 1, D, MD);
-    model.mem_enc.out_proj_b = T1f("mem_enc.out_proj.bias", MD);
+    if (!hp.is_multiplex()) {
+        // SAM 3.1: out_proj is Identity (mem_dim == hidden_dim).
+        model.mem_enc.out_proj_w = T4("mem_enc.out_proj.weight", 1, 1, D, MD);
+        model.mem_enc.out_proj_b = T1f("mem_enc.out_proj.bias", MD);
+    }
 
     // temporal pos encodings
     model.mem_enc.tpos[0] = T4f("mem_enc.tpos_enc", MD, 1, 1, hp.num_maskmem);
@@ -3757,6 +3957,43 @@ static void sam3_register_tensors(sam3_model& model) {
 
     for (int i = 0; i < hp.mem_attn_layers; ++i) {
         auto& ly = model.mem_attn.layers[i];
+        if (hp.is_multiplex()) {
+            // SAM 3.1 DecoupledTransformerDecoderLayerv2: flat key names,
+            // 8-head RoPE attention, dual image/memory projections,
+            // kv_dim = 256 (mem_dim == hidden).
+            auto p = "mem_attn.layers." + std::to_string(i);
+            ly.sa_q_w = T2(p + ".self_attn_q_proj.weight", D, D);
+            ly.sa_q_b = T1f(p + ".self_attn_q_proj.bias", D);
+            ly.sa_k_w = T2(p + ".self_attn_k_proj.weight", D, D);
+            ly.sa_k_b = T1f(p + ".self_attn_k_proj.bias", D);
+            ly.sa_v_w = T2(p + ".self_attn_v_proj.weight", D, D);
+            ly.sa_v_b = T1f(p + ".self_attn_v_proj.bias", D);
+            ly.sa_out_w = T2(p + ".self_attn_out_proj.weight", D, D);
+            ly.sa_out_b = T1f(p + ".self_attn_out_proj.bias", D);
+            ly.norm1_w = T1f(p + ".norm1.weight", D);
+            ly.norm1_b = T1f(p + ".norm1.bias", D);
+            ly.ca_q_w = T2(p + ".cross_attn_q_proj.weight", D, D);
+            ly.ca_q_b = T1f(p + ".cross_attn_q_proj.bias", D);
+            ly.ca_k_w = T2(p + ".cross_attn_k_proj.weight", MD, D);
+            ly.ca_k_b = T1f(p + ".cross_attn_k_proj.bias", D);
+            ly.ca_v_w = T2(p + ".cross_attn_v_proj.weight", MD, D);
+            ly.ca_v_b = T1f(p + ".cross_attn_v_proj.bias", D);
+            ly.ca_out_w = T2(p + ".cross_attn_out_proj.weight", D, D);
+            ly.ca_out_b = T1f(p + ".cross_attn_out_proj.bias", D);
+            ly.img_ca_q_w = T2(p + ".image_cross_attn_q_proj.weight", D, D);
+            ly.img_ca_q_b = T1f(p + ".image_cross_attn_q_proj.bias", D);
+            ly.img_ca_k_w = T2(p + ".image_cross_attn_k_proj.weight", MD, D);
+            ly.img_ca_k_b = T1f(p + ".image_cross_attn_k_proj.bias", D);
+            ly.norm2_w = T1f(p + ".norm2.weight", D);
+            ly.norm2_b = T1f(p + ".norm2.bias", D);
+            ly.ffn_fc1_w = T2(p + ".linear1.weight", D, FFN);
+            ly.ffn_fc1_b = T1f(p + ".linear1.bias", FFN);
+            ly.ffn_fc2_w = T2(p + ".linear2.weight", FFN, D);
+            ly.ffn_fc2_b = T1f(p + ".linear2.bias", D);
+            ly.norm3_w = T1f(p + ".norm3.weight", D);
+            ly.norm3_b = T1f(p + ".norm3.bias", D);
+            continue;
+        }
         auto p = "mem_attn.layers." + std::to_string(i);
         // self-attention (RoPE, 1 head, 256-dim)
         ly.sa_q_w = T2(p + ".sa.q_proj.weight", D, D);
@@ -3795,16 +4032,112 @@ static void sam3_register_tensors(sam3_model& model) {
         model.obj_ptr_proj_w[j] = T2(bp + ".weight", D, D);
         model.obj_ptr_proj_b[j] = T1f(bp + ".bias", D);
     }
-    model.no_obj_ptr = T2f("no_obj_ptr", D, 1);
     model.obj_ptr_tpos_w = T2("obj_ptr_tpos_proj.weight", D, MD);
     model.obj_ptr_tpos_b = T1f("obj_ptr_tpos_proj.bias", MD);
 
     // standalone tracker parameters
-    model.no_mem_embed         = T3f("no_mem_embed", D, 1, 1);
-    model.no_mem_pos_enc       = T3f("no_mem_pos_enc", D, 1, 1);
-    model.no_obj_embed_spatial = T2f("no_obj_embed_spatial", MD, 1);
-    T4f("trk_mask_ds.weight", 4, 4, 1, 1);
-    T1f("trk_mask_ds.bias", 1);
+    if (hp.is_multiplex()) {
+        // SAM 3.1: linear no-obj-pointer gating replaces the constant vector;
+        // no no_mem_embed / no_mem_pos_enc / no_obj_ptr in the checkpoint.
+        model.no_obj_ptr_lin_w = T2("no_obj_ptr_lin.weight", D, D);
+        model.no_obj_ptr_lin_b = T1f("no_obj_ptr_lin.bias", D);
+        model.no_obj_embed_spatial = T2f("no_obj_embed_spatial", MD, n_mux);
+        if (hp.output_suppress_embed) {
+            model.out_valid_embed   = T2f("out_valid_embed", D, n_mux);
+            model.out_invalid_embed = T2f("out_invalid_embed", D, n_mux);
+        }
+        model.trk_mask_ds_int_w = T4("trk_mask_ds_int.weight", 4, 4, 1, 1);
+        model.trk_mask_ds_int_b = T1f("trk_mask_ds_int.bias", 1);
+        model.no_mem_embed_int  = T3f("no_mem_embed_int", D, 1, 1);
+
+        // ── Interactive path (point/mask prompts) ────────────────────────
+        register_neck(model.neck_trk_int, "neck.trk_int.");
+        model.sam_pe_int.pe_gaussian = T2f("sam_pe_int.pe_gaussian", 2, 128);
+        for (int i = 0; i < 4; ++i)
+            model.sam_pe_int.point_embed[i] = T2f("sam_pe_int.point_embeddings." + std::to_string(i) + ".weight", D, 1);
+        model.sam_pe_int.not_a_point_embed = T2f("sam_pe_int.not_a_point_embed.weight", D, 1);
+        model.sam_pe_int.no_mask_embed = T2f("sam_pe_int.no_mask_embed.weight", D, 1);
+        model.sam_pe_int.mask_ds_conv_w[0] = T4("sam_pe_int.mask_ds.0.weight", 2, 2, 1, 4);
+        model.sam_pe_int.mask_ds_conv_b[0] = T1f("sam_pe_int.mask_ds.0.bias", 4);
+        model.sam_pe_int.mask_ds_norm_w[0] = T1f("sam_pe_int.mask_ds.1.weight", 4);
+        model.sam_pe_int.mask_ds_norm_b[0] = T1f("sam_pe_int.mask_ds.1.bias", 4);
+        model.sam_pe_int.mask_ds_conv_w[1] = T4("sam_pe_int.mask_ds.3.weight", 2, 2, 4, 16);
+        model.sam_pe_int.mask_ds_conv_b[1] = T1f("sam_pe_int.mask_ds.3.bias", 16);
+        model.sam_pe_int.mask_ds_norm_w[1] = T1f("sam_pe_int.mask_ds.4.weight", 16);
+        model.sam_pe_int.mask_ds_norm_b[1] = T1f("sam_pe_int.mask_ds.4.bias", 16);
+        model.sam_pe_int.mask_ds_conv_w[2] = T4("sam_pe_int.mask_ds.6.weight", 1, 1, 16, D);
+        model.sam_pe_int.mask_ds_conv_b[2] = T1f("sam_pe_int.mask_ds.6.bias", D);
+
+        auto& di = model.sam_dec_int;
+        di.iou_token = T2f("sam_dec_int.iou_token.weight", D, 1);
+        di.mask_tokens = T2f("sam_dec_int.mask_tokens.weight", D, 4);
+        di.obj_score_token = T2f("sam_dec_int.obj_score_token.weight", D, 1);
+        di.twoway_blocks.resize(hp.sam_dec_depth);
+        for (int i = 0; i < hp.sam_dec_depth; ++i) {
+            auto& blk = di.twoway_blocks[i];
+            auto p = "sam_dec_int.twoway." + std::to_string(i);
+            reg_sam_attn(blk.self_attn, p + ".sa", D, D);
+            reg_sam_attn(blk.ca_tok2img, p + ".cross_attn_token_to_image", D, 128);
+            reg_sam_attn(blk.ca_img2tok, p + ".cross_attn_image_to_token", D, 128);
+            blk.norm1_w = T1f(p + ".norm1.weight", D);
+            blk.norm1_b = T1f(p + ".norm1.bias", D);
+            blk.norm2_w = T1f(p + ".norm2.weight", D);
+            blk.norm2_b = T1f(p + ".norm2.bias", D);
+            blk.norm3_w = T1f(p + ".norm3.weight", D);
+            blk.norm3_b = T1f(p + ".norm3.bias", D);
+            blk.norm4_w = T1f(p + ".norm4.weight", D);
+            blk.norm4_b = T1f(p + ".norm4.bias", D);
+            blk.mlp_fc1_w = T2(p + ".mlp.lin1.weight", D, FFN);
+            blk.mlp_fc1_b = T1f(p + ".mlp.lin1.bias", FFN);
+            blk.mlp_fc2_w = T2(p + ".mlp.lin2.weight", FFN, D);
+            blk.mlp_fc2_b = T1f(p + ".mlp.lin2.bias", D);
+        }
+        reg_sam_attn(di.final_attn, "sam_dec_int.final_attn", D, 128);
+        di.final_norm_w = T1f("sam_dec_int.final_norm.weight", D);
+        di.final_norm_b = T1f("sam_dec_int.final_norm.bias", D);
+        di.up1_w = T4("sam_dec_int.upscale.0.weight", 2, 2, 64, D);
+        di.up1_b = T1f("sam_dec_int.upscale.0.bias", 64);
+        di.up1_norm_w = T1f("sam_dec_int.upscale.1.weight", 64);
+        di.up1_norm_b = T1f("sam_dec_int.upscale.1.bias", 64);
+        di.up2_w = T4("sam_dec_int.upscale.3.weight", 2, 2, 32, 64);
+        di.up2_b = T1f("sam_dec_int.upscale.3.bias", 32);
+        di.conv_s0_w = T4("sam_dec_int.conv_s0.weight", 1, 1, D, 32);
+        di.conv_s0_b = T1f("sam_dec_int.conv_s0.bias", 32);
+        di.conv_s1_w = T4("sam_dec_int.conv_s1.weight", 1, 1, D, 64);
+        di.conv_s1_b = T1f("sam_dec_int.conv_s1.bias", 64);
+        for (int m = 0; m < 4; ++m) {
+            for (int j = 0; j < 3; ++j) {
+                int in_d = D, out_d = (j == 2) ? 32 : D;
+                auto bp = "sam_dec_int.hyper." + std::to_string(m) + ".layers." + std::to_string(j);
+                di.hyper_w[m][j] = T2(bp + ".weight", in_d, out_d);
+                di.hyper_b[m][j] = T1f(bp + ".bias", out_d);
+            }
+        }
+        for (int j = 0; j < 3; ++j) {
+            int out_d = (j == 2) ? 4 : D;
+            auto bp = "sam_dec_int.iou_prediction_head.layers." + std::to_string(j);
+            di.iou_head_w[j] = T2(bp + ".weight", D, out_d);
+            di.iou_head_b[j] = T1f(bp + ".bias", out_d);
+        }
+        for (int j = 0; j < 3; ++j) {
+            int out_d = (j == 2) ? 1 : D;
+            auto bp = "sam_dec_int.pred_obj_score_head.layers." + std::to_string(j);
+            di.obj_head_w[j] = T2(bp + ".weight", D, out_d);
+            di.obj_head_b[j] = T1f(bp + ".bias", out_d);
+        }
+        for (int j = 0; j < 3; ++j) {
+            auto bp = "obj_ptr_proj_int.layers." + std::to_string(j);
+            model.obj_ptr_proj_int_w[j] = T2(bp + ".weight", D, D);
+            model.obj_ptr_proj_int_b[j] = T1f(bp + ".bias", D);
+        }
+    } else {
+        model.no_obj_ptr = T2f("no_obj_ptr", D, 1);
+        model.no_mem_embed         = T3f("no_mem_embed", D, 1, 1);
+        model.no_mem_pos_enc       = T3f("no_mem_pos_enc", D, 1, 1);
+        model.no_obj_embed_spatial = T2f("no_obj_embed_spatial", MD, 1);
+        T4f("trk_mask_ds.weight", 4, 4, 1, 1);
+        T1f("trk_mask_ds.bias", 1);
+    }
 }
 
 // Stream tensor data from the GGUF data section into the already-registered
@@ -3820,6 +4153,25 @@ static bool sam3_load_tensors_from_gguf(const char* path, struct gguf_context* g
     if (n_tensors != (int64_t) model.tensors.size()) {
         fprintf(stderr, "%s: tensor count mismatch: file has %lld, model registered %zu\n",
                 __func__, (long long) n_tensors, model.tensors.size());
+        // Temporary diagnostics: list names present in only one side.
+        std::map<std::string, bool> file_names;
+        for (int64_t i = 0; i < n_tensors; ++i) {
+            const char* nm = gguf_get_tensor_name(gguf, (int) i);
+            if (nm) file_names[nm] = true;
+        }
+        int shown = 0;
+        for (auto& kv : model.tensors) {
+            if (!file_names.count(kv.first) && shown < 40) {
+                fprintf(stderr, "  REGISTERED-NOT-IN-FILE: %s\n", kv.first.c_str());
+                ++shown;
+            }
+        }
+        for (const auto& fn : file_names) {
+            if (!model.tensors.count(fn.first) && shown < 60) {
+                fprintf(stderr, "  IN-FILE-NOT-REGISTERED: %s\n", fn.first.c_str());
+                ++shown;
+            }
+        }
         return false;
     }
 
@@ -3970,6 +4322,7 @@ std::shared_ptr<sam3_model> sam3_load_model(const sam3_params& params) {
             __func__, arch.c_str(), ftype, (long long) gguf_get_n_tensors(gguf));
 
     auto model = std::make_shared<sam3_model>();
+    model->debug = params.debug;  // diagnostics come in through the API, not the environment
     {
         ggml_type wtype;
         switch (ftype) {
@@ -3977,6 +4330,9 @@ std::shared_ptr<sam3_model> sam3_load_model(const sam3_params& params) {
             case 1:  wtype = GGML_TYPE_F16;  break;
             case 2:  wtype = GGML_TYPE_Q4_0; break;
             case 3:  wtype = GGML_TYPE_Q4_1; break;
+            case 12: wtype = GGML_TYPE_Q4_K; break;
+            case 13: wtype = GGML_TYPE_Q5_K; break;
+            case 14: wtype = GGML_TYPE_Q6_K; break;
             case 8:  wtype = GGML_TYPE_Q8_0; break;
             default:
                 fprintf(stderr, "%s: unsupported ftype: %d\n", __func__, ftype);
@@ -4173,6 +4529,17 @@ void sam3_free_state(sam3_state& state) {
         ggml_free(state.enc_ctx);
         state.enc_ctx = nullptr;
     }
+    if (state.text_galloc) {
+        ggml_gallocr_free(state.text_galloc);
+        state.text_galloc = nullptr;
+    }
+    if (state.text_ctx) {
+        ggml_free(state.text_ctx);
+        state.text_ctx = nullptr;
+    }
+    state.text_graph = nullptr;
+    state.text_inp   = nullptr;
+    state.text_out   = nullptr;
     if (state.galloc) {
         ggml_gallocr_free(state.galloc);
         state.galloc = nullptr;
@@ -4266,6 +4633,7 @@ static void sam3_resize_bilinear(const uint8_t* src, int src_w, int src_h,
 // Preprocess an image: resize to img_size × img_size, convert to float, normalize.
 // Returns a float tensor in [C, H, W] layout (channel-first), range normalized with
 // mean=0.5, std=0.5 → pixel values in [-1, 1].
+
 static std::vector<float> sam3_preprocess_image(const sam3_image& image, int img_size) {
     const int C = 3;
     std::vector<float> result(C * img_size * img_size);
@@ -4537,16 +4905,9 @@ static struct ggml_tensor* sam3_vit_mul_mat(struct ggml_context* ctx,
 // head dimension. The backend's supports_op is the single source of truth
 // (it owns the head-dim whitelist), so this stays correct when ggml or the
 // patch set changes the supported set. Results are cached per backend.
-static bool sam3_fattn_hd_supported(ggml_backend_t backend, int64_t hd) {
+// `force_probe` bypasses the hd==32 shortcut below (large-query callers).
+static bool sam3_fattn_hd_probe(ggml_backend_t backend, int64_t hd) {
     if (hd <= 0 || hd > 4096 || !backend) {
-        return false;
-    }
-
-    // CUDA flash-attention offers only the generic TILE kernel for head_dim=32
-    // (MMA/VEC kernels exclude it), which is pathologically slow for the small
-    // query counts used here (geometry/fusion encoders). Route it to manual
-    // SDPA, which is an order of magnitude faster in practice.
-    if (hd == 32) {
         return false;
     }
 
@@ -4588,6 +4949,18 @@ static bool sam3_fattn_hd_supported(ggml_backend_t backend, int64_t hd) {
     return supported;
 }
 
+// hd=32 gate (see the note above the probe): CUDA offers only the generic
+// TILE kernel for head_dim=32 (MMA/VEC exclude it), which loses to manual
+// SDPA for the small query counts of the geometry/fusion encoders — but for
+// large-query attention (memory attention: 5184 x 36544 keys) the tile kernel
+// avoids materializing a [Nkv, Nq, NH] F32 score matrix and wins decisively.
+static bool sam3_fattn_hd_supported(ggml_backend_t backend, int64_t hd, int64_t n_q) {
+    if (hd == 32 && n_q <= 512) {
+        return false;
+    }
+    return sam3_fattn_hd_probe(backend, hd);
+}
+
 static struct ggml_tensor* sam3_attn_ext(
     struct ggml_context* ctx,
     struct ggml_tensor*  Q,            // [HD, N_q,  NH, B]
@@ -4603,7 +4976,7 @@ static struct ggml_tensor* sam3_attn_ext(
     // report "supported" and then abort at graph compute. Route such masks to
     // the manual SDPA path, which handles arbitrary mask shapes.
     const bool mask_compat = (mask == nullptr) || (mask->ne[2] == 1);
-    if (mask_compat && sam3_fattn_hd_supported(g_sam3_backend, Q->ne[0])) {
+    if (mask_compat && sam3_fattn_hd_supported(g_sam3_backend, Q->ne[0], Q->ne[1])) {
         return ggml_flash_attn_ext(ctx, Q, K, V, mask, scale, max_bias, logit_softcap);
     }
 
@@ -4772,6 +5145,8 @@ static inline struct ggml_tensor* sam3_global_mean_dim0(
 
 // Single ViT block forward: pre-norm → attn (window or global, with RoPE) → residual → pre-norm → MLP → residual
 // x: [E, W, H, B] in ggml layout (following sam.cpp convention)
+static bool g_vit_internal_dump = false;  // parity: dump blk9 qkv/attn/proj internals
+
 static struct ggml_tensor* sam3_vit_block_forward(struct ggml_context* ctx,
                                                   struct ggml_tensor* x,
                                                   const sam3_vit_block& blk,
@@ -4806,6 +5181,9 @@ static struct ggml_tensor* sam3_vit_block_forward(struct ggml_context* ctx,
             : blk.qkv_b;
         cur = ggml_add(ctx, cur, qkv_bias);
         // cur: [3*E, W_cur, H_cur, B_cur]
+        if (block_idx == 9 && g_vit_internal_dump) {
+            ggml_set_name(cur, "cpp_b9_qkv"); ggml_set_output(cur);
+        }
 
         struct ggml_tensor* Q = nullptr;
         struct ggml_tensor* K = nullptr;
@@ -4874,9 +5252,15 @@ static struct ggml_tensor* sam3_vit_block_forward(struct ggml_context* ctx,
         // flash_attn_ext returns [HD, NH, N, B_cur] — HD and NH adjacent,
         // so reshaping directly to [E, W, H, B] is correct.
         x = ggml_reshape_4d(ctx, attn_out, E, W_cur, H_cur, B_cur);
+        if (block_idx == 9 && g_vit_internal_dump) {
+            ggml_set_name(x, "cpp_b9_attn"); ggml_set_output(x);
+        }
 
         x = ggml_mul_mat(ctx, blk.proj_w, x);
         x = ggml_add(ctx, x, blk.proj_b);
+        if (block_idx == 9 && g_vit_internal_dump) {
+            ggml_set_name(x, "cpp_b9_proj"); ggml_set_output(x);
+        }
     }
 
     if (!is_global) {
@@ -4916,6 +5300,7 @@ static struct ggml_tensor* sam3_build_vit_prefix_graph(struct ggml_context* ctx,
     // Patch embedding: ggml conv outputs [W, H, E, 1], permute to [E, W, H, B]
     auto* x = ggml_conv_2d_sk_p0(ctx, model.vit.patch_embed_w, input);
     x = ggml_cont(ctx, ggml_permute(ctx, x, 1, 2, 0, 3));
+    auto* patch_out = x;
 
     // pos_embed [E, 24, 24] is Hiera pretrained resolution — tile 3x3 to [E, 72, 72]
     auto* pos_2d = model.vit.pos_embed;
@@ -4923,6 +5308,14 @@ static struct ggml_tensor* sam3_build_vit_prefix_graph(struct ggml_context* ctx,
     auto* pos_tiled = ggml_repeat(ctx, pos_2d, pos_target);
 
     x = ggml_add(ctx, x, pos_tiled);
+
+    const bool dump_blocks0 = model.debug.dump_vit_blocks;
+    if (dump_blocks0) {
+        ggml_set_name(x, "cpp_pe_pos");
+        ggml_set_output(x);
+        ggml_set_name(patch_out, "cpp_pe");
+        ggml_set_output(patch_out);
+    }
 
     x = ggml_norm(ctx, x, 1e-5f);
     x = ggml_mul_inplace(ctx, x, model.vit.ln_pre_w);
@@ -4941,9 +5334,22 @@ static struct ggml_tensor* sam3_build_vit_graph(struct ggml_context* ctx,
 
     struct ggml_tensor * x = sam3_build_vit_prefix_graph(ctx, input, model);
 
+    const bool dump_blocks = model.debug.dump_vit_blocks;
+    g_vit_internal_dump = !model.debug.parity_dump_dir.empty();
+    if (dump_blocks) {
+        ggml_set_name(x, "cpp_blk0_in");
+        ggml_set_output(x);
+    }
+
     // ── 32 transformer blocks ─────────────────────────────────────────────
     for (int i = 0; i < hp.vit_depth; ++i) {
         x = sam3_vit_block_forward(ctx, x, model.vit.blocks[i], hp, i);
+        if (dump_blocks) {
+            char bn[32];
+            snprintf(bn, sizeof(bn), "cpp_blk%02d", i);
+            ggml_set_name(x, bn);
+            ggml_set_output(x);
+        }
     }
 
     // Output: [E, W, H, 1] = [1024, 72, 72, 1]
@@ -5007,8 +5413,8 @@ static void sam3_build_neck_graph(struct ggml_context* ctx,
         out[2] = ggml_cont(ctx, ggml_permute(ctx, s2, 1, 2, 0, 3));
     }
 
-    // Scale 3 (0.5× downsample)
-    {
+    // Scale 3 (0.5× downsample) — absent in SAM 3.1 (3-level FPN).
+    if (neck.scales[3].conv1x1_w) {
         auto* s3 = ggml_pool_2d(ctx, x, GGML_OP_POOL_MAX, 2, 2, 2, 2, 0, 0);
         s3 = ggml_conv_2d_sk_p0(ctx, neck.scales[3].conv1x1_w, s3);
         s3 = add_bias(s3, neck.scales[3].conv1x1_b);
@@ -5284,8 +5690,8 @@ static std::vector<float> sam2_compute_pos_embed(const sam3_model& model, int H,
             for (int x = 0; x < W; ++x)
                 win_tiled[e * H * W + y * W + x] = win_chw[e * ws * ws + (y % ws) * ws + (x % ws)];
 
-    // Dump intermediates if requested
-    const char* dump_dir = getenv("SAM2_DUMP_DIR");
+    // Dump intermediates if requested (explicitly configured)
+    const char* dump_dir = model.debug.sam2_dump_dir.empty() ? nullptr : model.debug.sam2_dump_dir.c_str();
     if (dump_dir) {
         char path[512];
         // Dump bkg_interp as CHW
@@ -5751,7 +6157,7 @@ static bool sam2_encode_image_hiera(sam3_state& state,
     auto t_start = std::chrono::high_resolution_clock::now();
     const auto& hp = model.hparams;
     const int img_size = sam3_eff_img_size(state, hp);
-    const bool timing = getenv("SAM3_ENCODE_TIMING") != nullptr;
+    const bool timing = model.debug.encode_timing;
     auto tmark = [&](const char* what) {
         if (timing) {
             auto now = std::chrono::high_resolution_clock::now();
@@ -5990,6 +6396,82 @@ static bool sam2_encode_image_hiera(sam3_state& state,
 ** Image backbone — public API
 *****************************************************************************/
 
+// Diagnostic (SAM3_CENSUS=1): walk a finished cgraph and report per-op node
+// counts, FLOP estimates and approximate memory traffic. FLOP model:
+// mul_mat = 2*K*M*N; flash_attn_ext = 4*hd*Nq*Nkv*NH*B (two GEMMs, FMA=2);
+// conv_2d/transpose = 2*W*H*Cin*Cout*Wout*Hout. Everything else is counted as
+// elementwise traffic (write + one read).
+static void sam3_graph_census(const char* tag, struct ggml_cgraph* g, int census_level) {
+    if (!census_level) return;
+    struct census_entry { int64_t n; double flops; double bytes; };
+    static census_entry st[GGML_OP_COUNT];
+    for (int op = 0; op < GGML_OP_COUNT; ++op) st[op] = {0, 0.0, 0.0};
+    int n_nodes = ggml_graph_n_nodes(g);
+    for (int i = 0; i < n_nodes; ++i) {
+        struct ggml_tensor* n = ggml_graph_node(g, i);
+        const enum ggml_op op = n->op;
+        st[op].n++;
+        double f = 0.0;
+        switch (op) {
+        case GGML_OP_MUL_MAT: {
+            const struct ggml_tensor* a = n->src[0];
+            f = 2.0 * a->ne[0] * n->ne[0] * n->ne[1] * n->ne[2] * n->ne[3];
+            break;
+        }
+        case GGML_OP_FLASH_ATTN_EXT: {
+            const struct ggml_tensor* q = n->src[0];
+            const struct ggml_tensor* k = n->src[1];
+            f = 4.0 * q->ne[0] * q->ne[1] * k->ne[1] *
+                (double)q->ne[2] * q->ne[3];
+            break;
+        }
+        case GGML_OP_CONV_2D:
+        case GGML_OP_CONV_TRANSPOSE_2D: {
+            const struct ggml_tensor* w = n->src[0];
+            f = 2.0 * w->ne[0] * w->ne[1] * w->ne[2] * w->ne[3] *
+                n->ne[0] * n->ne[1] * (double)(n->ne[3] > 0 ? n->ne[3] : 1);
+            break;
+        }
+        default: break;
+        }
+        st[op].flops += f;
+        st[op].bytes += (double)ggml_nbytes(n) * 2.0;
+    }
+    double tot_f = 0, tot_b = 0;
+    for (int op = 0; op < GGML_OP_COUNT; ++op) {
+        tot_f += st[op].flops;
+        tot_b += st[op].bytes;
+    }
+    fprintf(stderr, "CENSUS[%s]: %d nodes, %.1f GFLOP, %.0f MB traffic\n",
+            tag, n_nodes, tot_f / 1e9, tot_b / 1e6);
+    for (int op = 0; op < GGML_OP_COUNT; ++op) {
+        if (!st[op].n) continue;
+        fprintf(stderr, "  %-20s n=%6lld  %10.1f GFLOP  %10.0f MB\n",
+                ggml_op_name((enum ggml_op) op), (long long)st[op].n,
+                st[op].flops / 1e9, st[op].bytes / 1e6);
+    }
+    // census_level == 2: additionally dump CPY-family node shapes/strides, to
+    // attribute cpy_scalar time to concrete layout patterns.
+    if (census_level == 2) {
+        for (int i = 0; i < n_nodes; ++i) {
+            struct ggml_tensor* n = ggml_graph_node(g, i);
+            if (n->op != GGML_OP_CPY && n->op != GGML_OP_DUP) continue;
+            struct ggml_tensor* s = n->src[0];
+            if (!s) continue;
+            fprintf(stderr,
+                    "  CPY[%s] %s->%s %s->%s cont=%d%d src ne=[%lld,%lld,%lld,%lld] nb=[%lld,%lld,%lld,%lld]"
+                    " dst ne=[%lld,%lld,%lld,%lld] nb=[%lld,%lld,%lld,%lld]\n",
+                    ggml_op_desc(n), ggml_get_name(s), ggml_get_name(n),
+                    ggml_type_name(s->type), ggml_type_name(n->type),
+                    ggml_is_contiguous(s), ggml_is_contiguous(n),
+                    (long long)s->ne[0], (long long)s->ne[1], (long long)s->ne[2], (long long)s->ne[3],
+                    (long long)s->nb[0], (long long)s->nb[1], (long long)s->nb[2], (long long)s->nb[3],
+                    (long long)n->ne[0], (long long)n->ne[1], (long long)n->ne[2], (long long)n->ne[3],
+                    (long long)n->nb[0], (long long)n->nb[1], (long long)n->nb[2], (long long)n->nb[3]);
+        }
+    }
+}
+
 static bool sam3_encode_image_impl(sam3_state& state,
                                    const sam3_model& model,
                                    const sam3_image& image,
@@ -6027,6 +6509,8 @@ static bool sam3_encode_image_impl(sam3_state& state,
     struct ggml_tensor     * vit_out  = nullptr;
     struct ggml_tensor     * neck_det_out[4] = {};
     struct ggml_tensor     * neck_trk_out[4] = {};
+    struct ggml_tensor     * neck_trk_int_out[4] = {};
+    const bool need_int_neck = model.hparams.is_multiplex();
     struct ggml_context    * ctx0;
     struct ggml_cgraph     * graph;
     struct ggml_gallocr    * galloc;
@@ -6041,6 +6525,7 @@ static bool sam3_encode_image_impl(sam3_state& state,
         for (int i = 0; i < 4; ++i) {
             neck_det_out[i] = state.neck_det[i];
             neck_trk_out[i] = state.neck_trk[i];
+            neck_trk_int_out[i] = state.neck_trk_int[i];
         }
 
         if (!inp) {
@@ -6086,26 +6571,42 @@ static bool sam3_encode_image_impl(sam3_state& state,
             sam3_build_neck_graph(ctx0, neck_input, model.neck_det, neck_det_out);
         }
         sam3_build_neck_graph(ctx0, neck_input, model.neck_trk, neck_trk_out);
+        if (need_int_neck) {
+            // SAM 3.1: the interactive neck shares the same ViT/FPN trunk.
+            // Only scales 0..2 exist (3-level FPN).
+            sam3_build_neck_graph(ctx0, neck_input, model.neck_trk_int, neck_trk_int_out);
+            for (int i = 0; i < 4 && neck_trk_int_out[i]; ++i) {
+                char name[64];
+                snprintf(name, sizeof(name), "neck_trk_int_%d", i);
+                ggml_set_name(neck_trk_int_out[i], name);
+                ggml_set_output(neck_trk_int_out[i]);
+            }
+        }
 
         for (int i = 0; i < 4; ++i) {
             char name[64];
-            if (!model.hparams.visual_only && !tracker_only) {
+            if (!model.hparams.visual_only && !tracker_only && neck_det_out[i]) {
                 snprintf(name, sizeof(name), "neck_det_%d", i);
                 ggml_set_name(neck_det_out[i], name);
                 ggml_set_output(neck_det_out[i]);
             }
-            snprintf(name, sizeof(name), "neck_trk_%d", i);
-            ggml_set_name(neck_trk_out[i], name);
-            ggml_set_output(neck_trk_out[i]);
+            if (neck_trk_out[i]) {
+                snprintf(name, sizeof(name), "neck_trk_%d", i);
+                ggml_set_name(neck_trk_out[i], name);
+                ggml_set_output(neck_trk_out[i]);
+            }
         }
 
         graph = ggml_new_graph_custom(ctx0, 16384, false);
         for (int i = 0; i < 4; ++i) {
-            if (!model.hparams.visual_only && !tracker_only) {
+            if (!model.hparams.visual_only && !tracker_only && neck_det_out[i]) {
                 ggml_build_forward_expand(graph, neck_det_out[i]);
             }
-            ggml_build_forward_expand(graph, neck_trk_out[i]);
+            if (neck_trk_out[i]) ggml_build_forward_expand(graph, neck_trk_out[i]);
+            if (need_int_neck && neck_trk_int_out[i])
+                ggml_build_forward_expand(graph, neck_trk_int_out[i]);
         }
+        sam3_graph_census("image(vit+necks)", graph, model.debug.census);
 
         galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
 
@@ -6158,6 +6659,7 @@ static bool sam3_encode_image_impl(sam3_state& state,
         for (int i = 0; i < 4; ++i) {
             state.neck_det[i] = (model.hparams.visual_only || tracker_only) ? nullptr : neck_det_out[i];
             state.neck_trk[i] = neck_trk_out[i];
+            state.neck_trk_int[i] = need_int_neck ? neck_trk_int_out[i] : nullptr;
         }
 
         // Save to SAM3-specific cache fields
@@ -6281,6 +6783,7 @@ static void sam3_clear_encoder_state(sam3_state & state) {
         state.neck_trk[i] = nullptr;
         state.neck_det_pe[i] = nullptr;
         state.neck_trk_pe[i] = nullptr;
+        state.neck_trk_int[i] = nullptr;
     }
 }
 
@@ -7132,7 +7635,7 @@ bool sam3_encode_image_from_preprocessed(sam3_state& state,
             ggml_backend_tensor_set(pe_tensor, pe_data.data(), 0, pe_data.size() * sizeof(float));
 
             // Dump PE if requested
-            const char* dump_dir = getenv("SAM2_DUMP_DIR");
+            const char* dump_dir = model.debug.sam2_dump_dir.empty() ? nullptr : model.debug.sam2_dump_dir.c_str();
             if (dump_dir) {
                 char path[512];
                 snprintf(path, sizeof(path), "%s/cpp_pos_embed.bin", dump_dir);
@@ -7159,9 +7662,9 @@ bool sam3_encode_image_from_preprocessed(sam3_state& state,
             return false;
         }
 
-        // Dump debug tensors if SAM2_DUMP_DIR is set
+        // Dump debug tensors if sam2_dump_dir is set
         {
-            const char* dump_dir = getenv("SAM2_DUMP_DIR");
+            const char* dump_dir = model.debug.sam2_dump_dir.empty() ? nullptr : model.debug.sam2_dump_dir.c_str();
             if (dump_dir) {
                 const char* dbg_names[] = {
                     "dbg_patch_embed", "dbg_after_pe",
@@ -7249,7 +7752,7 @@ bool sam3_encode_image_from_preprocessed(sam3_state& state,
     state.orig_height = img_size;
 
     // ── Build computation graph (SAM3 path) ──
-    const size_t buf_size = ggml_tensor_overhead() * 8192 + ggml_graph_overhead() * 2;
+    const size_t buf_size = ggml_tensor_overhead() * 32768 + ggml_graph_overhead() * 2;
     struct ggml_init_params gparams = {
         /*.mem_size   =*/buf_size,
         /*.mem_buffer =*/nullptr,
@@ -7266,6 +7769,8 @@ bool sam3_encode_image_from_preprocessed(sam3_state& state,
     ggml_set_input(inp);
 
     auto* vit_out = sam3_build_vit_graph(ctx0, inp, model);
+    if (!vit_out) { fprintf(stderr, "%s: build_vit_graph returned null\n", __func__); return false; }
+    fprintf(stderr, "PARITYDBG: P1 vit built\n");
     ggml_set_name(vit_out, "vit_output");
     ggml_set_output(vit_out);
 
@@ -7311,31 +7816,54 @@ bool sam3_encode_image_from_preprocessed(sam3_state& state,
     }
 
     struct ggml_tensor* neck_det_out[4] = {};
-    struct ggml_tensor* neck_trk_out[4];
+    struct ggml_tensor* neck_trk_out[4] = {};
+    struct ggml_tensor* neck_trk_int_out[4] = {};
+    fprintf(stderr, "PARITYDBG: P2 pre-neck\n");
+    const bool need_int_neck = model.hparams.is_multiplex();
     auto* neck_input = ggml_cont(ctx0, ggml_permute(ctx0, vit_out, 2, 0, 1, 3));
     if (!model.hparams.visual_only) {
         sam3_build_neck_graph(ctx0, neck_input, model.neck_det, neck_det_out);
     }
     sam3_build_neck_graph(ctx0, neck_input, model.neck_trk, neck_trk_out);
+    if (need_int_neck) {
+        sam3_build_neck_graph(ctx0, neck_input, model.neck_trk_int, neck_trk_int_out);
+        fprintf(stderr, "PARITYDBG: P3 necks built\n");
+        for (int i = 0; i < 4; ++i)
+            fprintf(stderr, "PARITYDBG: int_out[%d]=%p det[%d]=%p trk[%d]=%p\n",
+                    i, (void*)neck_trk_int_out[i], i, (void*)neck_det_out[i], i, (void*)neck_trk_out[i]);
+        for (int i = 0; i < 4 && neck_trk_int_out[i]; ++i) {
+            char name[64];
+            snprintf(name, sizeof(name), "neck_trk_int_%d", i);
+            ggml_set_name(neck_trk_int_out[i], name);
+            ggml_set_output(neck_trk_int_out[i]);
+        }
+    }
 
     for (int i = 0; i < 4; ++i) {
         char name[64];
-        if (!model.hparams.visual_only) {
+        if (!model.hparams.visual_only && neck_det_out[i]) {
             snprintf(name, sizeof(name), "neck_det_%d", i);
             ggml_set_name(neck_det_out[i], name);
             ggml_set_output(neck_det_out[i]);
         }
-        snprintf(name, sizeof(name), "neck_trk_%d", i);
-        ggml_set_name(neck_trk_out[i], name);
-        ggml_set_output(neck_trk_out[i]);
+        if (neck_trk_out[i]) {
+            snprintf(name, sizeof(name), "neck_trk_%d", i);
+            ggml_set_name(neck_trk_out[i], name);
+            ggml_set_output(neck_trk_out[i]);
+        }
     }
 
+    fprintf(stderr, "PARITYDBG: P4 pre-graph\n");
     struct ggml_cgraph* graph = ggml_new_graph_custom(ctx0, 16384, false);
     for (int i = 0; i < 4; ++i) {
-        if (!model.hparams.visual_only) {
+        if (!model.hparams.visual_only && neck_det_out[i]) {
             ggml_build_forward_expand(graph, neck_det_out[i]);
         }
-        ggml_build_forward_expand(graph, neck_trk_out[i]);
+        if (neck_trk_out[i]) {
+            ggml_build_forward_expand(graph, neck_trk_out[i]);
+        }
+        if (need_int_neck && neck_trk_int_out[i])
+            ggml_build_forward_expand(graph, neck_trk_int_out[i]);
     }
 
     auto* galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
@@ -7366,6 +7894,36 @@ bool sam3_encode_image_from_preprocessed(sam3_state& state,
             ggml_free(ctx0);
             return false;
         }
+        // Parity: dump per-block ViT outputs (paired with the official blkNN dumps)
+        if (!model.debug.parity_dump_dir.empty()) {
+            for (int i = 0; i < (int)model.hparams.vit_depth; ++i) {
+                char bn[64], pn[80];
+                snprintf(bn, sizeof(bn), "cpp_blk%02d", i);
+                auto* dt = ggml_get_tensor(ctx0, bn);
+                if (!dt || dt->type != GGML_TYPE_F32) continue;
+                const int64_t n = ggml_nelements(dt);
+                std::vector<float> buf(n);
+                ggml_backend_tensor_get(dt, buf.data(), 0, n * sizeof(float));
+                snprintf(pn, sizeof(pn), "%s/cpp_vitblk%02d.f32",
+                         model.debug.parity_dump_dir.c_str(), i);
+                FILE* pf = fopen(pn, "wb");
+                if (pf) { fwrite(buf.data(), 4, n, pf); fclose(pf); }
+            }
+            // Pre-block anchors: patch-embed out, pos-embed add, block-0 input
+            for (const char* extra : {"cpp_pe", "cpp_pe_pos", "cpp_blk0_in",
+                                       "cpp_b9_qkv", "cpp_b9_attn", "cpp_b9_proj"}) {
+                auto* dt = ggml_get_tensor(ctx0, extra);
+                if (!dt || dt->type != GGML_TYPE_F32) continue;
+                const int64_t n = ggml_nelements(dt);
+                std::vector<float> buf(n);
+                ggml_backend_tensor_get(dt, buf.data(), 0, n * sizeof(float));
+                char pn[256];
+                snprintf(pn, sizeof(pn), "%s/%s.f32",
+                         model.debug.parity_dump_dir.c_str(), extra);
+                FILE* pf = fopen(pn, "wb");
+                if (pf) { fwrite(buf.data(), 4, n, pf); fclose(pf); }
+            }
+        }
         auto t1 = std::chrono::high_resolution_clock::now();
         double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         fprintf(stderr, "%s: graph computed in %.1f ms (%d threads)\n",
@@ -7384,6 +7942,7 @@ bool sam3_encode_image_from_preprocessed(sam3_state& state,
     for (int i = 0; i < 4; ++i) {
         state.neck_det[i] = model.hparams.visual_only ? nullptr : neck_det_out[i];
         state.neck_trk[i] = neck_trk_out[i];
+        state.neck_trk_int[i] = need_int_neck ? neck_trk_int_out[i] : nullptr;
     }
 
     // Compute sinusoidal PEs
@@ -9312,15 +9871,29 @@ static struct ggml_tensor* sam3_build_mem_attn_graph(
 ** Object pointer extraction (Phase 7, Step 7.3)
 *****************************************************************************/
 
+// SAM 3.1 variant (defined in the Object Multiplex section below).
+static void sam3_extract_obj_ptr_mux(
+    const sam3_model& model, const float* sam_token_data, float obj_logit,
+    float* out_ptr, bool interactive = false);
+
 // Extract object pointer from SAM output token via 3-layer MLP (CPU-side).
 static void sam3_extract_obj_ptr_cpu(
     const sam3_model& model,
     const float* sam_token_data,  // [D]
     float obj_score,
-    float* out_ptr)  // [D]
+    float* out_ptr,  // [D]
+    bool interactive = false)
 {
     const auto& hp = model.hparams;
     const int D = hp.neck_dim;
+
+    // SAM 3.1: proj MLP + linear no-obj gating; the interactive path (points,
+    // mask prompts) uses its own obj_ptr_proj_int weights.
+    if (hp.is_multiplex()) {
+        sam3_extract_obj_ptr_mux(model, sam_token_data, obj_score, out_ptr,
+                                 interactive);
+        return;
+    }
 
     // SAM2 with fixed_no_obj_ptr: blend projected ptr with no_obj_ptr
     // based on presence score λ.
@@ -9390,32 +9963,6 @@ static void sam3_extract_obj_ptr_cpu(
 /*****************************************************************************
 ** Tracker infrastructure (Phase 7, Step 7.4)
 *****************************************************************************/
-
-// Select memory frames for propagation (most recent + evenly spaced).
-static std::vector<int> sam3_select_memory_frames(
-    const std::vector<sam3_memory_slot>& bank,
-    int max_slots) {
-    if ((int)bank.size() <= max_slots) {
-        std::vector<int> all(bank.size());
-        for (int i = 0; i < (int)bank.size(); ++i) all[i] = i;
-        return all;
-    }
-    std::vector<int> selected;
-    selected.push_back(0);
-    selected.push_back((int)bank.size() - 1);
-    int remaining = max_slots - 2;
-    if (remaining > 0) {
-        float step = (float)(bank.size() - 2) / (remaining + 1);
-        for (int i = 0; i < remaining; ++i) {
-            int idx = 1 + (int)((i + 1) * step);
-            idx = std::min(idx, (int)bank.size() - 2);
-            selected.push_back(idx);
-        }
-    }
-    std::sort(selected.begin(), selected.end());
-    selected.erase(std::unique(selected.begin(), selected.end()), selected.end());
-    return selected;
-}
 
 // Compute mask IoU between two binary masks.
 static float sam3_mask_iou(const uint8_t* a, const uint8_t* b, int n) {
@@ -9583,9 +10130,78 @@ static std::vector<int> sam3_nms(const std::vector<sam3_detection>& dets, float 
 
 // Bilinear interpolation of a flat mask [H_in * W_in] to [H_out * W_out].
 // Uses double for coordinate math to match PyTorch F.interpolate precision.
-static std::vector<float> sam3_bilinear_interpolate(const float* src, int src_w, int src_h,
-                                                    int dst_w, int dst_h) {
-    std::vector<float> dst(dst_w * dst_h);
+
+#if defined(__x86_64__) || defined(__i386__)
+// AVX2 fast path: 8 output pixels per iteration via gathers. Bit-identical to
+// the scalar loop below: the per-row x0/wx tables are precomputed with the
+// exact same double-precision coordinate math, and the tap combination tree
+// uses explicit mul/add in the same order (no FMA, matching the SSE2-baseline
+// scalar code). Only pixels-independent lanes are parallelized.
+__attribute__((target("avx2")))
+static void sam3_bilinear_interpolate_into_avx2(const float* src, int src_w, int src_h,
+                                                float* dst, int dst_w, int dst_h) {
+    const double sx = (double)src_w / dst_w;
+    const double sy = (double)src_h / dst_h;
+
+    std::vector<int>   x0_tab(dst_w);
+    std::vector<float> wx_tab(dst_w);
+    for (int x = 0; x < dst_w; ++x) {
+        double fx = (x + 0.5) * sx - 0.5;
+        fx = std::max(0.0, std::min(fx, (double)(src_w - 1)));
+        const int x0 = std::min((int)fx, src_w - 2);
+        x0_tab[x] = x0;
+        wx_tab[x] = (float)(fx - x0);
+    }
+
+    const __m256 one = _mm256_set1_ps(1.0f);
+    for (int y = 0; y < dst_h; ++y) {
+        double fy = (y + 0.5) * sy - 0.5;
+        fy = std::max(0.0, std::min(fy, (double)(src_h - 1)));
+        const int y0 = std::min((int)fy, src_h - 2);
+        const int y1 = y0 + 1;
+        const float wy = (float)(fy - y0);
+        const __m256 wyv    = _mm256_set1_ps(wy);
+        const __m256 one_wy = _mm256_sub_ps(one, wyv);
+        const float* row0 = src + (size_t)y0 * src_w;
+        const float* row1 = src + (size_t)y1 * src_w;
+        float*       drow = dst + (size_t)y * dst_w;
+
+        int x = 0;
+        for (; x + 8 <= dst_w; x += 8) {
+            const __m256i x0v = _mm256_loadu_si256((const __m256i*)(x0_tab.data() + x));
+            const __m256i x1v = _mm256_add_epi32(x0v, _mm256_set1_epi32(1));
+            // indices are within [0, src_w-1] by construction -> gather is safe
+            const __m256 a = _mm256_i32gather_ps(row0, x0v, 4);
+            const __m256 b = _mm256_i32gather_ps(row0, x1v, 4);
+            const __m256 c = _mm256_i32gather_ps(row1, x0v, 4);
+            const __m256 d = _mm256_i32gather_ps(row1, x1v, 4);
+            const __m256 wx    = _mm256_loadu_ps(wx_tab.data() + x);
+            const __m256 one_wx = _mm256_sub_ps(one, wx);
+            // same tree as scalar: (1-wy)*((1-wx)*a + wx*b) + wy*((1-wx)*c + wx*d)
+            const __m256 v = _mm256_add_ps(
+                _mm256_mul_ps(one_wy, _mm256_add_ps(_mm256_mul_ps(one_wx, a), _mm256_mul_ps(wx, b))),
+                _mm256_mul_ps(wyv,    _mm256_add_ps(_mm256_mul_ps(one_wx, c), _mm256_mul_ps(wx, d))));
+            _mm256_storeu_ps(drow + x, v);
+        }
+        for (; x < dst_w; ++x) {
+            const int   x0 = x0_tab[x];
+            const float wx = wx_tab[x];
+            drow[x] = (1 - wy) * ((1 - wx) * row0[x0] + wx * row0[x0 + 1]) +
+                      wy * ((1 - wx) * row1[x0] + wx * row1[x0 + 1]);
+        }
+    }
+}
+#endif
+
+static void sam3_bilinear_interpolate_into(const float* src, int src_w, int src_h,
+                                           float* dst, int dst_w, int dst_h) {
+#if (defined(__x86_64__) || defined(__i386__)) && !defined(SAM3_NO_FAST_INTERP)
+    static const bool has_avx2 = __builtin_cpu_supports("avx2");
+    if (has_avx2) {
+        sam3_bilinear_interpolate_into_avx2(src, src_w, src_h, dst, dst_w, dst_h);
+        return;
+    }
+#endif
     const double sx = (double)src_w / dst_w;
     const double sy = (double)src_h / dst_h;
 
@@ -9607,6 +10223,12 @@ static std::vector<float> sam3_bilinear_interpolate(const float* src, int src_w,
             dst[y * dst_w + x] = v;
         }
     }
+}
+
+static std::vector<float> sam3_bilinear_interpolate(const float* src, int src_w, int src_h,
+                                                    int dst_w, int dst_h) {
+    std::vector<float> dst((size_t)dst_w * dst_h);
+    sam3_bilinear_interpolate_into(src, src_w, src_h, dst.data(), dst_w, dst_h);
     return dst;
 }
 
@@ -9783,6 +10405,16 @@ sam3_result sam3_segment_pcs(sam3_state& state,
 #if SAM3_LOG_LEVEL >= 1
     auto t_start = std::chrono::high_resolution_clock::now();
 #endif
+    // Diagnostic (SAM3_PCS_PROF=1): per-sub-graph wall time of this call.
+    const bool pcs_prof = model.debug.pcs_prof;
+    auto pcs_mark = std::chrono::high_resolution_clock::now();
+    auto pcs_tick = [&](const char* tag) {
+        if (!pcs_prof) return;
+        auto now = std::chrono::high_resolution_clock::now();
+        fprintf(stderr, "PCS_PROF[%s]: %.1f ms\n", tag,
+                std::chrono::duration<double, std::milli>(now - pcs_mark).count());
+        pcs_mark = now;
+    };
     const auto& hp = model.hparams;
     const int D = hp.neck_dim;           // 256
     const int H = hp.n_img_embd();       // 72
@@ -9868,7 +10500,45 @@ sam3_result sam3_segment_pcs(sam3_state& state,
     ** ── SUB-GRAPH 1: Text Encoder ────────────────────────────────────
     */
     std::vector<float> text_feats_cpu(D * L);
-    {
+    if (state.text_cache_valid && state.text_cache_prompt == params.text_prompt &&
+        (int)state.text_cache_feats.size() == D * L) {
+        // Tier 1: feature cache hit — same prompt as the previous call.
+        memcpy(text_feats_cpu.data(), state.text_cache_feats.data(), D * L * sizeof(float));
+        SAM3_LOG(2, "%s: text encoder cache hit for '%s'\n", __func__, params.text_prompt.c_str());
+    } else if (state.text_graph) {
+        // Tier 2: cached graph — topology is prompt-independent, so just
+        // upload the new token ids and recompute (~24 ms).
+        ggml_backend_tensor_set(state.text_inp, token_ids.data(), 0, L * sizeof(int32_t));
+        // Re-upload the causal mask too: it is constant, but its buffer lives
+        // in the gallocr allocation and other sub-graphs' pool churn between
+        // calls has been observed to leave stale/NaN data in un-re-uploaded
+        // graph inputs (tier-2 recompute produced NaN features without this).
+        if (state.text_causal && state.text_causal->buffer) {
+            std::vector<ggml_fp16_t> cm(L * L);
+            sam3_fill_causal_mask(cm.data(), L);
+            ggml_backend_tensor_set(state.text_causal, cm.data(), 0, L * L * sizeof(ggml_fp16_t));
+        }
+        if (pcs_prof) {
+            int32_t tsum = 0;
+            for (int i = 0; i < L; ++i) tsum += token_ids[i];
+            fprintf(stderr, "DBG tier2 prompt='%s' token_sum=%d\n",
+                    params.text_prompt.c_str(), tsum);
+        }
+        if (!sam3_graph_compute(model.backend, state.text_graph, state.n_threads)) {
+            return result;
+        }
+        ggml_backend_tensor_get(state.text_out, text_feats_cpu.data(), 0, D * L * sizeof(float));
+        if (pcs_prof) {
+            double fsum = 0;
+            for (int i = 0; i < D * L; ++i) fsum += text_feats_cpu[i];
+            fprintf(stderr, "DBG tier2 feats_sum=%.6f\n", fsum);
+        }
+        state.text_cache_prompt = params.text_prompt;
+        state.text_cache_feats  = text_feats_cpu;
+        state.text_cache_valid  = true;
+    } else {
+        // Tier 3: build once — the graph (ctx + cgraph + gallocr) then lives in
+        // the state for the lifetime of the session (see text_* cache fields).
         const size_t sz = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() * 2;
         struct ggml_init_params gp = {sz, nullptr, true};
         auto* ctx = ggml_init(gp);
@@ -9882,6 +10552,8 @@ sam3_result sam3_segment_pcs(sam3_state& state,
 
         auto* graph = ggml_new_graph_custom(ctx, 16384, false);
         ggml_build_forward_expand(graph, out);
+        sam3_graph_census("text_enc", graph, model.debug.census);
+        pcs_tick("text.build");
 
         auto* causal = ggml_get_tensor(ctx, "causal_mask");
         auto* alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
@@ -9891,6 +10563,7 @@ sam3_result sam3_segment_pcs(sam3_state& state,
             ggml_free(ctx);
             return result;
         }
+        pcs_tick("text.alloc");
 
         if (inp->buffer) {
             ggml_backend_tensor_set(inp, token_ids.data(), 0, L * sizeof(int32_t));
@@ -9901,10 +10574,12 @@ sam3_result sam3_segment_pcs(sam3_state& state,
             return result;
         }
         if (causal && causal->buffer) {
+            // Constant across calls — uploaded once while the graph is built.
             std::vector<ggml_fp16_t> cm(L * L);
             sam3_fill_causal_mask(cm.data(), L);
             ggml_backend_tensor_set(causal, cm.data(), 0, L * L * sizeof(ggml_fp16_t));
         }
+        pcs_tick("text.upload");
 
         if (!sam3_graph_compute(model.backend, graph, state.n_threads)) {
             ggml_gallocr_free(alloc);
@@ -9912,12 +10587,28 @@ sam3_result sam3_segment_pcs(sam3_state& state,
             return result;
         }
         ggml_backend_tensor_get(out, text_feats_cpu.data(), 0, D * L * sizeof(float));
+        pcs_tick("text.compute");
+        if (pcs_prof) {
+            double fsum = 0;
+            for (int i = 0; i < D * L; ++i) fsum += text_feats_cpu[i];
+            fprintf(stderr, "DBG tier3 feats_sum=%.6f\n", fsum);
+        }
 
-        ggml_gallocr_free(alloc);
-        ggml_free(ctx);
+        // Keep the built graph alive in the state for subsequent calls.
+        state.text_ctx    = ctx;
+        state.text_graph  = graph;
+        state.text_galloc = alloc;
+        state.text_inp    = inp;
+        state.text_out    = out;
+        state.text_causal = causal;
+
+        state.text_cache_prompt = params.text_prompt;
+        state.text_cache_feats  = text_feats_cpu;
+        state.text_cache_valid  = true;
     }
 
     SAM3_LOG(2, "%s: text encoder done\n", __func__);
+    pcs_tick("text");
 
     /*
     ** ── SUB-GRAPH 2: Geometry Encoder ────────────────────────────────
@@ -9941,6 +10632,8 @@ sam3_result sam3_segment_pcs(sam3_state& state,
 
         auto* graph = ggml_new_graph_custom(ctx, 4096, false);
         ggml_build_forward_expand(graph, gr.geo_feats);
+        sam3_graph_census("geom_enc", graph, model.debug.census);
+        pcs_tick("geom.build");
 
         SAM3_LOG(2, "%s: geom: reserving...\n", __func__);
         auto* alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
@@ -9985,6 +10678,7 @@ sam3_result sam3_segment_pcs(sam3_state& state,
     memcpy(combined_prompt_cpu.data() + D * L, geo_feats_cpu.data(), D * N_geo * sizeof(float));
 
     SAM3_LOG(2, "%s: starting fusion encoder\n", __func__);
+    pcs_tick("geom");
     /*
     ** ── SUB-GRAPH 3: Fusion Encoder ──────────────────────────────────
     */
@@ -10012,6 +10706,8 @@ sam3_result sam3_segment_pcs(sam3_state& state,
 
         auto* graph = ggml_new_graph_custom(ctx, 16384, false);
         ggml_build_forward_expand(graph, out);
+        sam3_graph_census("fenc", graph, model.debug.census);
+        pcs_tick("fenc.build");
 
         auto* alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
         if (!ggml_gallocr_reserve(alloc, graph) || !ggml_gallocr_alloc_graph(alloc, graph)) {
@@ -10042,6 +10738,7 @@ sam3_result sam3_segment_pcs(sam3_state& state,
     }
 
     SAM3_LOG(2, "%s: fusion encoder done\n", __func__);
+    pcs_tick("fenc");
     /*
     ** ── SUB-GRAPH 4: DETR Decoder + Scoring ──────────────────────────
     */
@@ -10087,6 +10784,8 @@ sam3_result sam3_segment_pcs(sam3_state& state,
         ggml_build_forward_expand(graph, dout.pred_boxes);
         ggml_build_forward_expand(graph, dout.presence_score);
         ggml_build_forward_expand(graph, dout.queries);
+        sam3_graph_census("ddec", graph, model.debug.census);
+        pcs_tick("ddec.build");
 
         auto* alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
         if (!ggml_gallocr_reserve(alloc, graph) || !ggml_gallocr_alloc_graph(alloc, graph)) {
@@ -10136,12 +10835,27 @@ sam3_result sam3_segment_pcs(sam3_state& state,
     float presence_prob = 1.0f / (1.0f + expf(-presence_logit));
 
     SAM3_LOG(2, "%s: DETR decoder done\n", __func__);
+    pcs_tick("ddec");
     /*
     ** ── SUB-GRAPH 5: Segmentation Head ───────────────────────────────
     */
     const int mask_hw = H * 4;  // 288 for SAM3
-    std::vector<float> all_masks(NQ * mask_hw * mask_hw);
-    {
+
+    // Threshold-first: class scores and presence are already known from the
+    // DETR decoder, and the seg head processes each query independently
+    // (queries only cross-attend to text/FPN features, never to each other).
+    // So compute masks only for queries that survive score_threshold —
+    // identical detections, but skips ~NQ*288*288 mask computation when most
+    // queries score below threshold.
+    std::vector<int> surv_q;
+    for (int q = 0; q < NQ; ++q) {
+        float class_prob = 1.0f / (1.0f + expf(-scores_data[q]));
+        if (class_prob * presence_prob >= params.score_threshold) surv_q.push_back(q);
+    }
+    const int ns = (int)surv_q.size();
+
+    std::vector<float> all_masks((size_t)ns * mask_hw * mask_hw);
+    if (ns > 0) {
         const size_t sz = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() * 2;
         struct ggml_init_params gp = {sz, nullptr, true};
         auto* ctx = ggml_init(gp);
@@ -10163,8 +10877,8 @@ sam3_result sam3_segment_pcs(sam3_state& state,
         ggml_set_input(fpn2);
         struct ggml_tensor* fpn_feats[3] = {fpn0, fpn1, fpn2};
 
-        // Object queries (skip presence token at index 0 → start at index 1)
-        auto* oq = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, NQ, 1);
+        // Object queries (presence token at index 0 is not consumed here)
+        auto* oq = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, ns, 1);
         ggml_set_name(oq, "seg_queries");
         ggml_set_input(oq);
 
@@ -10182,7 +10896,9 @@ sam3_result sam3_segment_pcs(sam3_state& state,
         auto* graph = ggml_new_graph_custom(ctx, 32768, false);
         ggml_build_forward_expand(graph, out);
 
-        SAM3_LOG(2, "%s: seg head graph: %d nodes\n", __func__, ggml_graph_n_nodes(graph));
+        SAM3_LOG(2, "%s: seg head graph: %d nodes (%d surviving queries)\n",
+                 __func__, ggml_graph_n_nodes(graph), ns);
+        pcs_tick("seg.build");
 
         auto* alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
         if (!ggml_gallocr_reserve(alloc, graph) || !ggml_gallocr_alloc_graph(alloc, graph)) {
@@ -10191,31 +10907,38 @@ sam3_result sam3_segment_pcs(sam3_state& state,
             ggml_free(ctx);
             return result;
         }
+        pcs_tick("seg.alloc");
 
         ggml_backend_tensor_set(enc_h, fenc_output_cpu.data(), 0,
                                 D * N_spatial * sizeof(float));
 
-        // Copy FPN features from state
-        {
-            size_t s0 = (size_t)D * H0 * H0 * sizeof(float);
-            size_t s1 = (size_t)D * H1 * H1 * sizeof(float);
-            size_t s2 = (size_t)D * H * H * sizeof(float);
-            std::vector<float> b0(D * H0 * H0), b1(D * H1 * H1), b2(D * H * H);
-            ggml_backend_tensor_get(state.neck_det[0], b0.data(), 0, s0);
-            if (fpn0->buffer) ggml_backend_tensor_set(fpn0, b0.data(), 0, s0);
-            ggml_backend_tensor_get(state.neck_det[1], b1.data(), 0, s1);
-            if (fpn1->buffer) ggml_backend_tensor_set(fpn1, b1.data(), 0, s1);
-            ggml_backend_tensor_get(state.neck_det[2], b2.data(), 0, s2);
-            if (fpn2->buffer) ggml_backend_tensor_set(fpn2, b2.data(), 0, s2);
-        }
+        // FPN features: device-to-device copy from the state neck outputs
+        // (same backend → cudaMemcpyAsync D2D inside ggml_backend_tensor_copy).
+        // The previous get→CPU→set round trip staged ~112 MB through pageable
+        // host memory (~92 ms); the D2D copy avoids both the staging and the
+        // temporary host vectors. fpn2 is not always reachable from the seg
+        // head graph (gallocr then leaves it unallocated) — only copy inputs
+        // that were actually allocated, matching the old guarded get/set.
+        if (fpn0->buffer) ggml_backend_tensor_copy(state.neck_det[0], fpn0);
+        if (fpn1->buffer) ggml_backend_tensor_copy(state.neck_det[1], fpn1);
+        if (fpn2->buffer) ggml_backend_tensor_copy(state.neck_det[2], fpn2);
 
-        // Object queries: extract from DETR queries (skip presence token at slot 0)
-        // queries_data is flat [D * 201], presence token is at positions [0..D-1]
-        // Object queries start at position [D..D*(NQ+1)-1]
-        ggml_backend_tensor_set(oq, queries_data.data() + D, 0, D * NQ * sizeof(float));
+        // Object queries: gather only surviving queries from DETR queries
+        // (queries_data is flat [D * (NQ + 1)], presence token at slot 0;
+        // object query q lives at offset D * (q + 1))
+        {
+            std::vector<float> oq_data((size_t)D * ns);
+            for (int i = 0; i < ns; ++i) {
+                const int q = surv_q[i];
+                memcpy(oq_data.data() + (size_t)i * D,
+                       queries_data.data() + (size_t)(q + 1) * D, D * sizeof(float));
+            }
+            ggml_backend_tensor_set(oq, oq_data.data(), 0, (size_t)D * ns * sizeof(float));
+        }
 
         ggml_backend_tensor_set(txt, combined_prompt_cpu.data(), 0, D * T * sizeof(float));
         ggml_backend_tensor_set(tab, combined_bias_cpu.data(), 0, T * sizeof(float));
+        pcs_tick("seg.upload");
 
         if (!sam3_graph_compute(model.backend, graph, state.n_threads)) {
             ggml_gallocr_free(alloc);
@@ -10223,6 +10946,7 @@ sam3_result sam3_segment_pcs(sam3_state& state,
             return result;
         }
         ggml_backend_tensor_get(out, all_masks.data(), 0, all_masks.size() * sizeof(float));
+        pcs_tick("seg.compute");
 
         ggml_gallocr_free(alloc);
         ggml_free(ctx);
@@ -10231,11 +10955,12 @@ sam3_result sam3_segment_pcs(sam3_state& state,
     /*
     ** ── Post-processing: thresholding + NMS + mask resize ────────────
     */
+    pcs_tick("seghead");
     std::vector<sam3_detection> dets;
-    for (int q = 0; q < NQ; ++q) {
+    for (int si = 0; si < ns; ++si) {
+        const int q = surv_q[si];
         float class_prob = 1.0f / (1.0f + expf(-scores_data[q]));
         float score = class_prob * presence_prob;
-        if (score < params.score_threshold) continue;
 
         sam3_detection det;
         float cx = boxes_data[0 + q * 4];
@@ -10246,7 +10971,7 @@ sam3_result sam3_segment_pcs(sam3_state& state,
         det.box = sam3_cxcywh_to_xyxy(cx, cy, bw, bh, state.orig_width, state.orig_height);
         det.score = score;
 
-        const float* mask_ptr = all_masks.data() + q * mask_hw * mask_hw;
+        const float* mask_ptr = all_masks.data() + (size_t)si * mask_hw * mask_hw;
         auto mask_resized = sam3_bilinear_interpolate(mask_ptr, mask_hw, mask_hw,
                                                       state.orig_width, state.orig_height);
         det.mask.width = state.orig_width;
@@ -10270,6 +10995,7 @@ sam3_result sam3_segment_pcs(sam3_state& state,
     }
 
     SAM3_LOG(2, "%s: %zu detections after NMS\n", __func__, result.detections.size());
+    pcs_tick("post");
 
 #if SAM3_LOG_LEVEL >= 1
     auto t_end = std::chrono::high_resolution_clock::now();
@@ -10407,8 +11133,17 @@ static void sam3_pe_encode_coord(float* out, float x_norm, float y_norm,
 // Read SAM prompt encoder weights from GPU and cache them in state.
 // Also pre-computes the dense PE grid and no-mask tiled embedding.
 // These never change between PVS calls for the same model.
+static void sam3_ensure_mux_pe_caches(sam3_state& state, const sam3_model& model);
+
 static void sam3_populate_pe_cache(sam3_state& state, const sam3_model& model) {
     if (state.pe_cache_valid) return;
+
+    // SAM 3.1: the base prompt encoder does not exist; the interactive PE
+    // caches are the ones consumed by the PVS path.
+    if (model.hparams.is_multiplex()) {
+        sam3_ensure_mux_pe_caches(state, model);
+        return;
+    }
 
     const int D = model.hparams.sam_embed_dim;  // 256
     const int H = sam3_eff_feat_size(state, model.hparams);
@@ -10673,9 +11408,11 @@ static sam3_dec_result sam3_build_sam_dec_graph(
     struct ggml_tensor* dense_emb,    // [D, H, H, 1]
     struct ggml_tensor* feat_s0,      // [D, H*4, H*4, 1] high-res
     struct ggml_tensor* feat_s1,     // [D, H*2, H*2, 1] mid-res
-    int eff_feat_size = 0)
+    int eff_feat_size = 0,
+    // SAM 3.1: the interactive decoder clone (sam_dec_int) shares this graph.
+    const sam3_sam_mask_dec* dec_override = nullptr)
 {
-    const auto& dec = model.sam_dec;
+    const auto& dec = dec_override ? *dec_override : model.sam_dec;
     const auto& hp = model.hparams;
     const int D = hp.sam_embed_dim;  // 256
     const int H = (eff_feat_size > 0) ? eff_feat_size : hp.feat_size();
@@ -10897,7 +11634,9 @@ static sam3_dec_result sam3_build_sam_dec_graph(
 static bool sam3_mask_prompt_dense(const sam3_model& model,
                                    const sam3_pvs_params& params,
                                    int D, int H,
-                                   std::vector<float>& out_dense) {
+                                   std::vector<float>& out_dense,
+                                   const sam3_sam_prompt_enc* pe_override = nullptr) {
+    const sam3_sam_prompt_enc& pe = pe_override ? *pe_override : model.sam_pe;
     const int MI = H * 4;
     std::vector<float> inp_data;
 
@@ -10930,7 +11669,6 @@ static bool sam3_mask_prompt_dense(const sam3_model& model,
     ggml_set_name(inp, "mask_prompt_input");
     ggml_set_input(inp);
 
-    const auto& pe = model.sam_pe;
     // ggml conv_2d has no bias parameter — add it manually after each conv
     // (bias [OC] reshaped to [1,1,OC,1] for broadcasting), matching the
     // verified SAM2 encoder/decoder conv+bias patterns.
@@ -11051,19 +11789,22 @@ sam3_result sam3_segment_pvs(sam3_state& state,
     ggml_set_input(feat_s1);
 
     // ── SAM mask decoder graph ───────────────────────────────────────────
+    const sam3_sam_mask_dec* dec_w =
+        hp.is_multiplex() ? &model.sam_dec_int : nullptr;
     auto dec_out = sam3_build_sam_dec_graph(ctx0, model,
                                             image_feats,
                                             pe_out.image_pe,
                                             pe_out.sparse,
                                             pe_out.dense,
                                             feat_s0,
-                                            feat_s1, H);
+                                            feat_s1, H, dec_w);
 
     // Mark outputs
     ggml_set_output(dec_out.masks);
     ggml_set_output(dec_out.iou_pred);
     ggml_set_output(dec_out.obj_score);
     ggml_set_output(dec_out.sam_token);
+    if (dec_out.mask_tokens) ggml_set_output(dec_out.mask_tokens);
 
     // ── Build and allocate graph ─────────────────────────────────────────
     struct ggml_cgraph* graph = ggml_new_graph_custom(ctx0, 32768, false);
@@ -11071,6 +11812,7 @@ sam3_result sam3_segment_pvs(sam3_state& state,
     ggml_build_forward_expand(graph, dec_out.iou_pred);
     ggml_build_forward_expand(graph, dec_out.obj_score);
     ggml_build_forward_expand(graph, dec_out.sam_token);
+    if (dec_out.mask_tokens) ggml_build_forward_expand(graph, dec_out.mask_tokens);
 
     auto* galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
     if (!ggml_gallocr_reserve(galloc, graph)) {
@@ -11097,6 +11839,13 @@ sam3_result sam3_segment_pvs(sam3_state& state,
     // ── Upload input data (using cached embeddings) ────────────────────
     // Populate PE cache on first call (reads model weights from GPU once)
     sam3_populate_pe_cache(state, model);
+    // SAM 3.1: the interactive prompt encoder's caches drive this path.
+    const auto& pe_gauss_c   = hp.is_multiplex() ? state.int_pe_gauss_cache : state.pe_gauss_cache;
+    const auto& point_emb_c  = hp.is_multiplex() ? state.int_point_emb_cache : state.point_emb_cache;
+    const auto& not_a_pt_c   = hp.is_multiplex() ? state.int_not_a_point_cache : state.not_a_point_cache;
+    const auto& dense_pe_c   = hp.is_multiplex() ? state.int_dense_pe_cache : state.dense_pe_cache;
+    const auto& dense_nomask_c = hp.is_multiplex() ? state.int_dense_nomask_cache
+                                                   : state.dense_nomask_cache;
 
     {
         const int N_pts = pe_out.n_tokens;
@@ -11116,21 +11865,21 @@ sam3_result sam3_segment_pvs(sam3_state& state,
             float y_norm = py / (float)eff_img_size;
             float pe_vec[256];
             sam3_pe_encode_coord(pe_vec, x_norm, y_norm,
-                                 state.pe_gauss_cache.data(), num_pos_feats);
+                                 pe_gauss_c.data(), num_pos_feats);
             int label = all_labels[p];
             if (label == -1) {
                 for (int d = 0; d < D; ++d)
-                    sparse_data[p * D + d] = state.not_a_point_cache[d];
+                    sparse_data[p * D + d] = not_a_pt_c[d];
             } else {
                 for (int d = 0; d < D; ++d)
-                    sparse_data[p * D + d] = pe_vec[d] + state.point_emb_cache[label][d];
+                    sparse_data[p * D + d] = pe_vec[d] + point_emb_c[label][d];
             }
         }
         ggml_backend_tensor_set(pe_out.sparse, sparse_data.data(), 0, N_pts * D * sizeof(float));
 
         // Dump sparse embeddings if requested
         {
-            const char* dd = getenv("SAM2_DUMP_DIR");
+            const char* dd = model.debug.sam2_dump_dir.empty() ? nullptr : model.debug.sam2_dump_dir.c_str();
             if (dd) {
                 char p[512]; snprintf(p, sizeof(p), "%s/cpp_sparse_emb.bin", dd);
                 FILE* f = fopen(p, "wb");
@@ -11142,30 +11891,39 @@ sam3_result sam3_segment_pvs(sam3_state& state,
         // Dense PE grid and no-mask embedding — use pre-computed caches.
         // A mask prompt replaces the no-mask dense embedding with the
         // mask_downscaling branch output (official PromptEncoder semantics).
-        ggml_backend_tensor_set(pe_out.image_pe, state.dense_pe_cache.data(),
+        ggml_backend_tensor_set(pe_out.image_pe, dense_pe_c.data(),
                                 0, D * H * H * sizeof(float));
         if (has_mask_prompt) {
             std::vector<float> dense_mask;
-            if (sam3_mask_prompt_dense(model, params, D, H, dense_mask)) {
+            const sam3_sam_prompt_enc* pe_ov =
+                hp.is_multiplex() ? &model.sam_pe_int : nullptr;
+            if (sam3_mask_prompt_dense(model, params, D, H, dense_mask, pe_ov)) {
                 ggml_backend_tensor_set(pe_out.dense, dense_mask.data(),
                                         0, D * H * H * sizeof(float));
             } else {
-                ggml_backend_tensor_set(pe_out.dense, state.dense_nomask_cache.data(),
+                ggml_backend_tensor_set(pe_out.dense, dense_nomask_c.data(),
                                         0, D * H * H * sizeof(float));
             }
         } else {
-            ggml_backend_tensor_set(pe_out.dense, state.dense_nomask_cache.data(),
+            ggml_backend_tensor_set(pe_out.dense, dense_nomask_c.data(),
                                     0, D * H * H * sizeof(float));
         }
     }
 
     // ── Copy tracker features from state to fresh input tensors ─────────
-    // image_feats = neck_trk[2] + no_mem_embed (computed on CPU)
+    // image_feats = interactive neck features + interactivity_no_mem_embed.
+    // SAM 3.1: `_get_interactive_pix_mem` = features[-1] +
+    // interactivity_no_mem_embed; SAM 3: features + no_mem_embed.
     {
+        auto* feats2 = hp.is_multiplex() ? state.neck_trk_int[2] : state.neck_trk[2];
+        auto* feats0 = hp.is_multiplex() ? state.neck_trk_int[0] : state.neck_trk[0];
+        auto* feats1 = hp.is_multiplex() ? state.neck_trk_int[1] : state.neck_trk[1];
+        auto* no_mem_t = hp.is_multiplex() ? model.no_mem_embed_int
+                                           : model.tensors.at("no_mem_embed");
         const int n2 = D * H * H;
         std::vector<float> trk2(n2), no_mem_data(D);
-        ggml_backend_tensor_get(state.neck_trk[2], trk2.data(), 0, n2 * sizeof(float));
-        ggml_backend_tensor_get(model.tensors.at("no_mem_embed"), no_mem_data.data(), 0, D * sizeof(float));
+        ggml_backend_tensor_get(feats2, trk2.data(), 0, n2 * sizeof(float));
+        ggml_backend_tensor_get(no_mem_t, no_mem_data.data(), 0, D * sizeof(float));
         // Add no_mem_embed (broadcast [D] to [D, H, H])
         for (int s = 0; s < H * H; ++s)
             for (int d = 0; d < D; ++d)
@@ -11174,7 +11932,7 @@ sam3_result sam3_segment_pvs(sam3_state& state,
 
         // Dump image_feats (with no_mem_embed) if requested
         {
-            const char* dd = getenv("SAM2_DUMP_DIR");
+            const char* dd = model.debug.sam2_dump_dir.empty() ? nullptr : model.debug.sam2_dump_dir.c_str();
             if (dd) {
                 char p[512]; snprintf(p, sizeof(p), "%s/cpp_image_feats.bin", dd);
                 FILE* f = fopen(p, "wb");
@@ -11183,8 +11941,8 @@ sam3_result sam3_segment_pvs(sam3_state& state,
             }
         }
 
-        ggml_backend_tensor_copy(state.neck_trk[0], feat_s0);
-        ggml_backend_tensor_copy(state.neck_trk[1], feat_s1);
+        ggml_backend_tensor_copy(feats0, feat_s0);
+        ggml_backend_tensor_copy(feats1, feat_s1);
     }
 
     // ── Compute ──────────────────────────────────────────────────────────
@@ -11205,9 +11963,9 @@ sam3_result sam3_segment_pvs(sam3_state& state,
 #endif
     }
 
-    // ── Dump decoder outputs if SAM2_DUMP_DIR set ──────────────────────
+    // ── Dump decoder outputs if sam2_dump_dir set ──────────────────
     {
-        const char* dump_dir = getenv("SAM2_DUMP_DIR");
+        const char* dump_dir = model.debug.sam2_dump_dir.empty() ? nullptr : model.debug.sam2_dump_dir.c_str();
         if (dump_dir) {
             auto dump_t = [&](const char* name, struct ggml_tensor* t) {
                 if (!t) return;
@@ -11272,6 +12030,16 @@ sam3_result sam3_segment_pvs(sam3_state& state,
     std::vector<float> sam_token_data(D);
     ggml_backend_tensor_get(dec_out.sam_token, sam_token_data.data(), 0, D * sizeof(float));
 
+    // Per-mask output tokens [D, num_mask_tokens]: the official object pointer
+    // uses the token of the SELECTED mask (sam_output_tokens[best_iou_inds]),
+    // so each detection carries its own mask's token.
+    std::vector<float> tokens_data;
+    if (dec_out.mask_tokens) {
+        tokens_data.resize((size_t)D * num_mask_tokens);
+        ggml_backend_tensor_get(dec_out.mask_tokens, tokens_data.data(), 0,
+                                tokens_data.size() * sizeof(float));
+    }
+
     SAM3_LOG(2, "%s: obj_score=%.4f (logit=%.4f), iou=[%.3f, %.3f, %.3f, %.3f]\n",
              __func__, obj_score, obj_logit,
              iou_data[0], iou_data[1], iou_data[2], iou_data[3]);
@@ -11290,7 +12058,11 @@ sam3_result sam3_segment_pvs(sam3_state& state,
 
     for (int m = start_idx; m < end_idx; ++m) {
         sam3_detection det;
-        det.sam_token = sam_token_data;
+        const float* tok_ptr = tokens_data.empty()
+            ? sam_token_data.data()
+            : tokens_data.data() + (size_t)m * D;
+        det.sam_token.assign(tok_ptr, tok_ptr + D);
+        det.obj_logit = obj_logit;
 
         // Resize mask from 288×288 to original image size
         const float* mask_ptr = masks_data.data() + m * mask_hw * mask_hw;
@@ -11311,7 +12083,14 @@ sam3_result sam3_segment_pvs(sam3_state& state,
         det.score = iou_data[m];
         det.iou_score = iou_data[m];
         det.instance_id = m;
-        if (params.return_logits) det.mask_logits = std::move(mask_resized);
+        if (params.return_logits) {
+            det.mask_logits = std::move(mask_resized);
+            // Native decoder-resolution logits (the official memory encoder
+            // consumes these directly, before any video-res interpolation).
+            det.mask_logits_lowres.assign(
+                masks_data.data() + (size_t)m * mask_hw * mask_hw,
+                masks_data.data() + (size_t)(m + 1) * mask_hw * mask_hw);
+        }
 
         // Compute bounding box from mask
         int min_x = state.orig_width, min_y = state.orig_height;
@@ -11373,13 +12152,18 @@ static void sam3_ensure_tracker_pe_caches(sam3_tracker& tracker, const sam3_hpar
     tracker.cached_sinpe_64  = sam3_sinusoidal_pe_2d(H, H, MD);
 
     // Compute axial CIS and reorder to [2, half_d, N] layout
-    std::vector<float> rope_raw(N * D);
-    sam3_compute_axial_cis(rope_raw.data(), D, H, H, 10000.0f, 1.0f);
+    // SAM 3.1: 8 heads × 32-dim — compute the per-head CIS and tile it 8×
+    // across D so the shared [2, D/2, N] rope layout stays valid (RoPE is
+    // periodic within each head, so tiling == per-head application).
+    const int rope_dim = hp.is_multiplex() ? hp.mem_head_dim() : D;
+    std::vector<float> rope_raw(N * rope_dim);
+    sam3_compute_axial_cis(rope_raw.data(), rope_dim, H, H, 10000.0f, 1.0f);
     tracker.cached_axial_cis_reord.resize(2 * half_d * N);
     for (int n = 0; n < N; ++n)
         for (int i = 0; i < half_d; ++i) {
-            tracker.cached_axial_cis_reord[0 + i * 2 + n * D] = rope_raw[n * D + i * 2 + 0];
-            tracker.cached_axial_cis_reord[1 + i * 2 + n * D] = rope_raw[n * D + i * 2 + 1];
+            const int src_pair = hp.is_multiplex() ? (i % (rope_dim / 2)) : i;
+            tracker.cached_axial_cis_reord[0 + i * 2 + n * D] = rope_raw[n * rope_dim + src_pair * 2 + 0];
+            tracker.cached_axial_cis_reord[1 + i * 2 + n * D] = rope_raw[n * rope_dim + src_pair * 2 + 1];
         }
 
     tracker.pe_caches_valid = true;
@@ -11436,6 +12220,1338 @@ static void sam3_store_eff_iou_score(sam3_tracker& tracker, int inst_id,
     tracker.eff_history[inst_id][frame_idx] = norm * best_iou;
 }
 
+/*****************************************************************************
+** SAM 3.1 Object Multiplex — bucket-space graphs
+*****************************************************************************/
+
+// Multi-head RoPE attention core. q/k/v arrive as [D, T, 1]; returns [D, T, 1].
+// rope_q/rope_k apply before the head split (per-head periodic tiling makes
+// this equivalent to per-head RoPE).
+static struct ggml_tensor* sam3_mux_flash_attn(
+    struct ggml_context* ctx, const sam3_hparams& hp,
+    struct ggml_tensor* q, struct ggml_tensor* k, struct ggml_tensor* v,
+    struct ggml_tensor* rope_q, struct ggml_tensor* rope_k,
+    int n_keys, bool rope_k_keys, int num_k_exclude_rope) {
+    const int D = hp.neck_dim;
+    const int NH = hp.mem_attn_heads;
+    const int hd = hp.mem_head_dim();
+    const int Tq = (int)q->ne[1];
+    if (rope_q) q = sam3_apply_rope(ctx, q, rope_q);
+    if (rope_k && rope_k_keys && n_keys > num_k_exclude_rope) {
+        auto* k_sp = ggml_cont(ctx, ggml_view_3d(ctx, k, D, n_keys - num_k_exclude_rope, 1,
+                                                 k->nb[1], k->nb[2], 0));
+        k_sp = sam3_apply_rope(ctx, k_sp, rope_k);
+        if (num_k_exclude_rope > 0) {
+            auto* k_ptr = ggml_cont(ctx, ggml_view_3d(ctx, k, D, num_k_exclude_rope, 1,
+                                                      k->nb[1], k->nb[2],
+                                                      (size_t)(n_keys - num_k_exclude_rope) * k->nb[1]));
+            k = ggml_concat(ctx, k_sp, k_ptr, 1);
+        } else {
+            k = k_sp;
+        }
+    }
+    q = ggml_cont(ctx, ggml_permute(ctx,
+        ggml_reshape_4d(ctx, q, hd, NH, Tq, 1), 0, 2, 1, 3));  // [hd, Tq, NH, 1]
+    k = ggml_cont(ctx, ggml_permute(ctx,
+        ggml_reshape_4d(ctx, k, hd, NH, n_keys, 1), 0, 2, 1, 3));
+    v = ggml_permute(ctx,
+        ggml_reshape_4d(ctx, v, hd, NH, n_keys, 1), 0, 2, 1, 3);
+    auto* out = sam3_attn_ext(ctx, q, k, v, nullptr, 1.0f / sqrtf((float)hd), 0.0f, 0.0f);
+    // flash_attn_ext (and sam3_attn_ext's manual emulator) return [HD, NH, Tq]
+    // whose contiguous flat layout is already the token-major [D, Tq] head
+    // interleave (flat = hd + 32*nh + 256*t) — a plain reshape collects it.
+    return ggml_reshape_3d(ctx, out, D, Tq, 1);
+}
+
+// SAM 3.1 memory attention: DecoupledTransformerDecoderLayerv2 with dual
+// image/memory projections, 8-head RoPE self- and cross-attention, and the
+// extra raw-image-feature key stream (save_image_features).
+static struct ggml_tensor* sam3_build_mem_attn_graph_mux(
+    struct ggml_context* ctx,
+    const sam3_model& model,
+    struct ggml_tensor* curr_tokens,     // [D, N, 1] raw current frame features
+    struct ggml_tensor* src_pos,         // [D, N, 1]
+    struct ggml_tensor* prompt_mem,      // [MD, M_total, 1] maskmem feats + ptrs
+    struct ggml_tensor* prompt_img,      // [MD, M_total, 1] image feats + zeros
+    struct ggml_tensor* prompt_img_pos,  // [MD, M_total, 1] img PE+tpos + ptr tpos
+    struct ggml_tensor* rope_freqs,      // [2, D/2, N]
+    struct ggml_tensor* rope_k_freqs,    // [2, D/2, M_spatial] or nullptr
+    int num_ptr_tokens) {
+    const auto& ma = model.mem_attn;
+    const auto& hp = model.hparams;
+    const int D = hp.neck_dim;
+    const int N = (int)curr_tokens->ne[1];
+    const int M_total = (int)prompt_mem->ne[1];
+    const int M_spatial = M_total - num_ptr_tokens;
+
+    // pos_enc_at_input: x = curr + 0.1 * src_pos
+    auto* x = ggml_add(ctx, curr_tokens, ggml_scale(ctx, src_pos, 0.1f));
+    ggml_set_name(x, "mux_mem_attn_input");
+
+    for (int l = 0; l < (int)ma.layers.size(); ++l) {
+        const auto& ly = ma.layers[l];
+
+        // ── Self-attention (8 heads, RoPE; q = k = norm1(x), v = norm1(x)) ──
+        {
+            auto* x_norm = sam3_layer_norm(ctx, x, ly.norm1_w, ly.norm1_b);
+            auto* q = ggml_add(ctx, ggml_mul_mat(ctx, ly.sa_q_w, x_norm), ly.sa_q_b);
+            auto* k = ggml_add(ctx, ggml_mul_mat(ctx, ly.sa_k_w, x_norm), ly.sa_k_b);
+            auto* v = ggml_add(ctx, ggml_mul_mat(ctx, ly.sa_v_w, x_norm), ly.sa_v_b);
+            auto* sa_core = sam3_mux_flash_attn(ctx, hp, q, k, v, rope_freqs, rope_freqs,
+                                               N, true, 0);
+            auto* sa_out = ggml_add(ctx, ggml_mul_mat(ctx, ly.sa_out_w, sa_core), ly.sa_out_b);
+            x = ggml_add(ctx, x, sa_out);
+            sam3_name_tensorf(x, "mux_mem_attn_layer%d_after_sa", l);
+        }
+
+        // ── Cross-attention: dual q/k projections + image-key stream ──────
+        {
+            auto* x_norm = sam3_layer_norm(ctx, x, ly.norm2_w, ly.norm2_b);
+            // q = img_q(curr_raw) + mem_q(norm2(x))
+            auto* q = ggml_add(ctx,
+                               ggml_add(ctx, ggml_mul_mat(ctx, ly.img_ca_q_w, curr_tokens), ly.img_ca_q_b),
+                               ggml_add(ctx, ggml_mul_mat(ctx, ly.ca_q_w, x_norm), ly.ca_q_b));
+            // k = img_k(prompt_img) + mem_k(prompt_mem) + prompt_img_pos
+            auto* k = ggml_add(ctx,
+                               ggml_add(ctx, ggml_mul_mat(ctx, ly.img_ca_k_w, prompt_img), ly.img_ca_k_b),
+                               ggml_add(ctx, ggml_mul_mat(ctx, ly.ca_k_w, prompt_mem), ly.ca_k_b));
+            k = ggml_add(ctx, k, prompt_img_pos);
+            // v = mem_v(prompt_mem)
+            auto* v = ggml_add(ctx, ggml_mul_mat(ctx, ly.ca_v_w, prompt_mem), ly.ca_v_b);
+            auto* ca_out = sam3_mux_flash_attn(ctx, hp, q, k, v, rope_freqs, rope_k_freqs,
+                                               M_total, true, num_ptr_tokens);
+            ca_out = ggml_add(ctx, ggml_mul_mat(ctx, ly.ca_out_w, ca_out), ly.ca_out_b);
+            x = ggml_add(ctx, x, ca_out);
+            sam3_name_tensorf(x, "mux_mem_attn_layer%d_after_ca", l);
+        }
+
+        // ── FFN (gelu) ─────────────────────────────────────────────────────
+        {
+            auto* x_norm = sam3_layer_norm(ctx, x, ly.norm3_w, ly.norm3_b);
+            auto* ffn = ggml_add(ctx, ggml_mul_mat(ctx, ly.ffn_fc1_w, x_norm), ly.ffn_fc1_b);
+            ffn = ggml_gelu(ctx, ffn);
+            ffn = ggml_add(ctx, ggml_mul_mat(ctx, ly.ffn_fc2_w, ffn), ly.ffn_fc2_b);
+            x = ggml_add(ctx, x, ffn);
+            sam3_name_tensorf(x, "mux_mem_attn_layer%d_after_ffn", l);
+        }
+    }
+
+    auto* out = sam3_layer_norm(ctx, x, model.mem_attn_norm_w, model.mem_attn_norm_b);
+    ggml_set_name(out, "mux_mem_attn_output");
+    return out;
+}
+
+// SAM 3.1 joint propagation decoder: one TwoWayTransformer pass over
+// [obj(16) | iou(16) | masks(48)] = 80 tokens, masks/ious/scores per slot.
+struct sam3_dec_mux_result {
+    struct ggml_tensor* masks;           // [H4*H4, n_mux*3, 1]
+    struct ggml_tensor* iou_pred;        // [3, n_mux, 1]
+    struct ggml_tensor* obj_score;       // [1, n_mux, 1]
+    struct ggml_tensor* mask_tokens_out; // [D, n_mux*3, 1]
+};
+
+static sam3_dec_mux_result sam3_build_sam_dec_graph_mux(
+    struct ggml_context* ctx,
+    const sam3_model& model,
+    struct ggml_tensor* image_feats,   // [D, H, H, 1] memory-conditioned
+    struct ggml_tensor* image_pe,      // [D, H, H, 1]
+    struct ggml_tensor* feat_s0,       // [D, H*4, H*4, 1]
+    struct ggml_tensor* feat_s1,       // [D, H*2, H*2, 1]
+    struct ggml_tensor* extra_embed,   // [D, n_mux, 1] valid/invalid embeds or nullptr
+    int eff_feat_size) {
+    const auto& dec = model.sam_dec;
+    const auto& hp = model.hparams;
+    const int D = hp.sam_embed_dim;
+    const int H = eff_feat_size;
+    const int M = hp.multiplex_count;
+    const int n_out = 3;  // multimask-only outputs
+    const int n_heads = 8;
+
+    // tokens = [obj(16) | iou(16) | mask_tokens(48) + extra(48)]
+    auto* tokens = ggml_concat(ctx, dec.obj_score_token, dec.iou_token, 1);
+    auto* mask_tokens = dec.mask_tokens;  // [D, 48]
+    if (extra_embed) {
+        // tile [D, 16] → [D, 48] with index j = slot*3 + out: repeat each
+        // slot's embed across its 3 multimask outputs.
+        auto* e4 = ggml_reshape_4d(ctx, extra_embed, D, M, 1, 1);
+        auto* target = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, M, n_out, 1);
+        ggml_set_name(target, "mux_extra_tile_shape");
+        auto* e = ggml_repeat(ctx, e4, target);
+        mask_tokens = ggml_add(ctx, mask_tokens,
+                               ggml_reshape_3d(ctx, e, D, M * n_out, 1));
+    }
+    tokens = ggml_concat(ctx, tokens, mask_tokens, 1);
+    ggml_set_name(tokens, "mux_dec_tokens_initial");
+
+    auto* src = ggml_reshape_3d(ctx, image_feats, D, H * H, 1);
+    auto* pos_src = ggml_reshape_3d(ctx, image_pe, D, H * H, 1);
+
+    auto* queries = tokens;
+    auto* keys = src;
+    auto* query_pe = tokens;
+    auto* key_pe = pos_src;
+    for (int i = 0; i < hp.sam_dec_depth; ++i) {
+        sam3_twoway_block_forward(ctx, queries, keys, query_pe, key_pe,
+                                  dec.twoway_blocks[i], n_heads,
+                                  /*skip_first_layer_pe=*/(i == 0));
+        sam3_name_tensorf(queries, "mux_dec_block%d_queries", i);
+        ggml_set_output(queries);
+    }
+
+    // Final attention: tokens → image
+    {
+        auto* q = ggml_add(ctx, queries, query_pe);
+        auto* k = ggml_add(ctx, keys, key_pe);
+        auto* attn_out = sam3_sam_attention(ctx, q, k, keys, dec.final_attn, n_heads);
+        queries = ggml_add(ctx, queries, attn_out);
+        queries = sam3_layer_norm(ctx, queries, dec.final_norm_w, dec.final_norm_b);
+        ggml_set_name(queries, "mux_dec_final_queries");
+    }
+
+    // Per-slot token views. Token layout: [0..M) obj, [M..2M) iou, [2M..2M+M*3) masks.
+    auto* obj_out = ggml_cont(ctx, ggml_view_3d(ctx, queries, D, M, 1,
+                                                queries->nb[1], queries->nb[2], 0));
+    auto* iou_out = ggml_cont(ctx, ggml_view_3d(ctx, queries, D, M, 1,
+                                                queries->nb[1], queries->nb[2],
+                                                M * queries->nb[1]));
+    auto* mask_out = ggml_cont(ctx, ggml_view_3d(ctx, queries, D, M * n_out, 1,
+                                                 queries->nb[1], queries->nb[2],
+                                                 2 * M * queries->nb[1]));
+    ggml_set_name(mask_out, "mux_dec_mask_tokens_out");
+    ggml_set_output(mask_out);
+
+    // Upscale path — identical to the per-object decoder.
+    auto* src_img = ggml_reshape_4d(ctx, keys, D, H, H, 1);
+    src_img = ggml_cont(ctx, ggml_permute(ctx, src_img, 2, 0, 1, 3));
+    auto* up1 = ggml_conv_transpose_2d_p0(ctx, sam3_conv_transpose_weight(ctx, dec.up1_w), src_img, 2);
+    up1 = ggml_add(ctx, up1, ggml_reshape_4d(ctx, dec.up1_b, 1, 1, ggml_nelements(dec.up1_b), 1));
+    auto* fs1 = ggml_cont(ctx, ggml_permute(ctx, feat_s1, 2, 0, 1, 3));
+    auto* hs1 = ggml_conv_2d_sk_p0(ctx, dec.conv_s1_w, fs1);
+    hs1 = ggml_add(ctx, hs1, ggml_reshape_4d(ctx, dec.conv_s1_b, 1, 1, 64, 1));
+    up1 = ggml_add(ctx, up1, hs1);
+    up1 = ggml_cont(ctx, ggml_permute(ctx, up1, 1, 2, 0, 3));
+    up1 = sam3_layer_norm_2d(ctx, up1, dec.up1_norm_w, dec.up1_norm_b);
+    up1 = ggml_gelu_erf(ctx, up1);
+    up1 = ggml_cont(ctx, ggml_permute(ctx, up1, 2, 0, 1, 3));
+    auto* up2 = ggml_conv_transpose_2d_p0(ctx, sam3_conv_transpose_weight(ctx, dec.up2_w), up1, 2);
+    up2 = ggml_add(ctx, up2, ggml_reshape_4d(ctx, dec.up2_b, 1, 1, ggml_nelements(dec.up2_b), 1));
+    auto* fs0 = ggml_cont(ctx, ggml_permute(ctx, feat_s0, 2, 0, 1, 3));
+    auto* hs0 = ggml_conv_2d_sk_p0(ctx, dec.conv_s0_w, fs0);
+    hs0 = ggml_add(ctx, hs0, ggml_reshape_4d(ctx, dec.conv_s0_b, 1, 1, 32, 1));
+    up2 = ggml_add(ctx, up2, hs0);
+    up2 = ggml_cont(ctx, ggml_permute(ctx, up2, 1, 2, 0, 3));
+    up2 = ggml_gelu_erf(ctx, up2);
+    ggml_set_name(up2, "mux_dec_upscaled");
+
+    const int H4 = H * 4;
+    auto* up_flat = ggml_reshape_3d(ctx, up2, 32, H4 * H4, 1);
+
+    // masks: for output m, hyper_m over all 16 slot tokens (stride 3 slots).
+    struct ggml_tensor* masks = nullptr;
+    for (int m = 0; m < n_out; ++m) {
+        auto* tok_m = ggml_cont(ctx, ggml_view_3d(ctx, mask_out, D, M, 1,
+                                                  mask_out->nb[1] * n_out, mask_out->nb[2],
+                                                  m * mask_out->nb[1]));
+        auto* hyper = sam3_mlp_forward(ctx, tok_m,
+                                       dec.hyper_w[m], dec.hyper_b[m], 3);  // [32, M]
+        auto* mask_m = ggml_mul_mat(ctx, up_flat, hyper);  // [H4², M]
+        masks = masks ? ggml_concat(ctx, masks, mask_m, 1) : mask_m;
+    }
+    ggml_set_name(masks, "mux_dec_masks");
+    // column j = m * M + s (out-major concat); the consumer maps back to the
+    // official [B, mux, out, H, W] layout.
+
+    // Official 3.1 multiplex: iou_prediction_use_sigmoid=False.
+    auto* iou_pred = sam3_mlp_forward(ctx, iou_out,
+                                      dec.iou_head_w, dec.iou_head_b, 3,
+                                      /*sigmoid_output=*/false);
+    iou_pred = ggml_reshape_3d(ctx, iou_pred, n_out, M, 1);
+    ggml_set_name(iou_pred, "mux_dec_iou");
+
+    auto* obj_score = sam3_mlp_forward(ctx, obj_out,
+                                       dec.obj_head_w, dec.obj_head_b, 3);
+    obj_score = ggml_reshape_3d(ctx, obj_score, 1, M, 1);
+    ggml_set_name(obj_score, "mux_dec_obj_score");
+
+    sam3_dec_mux_result res;
+    res.masks = masks;
+    res.iou_pred = iou_pred;
+    res.obj_score = obj_score;
+    res.mask_tokens_out = mask_out;
+    return res;
+}
+
+// SAM 3.1 object pointer: 3-layer MLP projection, then the linear no-obj
+// gating λ·ptr + (1-λ)·Linear(ptr) (λ = hard threshold on the obj logit).
+// interactive=true selects the obj_ptr_proj_int weight set (point/mask path).
+static void sam3_extract_obj_ptr_mux(
+    const sam3_model& model,
+    const float* sam_token_data,  // [D] best multimask token (pre-projection)
+    float obj_logit,
+    float* out_ptr,               // [D]
+    bool interactive) {
+    const auto& hp = model.hparams;
+    const int D = hp.neck_dim;
+    const float lambda = (obj_logit > 0.0f) ? 1.0f : 0.0f;
+
+    struct ggml_tensor* const* ws = interactive ? model.obj_ptr_proj_int_w
+                                                : model.obj_ptr_proj_w;
+    struct ggml_tensor* const* bs = interactive ? model.obj_ptr_proj_int_b
+                                                : model.obj_ptr_proj_b;
+    std::vector<float> proj(D), h(D), w_data(D * D), b_data(D);
+    std::copy(sam_token_data, sam_token_data + D, h.data());
+    for (int j = 0; j < 3; ++j) {
+        sam3_read_f32(ws[j], w_data.data(), D * D);
+        sam3_read_f32(bs[j], b_data.data(), D);
+        for (int o = 0; o < D; ++o) {
+            float sum = b_data[o];
+            for (int i = 0; i < D; ++i) sum += w_data[o * D + i] * h[i];
+            proj[o] = (j < 2) ? std::max(0.0f, sum) : sum;
+        }
+        h = proj;
+    }
+    if (lambda >= 1.0f) {
+        std::copy(proj.begin(), proj.end(), out_ptr);
+        return;
+    }
+    // no_obj_ptr_linear(proj)
+    std::vector<float> lin(D), lw(D * D), lb(D);
+    sam3_read_f32(model.no_obj_ptr_lin_w, lw.data(), D * D);
+    sam3_read_f32(model.no_obj_ptr_lin_b, lb.data(), D);
+    for (int o = 0; o < D; ++o) {
+        float sum = lb[o];
+        for (int i = 0; i < D; ++i) sum += lw[o * D + i] * proj[i];
+        lin[o] = sum;
+    }
+    for (int i = 0; i < D; ++i)
+        out_ptr[i] = lambda * proj[i] + (1.0f - lambda) * lin[i];
+}
+
+// Dense PE grid from a cached [2 * num_pos_feats] gaussian matrix.
+static void sam3_fill_dense_pe_grid(std::vector<float>& out, int D, int H,
+                                    const std::vector<float>& gauss_cache) {
+    out.resize((size_t)D * H * H);
+    const int num_pos_feats = D / 2;
+    for (int row = 0; row < H; ++row) {
+        for (int col = 0; col < H; ++col) {
+            float x_norm = ((float)col + 0.5f) / (float)H;
+            float y_norm = ((float)row + 0.5f) / (float)H;
+            float pe_vec[256];
+            sam3_pe_encode_coord(pe_vec, x_norm, y_norm, gauss_cache.data(), num_pos_feats);
+            for (int d = 0; d < D; ++d)
+                out[d + col * D + row * D * H] = pe_vec[d];
+        }
+    }
+}
+
+// Lazily populate the 3.1-specific PE caches (propagation-decoder PE from the
+// tracker-owned image_pe_layer; interactive prompt-encoder embeddings).
+static void sam3_ensure_mux_pe_caches(sam3_state& state, const sam3_model& model) {
+    const int D = model.hparams.sam_embed_dim;
+    const int H = sam3_eff_feat_size(state, model.hparams);
+
+    if (!state.prop_pe_cache_valid && model.sam_pe.prop_pe_gaussian) {
+        const int pe_nel = D;  // [2, 128] flattened
+        std::vector<float> gauss(pe_nel);
+        if (model.sam_pe.prop_pe_gaussian->type == GGML_TYPE_F16) {
+            std::vector<ggml_fp16_t> tmp(pe_nel);
+            ggml_backend_tensor_get(model.sam_pe.prop_pe_gaussian, tmp.data(), 0, pe_nel * sizeof(ggml_fp16_t));
+            ggml_fp16_to_fp32_row(tmp.data(), gauss.data(), pe_nel);
+        } else {
+            ggml_backend_tensor_get(model.sam_pe.prop_pe_gaussian, gauss.data(), 0, pe_nel * sizeof(float));
+        }
+        sam3_fill_dense_pe_grid(state.prop_dense_pe_cache, D, H, gauss);
+        state.prop_pe_cache_valid = true;
+    }
+
+    if (!state.int_pe_cache_valid && model.sam_pe_int.pe_gaussian) {
+        const int pe_nel = D;
+        auto rd = [&](struct ggml_tensor* t, float* dst, int n) {
+            if (t->type == GGML_TYPE_F16) {
+                std::vector<ggml_fp16_t> tmp(n);
+                ggml_backend_tensor_get(t, tmp.data(), 0, n * sizeof(ggml_fp16_t));
+                ggml_fp16_to_fp32_row(tmp.data(), dst, n);
+            } else {
+                ggml_backend_tensor_get(t, dst, 0, n * sizeof(float));
+            }
+        };
+        state.int_pe_gauss_cache.resize(pe_nel);
+        rd(model.sam_pe_int.pe_gaussian, state.int_pe_gauss_cache.data(), pe_nel);
+        for (int i = 0; i < 4; ++i)
+            rd(model.sam_pe_int.point_embed[i], state.int_point_emb_cache[i], D);
+        rd(model.sam_pe_int.not_a_point_embed, state.int_not_a_point_cache, D);
+        rd(model.sam_pe_int.no_mask_embed, state.int_no_mask_emb_cache, D);
+        sam3_fill_dense_pe_grid(state.int_dense_pe_cache, D, H, state.int_pe_gauss_cache);
+        state.int_dense_nomask_cache.resize((size_t)D * H * H);
+        for (int i = 0; i < H * H; ++i)
+            for (int d = 0; d < D; ++d)
+                state.int_dense_nomask_cache[d + i * D] = state.int_no_mask_emb_cache[d];
+        state.int_pe_cache_valid = true;
+    }
+}
+
+// Store an instance's last-predicted lowres mask logits ([1,1,H4,H4] f32,
+// owned by the tracker) — consumed when a later add_prompt re-conditions the
+// same frame and the official re-encodes memory with every prompted object's
+// mask and conditioning flag.
+static void sam3_store_masklet_logits(sam3_tracker& tracker,
+                                      const sam3_model& model,
+                                      sam3_masklet& ml,
+                                      const float* logits, int hw) {
+    if (!tracker.ctx) {
+        struct ggml_init_params tp = {ggml_tensor_overhead() * 4096, nullptr, true};
+        tracker.ctx = ggml_init(tp);
+    }
+    if (!ml.mask_logits || ml.mask_logits->ne[2] != hw || ml.mask_logits->ne[3] != hw) {
+        auto* mt = ggml_new_tensor_4d(tracker.ctx, GGML_TYPE_F32, 1, 1, hw, hw);
+        auto* mb = ggml_backend_alloc_buffer(model.backend,
+                                             (size_t)hw * hw * sizeof(float));
+        struct ggml_tallocr ta = ggml_tallocr_new(mb);
+        ggml_tallocr_alloc(&ta, mt);
+        tracker.owned_buffers.push_back(mb);
+        ml.mask_logits = mt;
+    }
+    ggml_backend_tensor_set(ml.mask_logits, logits, 0,
+                            (size_t)hw * hw * sizeof(float));
+}
+
+// Store one frame's muxed object pointers ([16 × 256], padding = 0) into the
+// bucket's pointer bank (3.1). Same (frame, cond) replaces, like SAM3.
+static void sam3_store_obj_ptr_mux(
+    sam3_tracker& tracker, const sam3_model& model,
+    int bucket_id, const float* muxed, int frame_idx, bool is_cond) {
+    const int D = model.hparams.neck_dim;
+    const int M = model.hparams.multiplex_count;
+    if (!tracker.ctx) {
+        struct ggml_init_params tp = {ggml_tensor_overhead() * 4096, nullptr, true};
+        tracker.ctx = ggml_init(tp);
+    }
+    auto* pt = ggml_new_tensor_2d(tracker.ctx, GGML_TYPE_F32, D, M);
+    auto* pb = ggml_backend_alloc_buffer(model.backend, (size_t)D * M * sizeof(float));
+    struct ggml_tallocr ta = ggml_tallocr_new(pb);
+    ggml_tallocr_alloc(&ta, pt);
+    ggml_backend_tensor_set(pt, muxed, 0, (size_t)D * M * sizeof(float));
+    auto& bk = tracker.ptr_banks[bucket_id];
+    for (auto& s : bk)
+        if (s.frame_index == frame_idx && s.is_cond == is_cond) {
+            sam3_ptr_slot_release(s);
+            s.ptr = pt;
+            s.buf = pb;
+            return;
+        }
+    bk.push_back({frame_idx, pt, is_cond, pb});
+    const int cap = model.hparams.max_obj_ptrs +
+                    (model.hparams.max_cond_frames_in_attn > 0
+                         ? model.hparams.max_cond_frames_in_attn : 0);
+    while ((int)bk.size() > cap) {
+        bool evicted = false;
+        for (auto it = bk.begin(); it != bk.end(); ++it)
+            if (!it->is_cond) { sam3_ptr_slot_release(*it); bk.erase(it); evicted = true; break; }
+        if (!evicted) { sam3_ptr_slot_release(bk.front()); bk.erase(bk.begin()); }
+    }
+}
+
+// SAM 3.1 bucket memory encoder: 32-channel input (16 muxed mask channels +
+// 16 conditioning channels), pix_feat_proj, fuser, per-slot no_obj gating.
+// slot_logits[b] empty ⇒ padding slot (zero mask channel).
+static bool sam3_encode_memory_mux(
+    sam3_tracker& tracker, sam3_state& state, const sam3_model& model,
+    int bucket_id,
+    const std::vector<float> slot_logits[16], int mask_h, int mask_w,
+    const float slot_obj_logit[16], const bool slot_is_cond[16],
+    int frame_idx, bool is_cond_frame) {
+    const auto& hp = model.hparams;
+    const int D = hp.neck_dim, MD = hp.mem_out_dim;
+    const int M = hp.multiplex_count;
+    const int H = sam3_eff_feat_size(state, hp);
+    const int HIGH_RES = sam3_eff_img_size(state, hp);
+    const int INTERPOL = H * 16;
+    const int N = H * H;
+
+    const bool s_prof = model.debug.profile_prop;
+    auto t_m0 = std::chrono::high_resolution_clock::now();
+
+    // Build the 32-channel muxed input at image resolution. Per-slot channels
+    // are independent, so the multithreaded fill is bit-identical to the
+    // sequential version; the sigmoid is fused into the resample pass.
+    const int C_IN = 2 * M;
+    const float sig_scale = hp.sigmoid_scale(), sig_bias = hp.sigmoid_bias();
+    const size_t plane = (size_t)HIGH_RES * HIGH_RES;
+    const size_t muxed_elems = (size_t)C_IN * plane;
+    // Persistent scratch: the vector's value-initialization zeroes new elements
+    // once on the first (grow) frame; afterwards only channels that would have
+    // been zero in a fresh buffer (padding slots) are re-zeroed explicitly.
+    std::vector<float>& muxed = tracker.mem_muxed_scratch;
+    if (muxed.size() < muxed_elems) muxed.resize(muxed_elems);
+    {
+        auto slot_worker = [&](int lo, int hi) {
+            for (int s = lo; s < hi; ++s) {
+                float* dst = muxed.data() + (size_t)s * plane;
+                if (!slot_logits[s].empty()) {
+                    sam3_bilinear_interpolate_into(slot_logits[s].data(), mask_w, mask_h,
+                                                   dst, HIGH_RES, HIGH_RES);
+                    for (float* p = dst, *end = dst + plane; p != end; ++p) {
+                        const float sg = 1.0f / (1.0f + expf(-*p));
+                        *p = sg * sig_scale + sig_bias;
+                    }
+                } else {
+                    std::fill(dst, dst + plane, 0.0f);
+                }
+                if (slot_is_cond[s])
+                    std::fill(dst + (size_t)M * plane, dst + (size_t)(M + 1) * plane, 1.0f);
+                else // persistent scratch: clear stale cond flags from prior frames
+                    std::fill(dst + (size_t)M * plane, dst + (size_t)(M + 1) * plane, 0.0f);
+            }
+        };
+        const int nth = std::max(1, std::min(16, (int)std::thread::hardware_concurrency()));
+        std::vector<std::thread> ths;
+        for (int t = 1; t < nth; ++t)
+            ths.emplace_back(slot_worker, t * M / nth, (t + 1) * M / nth);
+        slot_worker(0, M / nth);
+        for (auto& th : ths) th.join();
+    }
+    auto t_m1 = std::chrono::high_resolution_clock::now();
+    double prof_muxed_ms = std::chrono::duration<double, std::milli>(t_m1 - t_m0).count();
+    // Resample to the mask-encoder input resolution (official interpol_size =
+    // H*16 = backbone_stride*img... note patch_size=14 makes H*16 = 1152 != 1008,
+    // so this is a real resample, not an identity). Per-channel work is
+    // independent, so the multithreaded pass is bit-identical to sequential.
+    const float* set_src = muxed.data();
+    size_t set_bytes = muxed.size() * sizeof(float);
+    if (HIGH_RES != INTERPOL) {
+        // Persistent scratch: every element is rewritten by the workers below,
+        // so only the first-frame allocation zero-fills the buffer.
+        std::vector<float>& mi = tracker.mem_interp_scratch;
+        if (mi.size() < (size_t)C_IN * INTERPOL * INTERPOL)
+            mi.resize((size_t)C_IN * INTERPOL * INTERPOL);
+        const size_t splane = (size_t)HIGH_RES * HIGH_RES;
+        const size_t dplane = (size_t)INTERPOL * INTERPOL;
+        auto interp_worker = [&](int lo, int hi) {
+            for (int c = lo; c < hi; ++c)
+                sam3_bilinear_interpolate_into(muxed.data() + (size_t)c * splane,
+                                               HIGH_RES, HIGH_RES,
+                                               mi.data() + (size_t)c * dplane,
+                                               INTERPOL, INTERPOL);
+        };
+        const int nth = std::max(1, std::min(16, (int)std::thread::hardware_concurrency()));
+        std::vector<std::thread> ths;
+        for (int t = 1; t < nth; ++t)
+            ths.emplace_back(interp_worker, t * C_IN / nth, (t + 1) * C_IN / nth);
+        interp_worker(0, C_IN / nth);
+        for (auto& th : ths) th.join();
+        set_src  = mi.data();
+        set_bytes = mi.size() * sizeof(float);
+    }
+    auto t_m2 = std::chrono::high_resolution_clock::now();
+    double prof_interp_ms = std::chrono::duration<double, std::milli>(t_m2 - t_m1).count();
+
+    const size_t bs = ggml_tensor_overhead() * 16384 + ggml_graph_overhead();
+    struct ggml_init_params gp = {bs, nullptr, true};
+
+    const bool mem_cached = (tracker.mem_ctx != nullptr) &&
+                            (tracker.mem_H == H) && (tracker.mem_C == C_IN);
+    struct ggml_context* ctx0;
+    struct ggml_gallocr* ga;
+    struct ggml_tensor *mask_in, *pix_in_raw, *mem_out;
+
+    if (mem_cached) {
+        ctx0       = tracker.mem_ctx;
+        ga         = tracker.mem_galloc;
+        mask_in    = tracker.mem_inp_mask;
+        pix_in_raw = tracker.mem_inp_pix;
+        mem_out    = tracker.mem_out;
+    } else {
+        if (tracker.mem_galloc) { ggml_gallocr_free(tracker.mem_galloc); tracker.mem_galloc = nullptr; }
+        if (tracker.mem_ctx)    { ggml_free(tracker.mem_ctx);             tracker.mem_ctx    = nullptr; }
+        tracker.mem_graph = nullptr;
+
+        ctx0 = ggml_init(gp);
+        if (!ctx0) return false;
+
+        mask_in = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, INTERPOL, INTERPOL, C_IN, 1);
+        ggml_set_name(mask_in, "mux_mem_mask");
+        ggml_set_input(mask_in);
+
+        auto* ds = mask_in;
+        for (int s = 0; s < 4; ++s) {
+            int out_ch = (int)model.mem_enc.ds_conv_w[s]->ne[3];
+            ds = ggml_conv_2d(ctx0, model.mem_enc.ds_conv_w[s], ds, 2, 2, 1, 1, 1, 1);
+            ds = ggml_add(ctx0, ds, ggml_reshape_4d(ctx0, model.mem_enc.ds_conv_b[s], 1, 1, out_ch, 1));
+            ds = ggml_cont(ctx0, ggml_permute(ctx0, ds, 1, 2, 0, 3));
+            ds = sam3_layer_norm_2d(ctx0, ds, model.mem_enc.ds_norm_w[s], model.mem_enc.ds_norm_b[s]);
+            ds = ggml_gelu(ctx0, ds);
+            ds = ggml_cont(ctx0, ggml_permute(ctx0, ds, 2, 0, 1, 3));
+        }
+        ds = ggml_conv_2d(ctx0, model.mem_enc.ds_conv_w[4], ds, 1, 1, 0, 0, 1, 1);
+        ds = ggml_add(ctx0, ds, ggml_reshape_4d(ctx0, model.mem_enc.ds_conv_b[4], 1, 1, D, 1));
+        ds = ggml_cont(ctx0, ggml_permute(ctx0, ds, 1, 2, 0, 3));
+
+        pix_in_raw = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H, H, 1);
+        ggml_set_name(pix_in_raw, "mux_mem_pix_feat");
+        ggml_set_input(pix_in_raw);
+        auto* pix_in = ggml_cont(ctx0, ggml_permute(ctx0, pix_in_raw, 2, 0, 1, 3));
+        auto* pix = ggml_conv_2d(ctx0, model.mem_enc.pix_proj_w, pix_in, 1, 1, 0, 0, 1, 1);
+        pix = ggml_add(ctx0, pix, ggml_reshape_4d(ctx0, model.mem_enc.pix_proj_b, 1, 1, D, 1));
+        pix = ggml_cont(ctx0, ggml_permute(ctx0, pix, 1, 2, 0, 3));
+
+        auto* fused = ggml_add(ctx0, pix, ds);
+        for (int i = 0; i < 2; ++i)
+            fused = sam3_cxblock_forward(ctx0, fused,
+                                         model.mem_enc.fuser_dw_w[i], model.mem_enc.fuser_dw_b[i],
+                                         model.mem_enc.fuser_norm_w[i], model.mem_enc.fuser_norm_b[i],
+                                         model.mem_enc.fuser_fc1_w[i], model.mem_enc.fuser_fc1_b[i],
+                                         model.mem_enc.fuser_fc2_w[i], model.mem_enc.fuser_fc2_b[i],
+                                         model.mem_enc.fuser_gamma[i]);
+        // SAM 3.1: out_proj is Identity (mem_dim == hidden_dim).
+        // `fused` is already token-major [MD, H, H] — keep that layout so the
+        // byte-copy into the token-major memory-slot tensor below is exact and
+        // the per-token no_obj gate indexing (i % MD) stays valid.
+        mem_out = fused;
+        ggml_set_name(mem_out, "mux_mem_out");
+        ggml_set_output(mem_out);
+
+        auto* g = ggml_new_graph_custom(ctx0, 16384, false);
+        ggml_build_forward_expand(g, mem_out);
+        sam3_graph_census("memenc", g, model.debug.census);
+        ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+        if (!ggml_gallocr_reserve(ga, g) || !ggml_gallocr_alloc_graph(ga, g)) {
+            ggml_gallocr_free(ga);
+            ggml_free(ctx0);
+            return false;
+        }
+        tracker.mem_ctx       = ctx0;
+        tracker.mem_graph     = g;
+        tracker.mem_galloc    = ga;
+        tracker.mem_H         = H;
+        tracker.mem_C         = C_IN;
+        tracker.mem_inp_mask  = mask_in;
+        tracker.mem_inp_pix   = pix_in_raw;
+        tracker.mem_out       = mem_out;
+    }
+
+    ggml_backend_tensor_set(mask_in, set_src, 0, set_bytes);
+    ggml_backend_tensor_copy(state.neck_trk[2], pix_in_raw);
+    auto t_m3 = std::chrono::high_resolution_clock::now();
+    double prof_upload_ms = std::chrono::duration<double, std::milli>(t_m3 - t_m2).count();
+    if (!sam3_graph_compute(model.backend, tracker.mem_graph, 4)) return false;
+    auto t_m4 = std::chrono::high_resolution_clock::now();
+    double prof_compute_ms = std::chrono::duration<double, std::milli>(t_m4 - t_m3).count();
+
+    // Per-slot no_obj_embed gating: Σ_s (1 - is_obj_s)·embed_s added to the map.
+    std::vector<float> gate(MD, 0.0f);
+    {
+        std::vector<float> noe((size_t)MD * M);
+        sam3_read_f32(model.no_obj_embed_spatial, noe.data(), MD * M);
+        for (int s = 0; s < M; ++s) {
+            const bool is_obj = slot_obj_logit[s] > 0.0f;
+            if (is_obj) continue;
+            for (int d = 0; d < MD; ++d) gate[d] += noe[s * MD + d];
+        }
+    }
+    const bool has_gate = [&] {
+        for (float g : gate) if (g != 0.0f) return true;
+        return false;
+    }();
+
+    if (!tracker.ctx) {
+        struct ggml_init_params tp = {ggml_tensor_overhead() * 4096, nullptr, true};
+        tracker.ctx = ggml_init(tp);
+    }
+
+    auto* st = ggml_new_tensor_4d(tracker.ctx, GGML_TYPE_F32, MD, H, H, 1);
+    auto* sb = ggml_backend_alloc_buffer(model.backend, (size_t)MD * N * sizeof(float));
+    struct ggml_tallocr ta = ggml_tallocr_new(sb);
+    ggml_tallocr_alloc(&ta, st);
+    if (has_gate) {
+        std::vector<float> md((size_t)MD * N);
+        ggml_backend_tensor_get(mem_out, md.data(), 0, md.size() * sizeof(float));
+        for (size_t i = 0; i < md.size(); ++i) md[i] += gate[i % MD];
+        ggml_backend_tensor_set(st, md.data(), 0, md.size() * sizeof(float));
+    } else {
+        ggml_backend_tensor_copy(mem_out, st);
+    }
+
+    // Raw image features for the save_image_features key stream.
+    auto* si = ggml_new_tensor_4d(tracker.ctx, GGML_TYPE_F32, D, H, H, 1);
+    auto* sib = ggml_backend_alloc_buffer(model.backend, (size_t)D * N * sizeof(float));
+    struct ggml_tallocr ta2 = ggml_tallocr_new(sib);
+    ggml_tallocr_alloc(&ta2, si);
+    ggml_backend_tensor_copy(state.neck_trk[2], si);
+
+    sam3_ensure_tracker_pe_caches(tracker, hp, H);
+    auto* spe = ggml_new_tensor_4d(tracker.ctx, GGML_TYPE_F32, MD, H, H, 1);
+    auto* speb = ggml_backend_alloc_buffer(model.backend, (size_t)MD * N * sizeof(float));
+    struct ggml_tallocr ta3 = ggml_tallocr_new(speb);
+    ggml_tallocr_alloc(&ta3, spe);
+    ggml_backend_tensor_set(spe, tracker.cached_sinpe_64.data(), 0,
+                            tracker.cached_sinpe_64.size() * sizeof(float));
+
+    sam3_memory_slot slot;
+    slot.spatial_feats = st;
+    slot.spatial_pe = spe;
+    slot.image_feats = si;
+    slot.bufs[0] = sb;
+    slot.bufs[1] = sib;
+    slot.bufs[2] = speb;
+    slot.frame_index = frame_idx;
+    slot.is_cond_frame = is_cond_frame;
+    auto& bk = tracker.mem_banks[bucket_id];
+    // Official cond_frame_outputs / non_cond_frame_outputs are dicts keyed by
+    // frame index: re-encoding the same frame (e.g. a second add_prompt on the
+    // seed frame with a fresh conditioning_objects set) REPLACES the previous
+    // entry instead of appending a duplicate slot.
+    bool replaced = false;
+    for (auto& s : bk)
+        if (s.frame_index == frame_idx && s.is_cond_frame == is_cond_frame) {
+            sam3_memory_slot_release(s);
+            s = slot;
+            replaced = true;
+            break;
+        }
+    if (!replaced) bk.push_back(slot);
+    while ((int)bk.size() > hp.num_maskmem) {
+        bool removed = false;
+        for (auto it = bk.begin(); it != bk.end(); ++it)
+            if (!it->is_cond_frame) { sam3_memory_slot_release(*it); bk.erase(it); removed = true; break; }
+        if (!removed) { sam3_memory_slot_release(bk[1]); bk.erase(bk.begin() + 1); }
+    }
+    auto t_m5 = std::chrono::high_resolution_clock::now();
+    if (s_prof)
+        fprintf(stderr, "  mux_memenc: muxed %.1f, interp %.1f, upload %.1f, "
+                "compute %.1f, store %.1f ms\n",
+                prof_muxed_ms, prof_interp_ms, prof_upload_ms, prof_compute_ms,
+                std::chrono::duration<double, std::milli>(t_m5 - t_m4).count());
+    return true;
+}
+
+// Ordered active instances (masklets + pending, ascending id) — index in this
+// list is the instance's multiplex slot; bucket = index / multiplex_count.
+static std::vector<sam3_masklet*> sam3_mux_slot_order(sam3_tracker& tracker) {
+    std::vector<sam3_masklet*> order;
+    for (auto& ml : tracker.masklets) order.push_back(&ml);
+    for (auto& ml : tracker.pending) order.push_back(&ml);
+    std::stable_sort(order.begin(), order.end(),
+                     [](const sam3_masklet* a, const sam3_masklet* b) {
+                         return a->instance_id < b->instance_id;
+                     });
+    return order;
+}
+
+// ── Parity dump (numeric alignment vs official PyTorch) ─────────────────
+// Enabled by sam3_params::debug.parity_dump_dir. Writes named graph tensors
+// (F16/F32 → f32 files) after each bucket pass so the comparison tool can
+// pair them with the official dumps frame by frame.
+static void sam3_parity_dump_graph(const sam3_model& model,
+                                   struct ggml_cgraph* graph,
+                                   const char* const* names, int n_names,
+                                   const char* frame_tag) {
+    if (model.debug.parity_dump_dir.empty() || !graph) return;
+    for (int i = 0; i < n_names; ++i) {
+        struct ggml_tensor* t = ggml_graph_get_tensor(graph, names[i]);
+        if (!t) { fprintf(stderr, "PARITY: %s not found in graph\n", names[i]); continue; }
+        const int64_t n = ggml_nelements(t);
+        std::vector<float> buf(n);
+        if (t->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_get(t, buf.data(), 0, n * sizeof(float));
+        } else if (t->type == GGML_TYPE_F16) {
+            std::vector<ggml_fp16_t> h(n);
+            ggml_backend_tensor_get(t, h.data(), 0, n * sizeof(ggml_fp16_t));
+            ggml_fp16_to_fp32_row(h.data(), buf.data(), (int)n);
+        } else {
+            fprintf(stderr, "PARITY: %s unsupported type %d\n", names[i], (int)t->type);
+            continue;
+        }
+        char path[600];
+        snprintf(path, sizeof(path), "%s/cpp_%s_%s.f32",
+                 model.debug.parity_dump_dir.c_str(), names[i], frame_tag);
+        FILE* f = fopen(path, "wb");
+        if (f) { fwrite(buf.data(), 4, n, f); fclose(f); }
+    }
+}
+
+static void sam3_parity_dump_host(const sam3_model& model, const char* name,
+                                  const char* frame_tag, const float* data, size_t n) {
+    if (model.debug.parity_dump_dir.empty()) return;
+    char path[600];
+    snprintf(path, sizeof(path), "%s/cpp_%s_%s.f32",
+             model.debug.parity_dump_dir.c_str(), name, frame_tag);
+    FILE* f = fopen(path, "wb");
+    if (f) { fwrite(data, 4, n, f); fclose(f); }
+}
+
+static void sam3_parity_dump_tensor(const sam3_model& model,
+                                    struct ggml_tensor* t, const char* name) {
+    if (model.debug.parity_dump_dir.empty() || !t) return;
+    const int64_t n = ggml_nelements(t);
+    std::vector<float> buf(n);
+    if (t->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(t, buf.data(), 0, n * sizeof(float));
+    } else if (t->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> h(n);
+        ggml_backend_tensor_get(t, h.data(), 0, n * sizeof(ggml_fp16_t));
+        ggml_fp16_to_fp32_row(h.data(), buf.data(), (int)n);
+    } else {
+        return;
+    }
+    char path[600];
+    snprintf(path, sizeof(path), "%s/cpp_%s.f32", model.debug.parity_dump_dir.c_str(), name);
+    FILE* f = fopen(path, "wb");
+    if (f) { fwrite(buf.data(), 4, n, f); fclose(f); }
+}
+
+// SAM 3.1 bucket-space propagation: one memory-attention + one 80-token
+// joint decode for all slots of the bucket. outs[k] corresponds to
+// slots[k] (empty for invalid slots and mux padding).
+static std::vector<sam3_prop_output> sam3_propagate_bucket(
+    sam3_tracker& tracker, sam3_state& state, const sam3_model& model,
+    int bucket_id, const std::vector<sam3_masklet*>& slots,
+    int frame_idx, bool reverse) {
+    const auto& hp = model.hparams;
+    const int D = hp.neck_dim, MD = hp.mem_out_dim;
+    const int M = hp.multiplex_count;
+    const int H = sam3_eff_feat_size(state, hp);
+    const int N = H * H;
+    std::vector<sam3_prop_output> outs(M);
+
+    const auto& mem_bank = tracker.mem_banks[bucket_id];
+    const auto& ptr_bank = tracker.ptr_banks[bucket_id];
+    if (mem_bank.empty()) return outs;
+
+    // Stage profiling (SAM3_PROFILE_PROP=1): readback / prompt / upload /
+    // compute / post — identifies where the per-frame bucket time goes.
+    const bool s_prof = model.debug.profile_prop;
+    using clk = std::chrono::steady_clock;
+    const auto prof_t0 = clk::now();
+    double prof_read = 0, prof_prompt = 0, prof_upload = 0, prof_compute = 0;
+    auto prof_split = [&](double& acc, const auto& prev) {
+        const double dt = std::chrono::duration<double, std::milli>(clk::now() - prev).count();
+        acc += dt;
+        return clk::now();
+    };
+
+    // ── Memory slot selection (SAM3 flow; memory selection is off in 3.1) ─
+    std::vector<int> cond_idx, nc_idx;
+    for (int i = 0; i < (int)mem_bank.size(); ++i)
+        (mem_bank[i].is_cond_frame ? cond_idx : nc_idx).push_back(i);
+    auto side_dist = [&](int slot) {
+        return reverse ? mem_bank[slot].frame_index - frame_idx
+                       : frame_idx - mem_bank[slot].frame_index;
+    };
+    std::vector<int> sel;
+    {
+        std::vector<int> cond_frames;
+        for (int i : cond_idx) cond_frames.push_back(mem_bank[i].frame_index);
+        for (int t : sam3_select_closest_cond(cond_frames, frame_idx,
+                                              hp.max_cond_frames_in_attn))
+            for (int i : cond_idx)
+                if (mem_bank[i].frame_index == t) { sel.push_back(i); break; }
+    }
+    const int n_cond = (int)sel.size();
+    std::vector<int> nc;
+    for (int i : nc_idx)
+        if (side_dist(i) >= 0) nc.push_back(i);
+    std::stable_sort(nc.begin(), nc.end(),
+                     [&](int a, int b) { return side_dist(a) > side_dist(b); });
+    sel.insert(sel.end(), nc.begin(), nc.end());
+    if (sel.empty()) return outs;
+
+    const int n_sel = (int)sel.size();
+    const int L = n_sel - n_cond;
+    std::vector<int> spatial_tpos(n_sel, 1);
+    sam3_ensure_tracker_pe_caches(tracker, hp, H);
+    for (int s = 0; s < n_sel; ++s) {
+        // Official 3.1 mux: conditioning frames use the signed frame distance
+        // as t_pos (video_tracking_multiplex.py: (frame_idx - t)*tpos_sign_mul),
+        // not 0 as in SAM2. t_pos <= 0 or >= num_maskmem folds onto the
+        // out-of-range row (maskmem_tpos_enc[num_maskmem-1] = t_pos 0 here).
+        spatial_tpos[s] = (s < n_cond)
+            ? [&]() {
+                  int tp = side_dist(sel[s]);
+                  return (tp <= 0 || tp >= hp.num_maskmem) ? 0 : tp;
+              }()
+            : (hp.num_maskmem - L + (s - n_cond));
+    }
+
+    // ── Object pointers: M muxed pointers per selected frame ─────────────
+    std::vector<const sam3_ptr_slot*> sel_ptrs;
+    {
+        auto pick = [&](int t, bool cond) -> const sam3_ptr_slot* {
+            const sam3_ptr_slot* best = nullptr;
+            for (const auto& s : ptr_bank)
+                if (s.frame_index == t && s.is_cond == cond) best = &s;
+            return best;
+        };
+        std::vector<int> cond_frames;
+        for (const auto& s : ptr_bank)
+            if (s.is_cond) cond_frames.push_back(s.frame_index);
+        for (int t : sam3_select_closest_cond(cond_frames, frame_idx,
+                                              hp.max_cond_frames_in_attn)) {
+            const sam3_ptr_slot* s = pick(t, true);
+            if (s) sel_ptrs.push_back(s);
+        }
+        std::vector<const sam3_ptr_slot*> cand;
+        for (const auto& s : ptr_bank) {
+            const int dist = reverse ? s.frame_index - frame_idx
+                                     : frame_idx - s.frame_index;
+            if (!s.is_cond && dist >= 1 && dist < hp.max_obj_ptrs)
+                cand.push_back(&s);
+        }
+        std::stable_sort(cand.begin(), cand.end(),
+                         [&](const sam3_ptr_slot* a, const sam3_ptr_slot* b) {
+                             const int da = reverse ? a->frame_index - frame_idx
+                                                    : frame_idx - a->frame_index;
+                             const int db = reverse ? b->frame_index - frame_idx
+                                                    : frame_idx - b->frame_index;
+                             return da < db;
+                         });
+        sel_ptrs.insert(sel_ptrs.end(), cand.begin(), cand.end());
+    }
+    const int P = (int)sel_ptrs.size();
+    std::vector<std::vector<float>> obj_ptrs;
+    std::vector<int> ptr_tpos;
+    obj_ptrs.reserve((size_t)P * M);
+    ptr_tpos.reserve((size_t)P * M);
+    for (int p = 0; p < P; ++p) {
+        std::vector<float> data((size_t)D * M);
+        ggml_backend_tensor_get(sel_ptrs[p]->ptr, data.data(), 0, (size_t)D * M * sizeof(float));
+        for (int k = 0; k < M; ++k) {
+            obj_ptrs.emplace_back(data.begin() + (size_t)k * D,
+                                  data.begin() + (size_t)(k + 1) * D);
+            ptr_tpos.push_back(std::abs(frame_idx - sel_ptrs[p]->frame_index));
+        }
+    }
+    auto prof_mark = prof_split(prof_read, prof_t0);
+
+    int t_diff_max = hp.max_obj_ptrs - 1;
+    if (tracker.total_frames > 0)
+        t_diff_max = std::min(tracker.total_frames, hp.max_obj_ptrs) - 1;
+
+    if (!tracker.mem_w_cache_valid) {
+        tracker.mem_tpos_enc.assign((size_t)MD * hp.num_maskmem, 0.0f);
+        if (model.mem_enc.tpos[0])
+            sam3_read_f32(model.mem_enc.tpos[0], tracker.mem_tpos_enc.data(), MD * hp.num_maskmem);
+        tracker.mem_ptr_tpos_w.assign((size_t)D * MD, 0.0f);
+        tracker.mem_ptr_tpos_b.assign((size_t)MD, 0.0f);
+        if (model.obj_ptr_tpos_w) {
+            sam3_read_f32(model.obj_ptr_tpos_w, tracker.mem_ptr_tpos_w.data(), D * MD);
+            sam3_read_f32(model.obj_ptr_tpos_b, tracker.mem_ptr_tpos_b.data(), MD);
+        }
+        tracker.mem_w_cache_valid = true;
+    }
+
+    // Pointer tokens only: the spatial key streams are assembled device-side
+    // below (D2D from the slot tensors + the per-enc_idx PE cache), so the
+    // builder runs with empty slot data. Its spatial-PE branch would be dead
+    // work here — the muxed graph takes positions from prompt_img_pos_t only.
+    auto pd = sam3_build_prompt_and_pos(model, {}, {}, spatial_tpos,
+                                        obj_ptrs, ptr_tpos, H,
+                                        &tracker.mem_tpos_enc, &tracker.mem_ptr_tpos_w,
+                                        &tracker.mem_ptr_tpos_b, t_diff_max);
+    const int ms = n_sel * N;                  // spatial tokens per stream
+    const int mt = ms + pd.num_obj_ptr_tokens; // M_total
+
+    // ── Per-enc_idx PE+tpos rows (computed once, device-resident) ──────────
+    // Bit-identical to the previous per-frame CPU loop: each row is the spatial
+    // PE plus exactly one tpos_all row broadcast over tokens.
+    if (!tracker.pe_tpos_cache_valid || tracker.pe_tpos_cache_n != hp.num_maskmem ||
+        tracker.cached_sinpe_256.size() != (size_t)MD * N) {
+        if (tracker.pe_tpos_buf) { ggml_backend_buffer_free(tracker.pe_tpos_buf); tracker.pe_tpos_buf = nullptr; }
+        tracker.pe_tpos_rows.clear();
+        if (!tracker.ctx) {
+            struct ggml_init_params tp = {ggml_tensor_overhead() * 128, nullptr, true};
+            tracker.ctx = ggml_init(tp);
+        }
+        tracker.pe_tpos_buf = ggml_backend_alloc_buffer(
+            model.backend, (size_t)hp.num_maskmem * MD * N * sizeof(float));
+        struct ggml_tallocr ta = ggml_tallocr_new(tracker.pe_tpos_buf);
+        std::vector<float> tpos_all((size_t)MD * hp.num_maskmem);
+        std::copy(tracker.mem_tpos_enc.begin(),
+                  tracker.mem_tpos_enc.begin() + MD * hp.num_maskmem, tpos_all.begin());
+        tracker.pe_tpos_rows.resize(hp.num_maskmem);
+        for (int e = 0; e < hp.num_maskmem; ++e) {
+            std::vector<float> pos = tracker.cached_sinpe_256;
+            for (int n = 0; n < N; ++n)
+                for (int d = 0; d < MD; ++d)
+                    pos[d + n * MD] += tpos_all[d + e * MD];
+            auto* t = ggml_new_tensor_4d(tracker.ctx, GGML_TYPE_F32, MD, H, H, 1);
+            ggml_tallocr_alloc(&ta, t);
+            ggml_backend_tensor_set(t, pos.data(), 0, pos.size() * sizeof(float));
+            tracker.pe_tpos_rows[e] = t;
+        }
+        tracker.pe_tpos_cache_n = hp.num_maskmem;
+        tracker.pe_tpos_cache_valid = true;
+    }
+    prof_mark = prof_split(prof_prompt, prof_mark);
+
+    // ── Graph (cached on M_total) ─────────────────────────────────────────
+    const bool graph_cached = (tracker.prop_ctx != nullptr) &&
+                              (tracker.prop_M_total == mt);
+    struct ggml_context* ctx0;
+    struct ggml_cgraph* graph;
+    struct ggml_gallocr* galloc;
+    struct ggml_tensor *curr, *src_pos_t, *prompt_t, *prompt_img_t,
+        *prompt_img_pos_t, *rope_q_t, *rope_k_t = nullptr, *image_pe, *extra_t,
+        *trk_s0, *trk_s1, *conditioned = nullptr;
+    sam3_dec_mux_result dec;
+
+    if (graph_cached) {
+        ctx0 = tracker.prop_ctx; graph = tracker.prop_graph; galloc = tracker.prop_galloc;
+        curr = tracker.prop_inp_curr; src_pos_t = tracker.prop_inp_src_pos;
+        prompt_t = tracker.prop_inp_prompt;
+        prompt_img_t = tracker.mux_inp_prompt_img; prompt_img_pos_t = tracker.mux_inp_prompt_ipos;
+        rope_q_t = tracker.prop_inp_rope_q; rope_k_t = tracker.prop_inp_rope_k;
+        image_pe = tracker.mux_inp_image_pe; extra_t = tracker.mux_inp_extra;
+        trk_s0 = tracker.prop_inp_trk_s0; trk_s1 = tracker.prop_inp_trk_s1;
+        dec.masks = tracker.mux_out_masks; dec.iou_pred = tracker.mux_out_iou;
+        dec.obj_score = tracker.mux_out_obj; dec.mask_tokens_out = tracker.mux_out_mask_toks;
+    } else {
+        if (tracker.prop_galloc) { ggml_gallocr_free(tracker.prop_galloc); tracker.prop_galloc = nullptr; }
+        if (tracker.prop_ctx)    { ggml_free(tracker.prop_ctx);             tracker.prop_ctx    = nullptr; }
+        tracker.prop_graph = nullptr;
+
+        const size_t buf_size = ggml_tensor_overhead() * 32768 + ggml_graph_overhead() * 2;
+        struct ggml_init_params gparams = {buf_size, nullptr, true};
+        ctx0 = ggml_init(gparams);
+        if (!ctx0) return outs;
+
+        curr = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, N, 1);
+        ggml_set_name(curr, "mux_prop_curr"); ggml_set_input(curr);
+        src_pos_t = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, N, 1);
+        ggml_set_name(src_pos_t, "mux_src_pos"); ggml_set_input(src_pos_t);
+        prompt_t = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, MD, mt, 1);
+        ggml_set_name(prompt_t, "mux_prompt"); ggml_set_input(prompt_t);
+        prompt_img_t = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, MD, mt, 1);
+        ggml_set_name(prompt_img_t, "mux_prompt_img"); ggml_set_input(prompt_img_t);
+        prompt_img_pos_t = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, MD, mt, 1);
+        ggml_set_name(prompt_img_pos_t, "mux_prompt_img_pos"); ggml_set_input(prompt_img_pos_t);
+        rope_q_t = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 2, D / 2, N);
+        ggml_set_name(rope_q_t, "mux_rope_q"); ggml_set_input(rope_q_t);
+        if (ms > 0) {
+            rope_k_t = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 2, D / 2, ms);
+            ggml_set_name(rope_k_t, "mux_rope_k"); ggml_set_input(rope_k_t);
+        }
+        image_pe = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H, H, 1);
+        ggml_set_name(image_pe, "mux_dec_pe"); ggml_set_input(image_pe);
+        extra_t = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D, M, 1);
+        ggml_set_name(extra_t, "mux_extra_embed"); ggml_set_input(extra_t);
+        trk_s0 = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H * 4, H * 4, 1);
+        ggml_set_name(trk_s0, "mux_trk_s0"); ggml_set_input(trk_s0);
+        trk_s1 = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, D, H * 2, H * 2, 1);
+        ggml_set_name(trk_s1, "mux_trk_s1"); ggml_set_input(trk_s1);
+
+        conditioned = sam3_build_mem_attn_graph_mux(
+            ctx0, model, curr, src_pos_t, prompt_t, prompt_img_t, prompt_img_pos_t,
+            rope_q_t, rope_k_t, pd.num_obj_ptr_tokens);
+        auto* cond_spatial = ggml_reshape_4d(ctx0, conditioned, D, H, H, 1);
+        dec = sam3_build_sam_dec_graph_mux(ctx0, model, cond_spatial, image_pe,
+                                           trk_s0, trk_s1, extra_t, H);
+        ggml_set_output(dec.masks);
+        ggml_set_output(dec.iou_pred);
+        ggml_set_output(dec.obj_score);
+        ggml_set_output(dec.mask_tokens_out);
+        ggml_set_output(conditioned);
+
+        graph = ggml_new_graph_custom(ctx0, 32768, false);
+        ggml_build_forward_expand(graph, dec.masks);
+        ggml_build_forward_expand(graph, dec.iou_pred);
+        ggml_build_forward_expand(graph, dec.obj_score);
+        ggml_build_forward_expand(graph, dec.mask_tokens_out);
+        ggml_build_forward_expand(graph, conditioned);
+        sam3_graph_census("prop(mem_attn+dec)", graph, model.debug.census);
+
+        // Parity dumps read tensors after the whole graph finishes, but the
+        // allocator reuses buffers of early-lifetime nodes. Mark every dumped
+        // tensor as an output so its storage is preserved until graph end.
+        if (!model.debug.parity_dump_dir.empty()) {
+            for (const char* n : {"mux_prompt", "mux_prompt_img", "mux_prompt_img_pos",
+                                   "mux_prop_curr", "mux_src_pos", "mux_dec_pe",
+                                   "mux_extra_embed", "mux_trk_s0", "mux_trk_s1",
+                                   "mux_mem_attn_input", "mux_mem_attn_output",
+                                   "mux_dec_tokens_initial", "mux_dec_final_queries",
+                                   "mux_dec_mask_tokens_out", "mux_dec_upscaled"}) {
+                auto* t = ggml_graph_get_tensor(graph, n);
+                if (t) ggml_set_output(t);
+            }
+        }
+
+        galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+        if (!ggml_gallocr_reserve(galloc, graph) || !ggml_gallocr_alloc_graph(galloc, graph)) {
+            fprintf(stderr, "%s: graph pool reserve/alloc FAILED (M_total=%d) — "
+                    "likely backend memory pressure; skipping this bucket pass\n",
+                    __func__, mt);
+            ggml_gallocr_free(galloc);
+            ggml_free(ctx0);
+            return outs;
+        }
+        tracker.prop_ctx = ctx0; tracker.prop_graph = graph; tracker.prop_galloc = galloc;
+        tracker.prop_M_total = mt;
+        tracker.prop_inp_curr = curr; tracker.prop_inp_src_pos = src_pos_t;
+        tracker.prop_inp_prompt = prompt_t;
+        tracker.mux_inp_prompt_img = prompt_img_t; tracker.mux_inp_prompt_ipos = prompt_img_pos_t;
+        tracker.prop_inp_rope_q = rope_q_t; tracker.prop_inp_rope_k = rope_k_t;
+        tracker.mux_inp_image_pe = image_pe; tracker.mux_inp_extra = extra_t;
+        tracker.prop_inp_trk_s0 = trk_s0; tracker.prop_inp_trk_s1 = trk_s1;
+        tracker.mux_out_masks = dec.masks; tracker.mux_out_iou = dec.iou_pred;
+        tracker.mux_out_obj = dec.obj_score; tracker.mux_out_mask_toks = dec.mask_tokens_out;
+        tracker.prop_consts_uploaded = false;
+    }
+
+    // Upload frame-dependent data. The memory / image key streams are assembled
+    // device-side: D2D copies from the slot tensors and the per-enc_idx PE
+    // cache replace the previous download → CPU rebuild → re-upload of ~130 MB
+    // per frame. Only the small pointer-token tail still comes from the host.
+    {
+        // Scratch context for the per-frame view descriptors (views inherit the
+        // parent buffer via ggml_backend_view_init, so the copies stay D2D).
+        struct ggml_init_params vparams = {ggml_tensor_overhead() * 128, nullptr, true};
+        struct ggml_context* vctx = ggml_init(vparams);
+        if (!vctx) return outs;
+        const size_t view_bytes_1 = MD * sizeof(float);
+        const size_t view_bytes_2 = (size_t)MD * H * sizeof(float);
+        const size_t view_bytes_3 = (size_t)MD * H * H * sizeof(float);
+        for (int s = 0; s < n_sel; ++s) {
+            const size_t off = (size_t)s * N * MD * sizeof(float);
+            auto* mem_v = ggml_view_4d(vctx, prompt_t, MD, H, H, 1,
+                                       view_bytes_1, view_bytes_2, view_bytes_3, off);
+            ggml_backend_view_init(mem_v);
+            ggml_backend_tensor_copy(mem_bank[sel[s]].spatial_feats, mem_v);
+            auto* img_v = ggml_view_4d(vctx, prompt_img_t, MD, H, H, 1,
+                                       view_bytes_1, view_bytes_2, view_bytes_3, off);
+            ggml_backend_view_init(img_v);
+            ggml_backend_tensor_copy(mem_bank[sel[s]].image_feats, img_v);
+            const int enc_idx = hp.num_maskmem - spatial_tpos[s] - 1;
+            auto* pos_v = ggml_view_4d(vctx, prompt_img_pos_t, MD, H, H, 1,
+                                       view_bytes_1, view_bytes_2, view_bytes_3, off);
+            ggml_backend_view_init(pos_v);
+            ggml_backend_tensor_copy(tracker.pe_tpos_rows[enc_idx], pos_v);
+        }
+        ggml_free(vctx);
+    }
+    // Pointer-token tail: pointer values, zero features, projected positions.
+    if (pd.num_obj_ptr_tokens > 0) {
+        const size_t tail_off = (size_t)ms * MD * sizeof(float);
+        ggml_backend_tensor_set(prompt_t, pd.prompt.data(), tail_off,
+                                pd.prompt.size() * sizeof(float));
+        std::vector<float> zeros((size_t)pd.num_obj_ptr_tokens * MD, 0.0f);
+        ggml_backend_tensor_set(prompt_img_t, zeros.data(), tail_off, zeros.size() * sizeof(float));
+        ggml_backend_tensor_set(prompt_img_pos_t, pd.prompt_pos.data(), tail_off,
+                                pd.prompt_pos.size() * sizeof(float));
+    }
+
+    if (!tracker.prop_consts_uploaded) {
+        const auto& rq = tracker.cached_axial_cis_reord;
+        ggml_backend_tensor_set(rope_q_t, rq.data(), 0, rq.size() * sizeof(float));
+        if (rope_k_t) {
+            std::vector<float> rope_k_data((size_t)2 * (D / 2) * ms);
+            for (int s = 0; s < ms / N; ++s)
+                memcpy(rope_k_data.data() + (size_t)s * D * N, rq.data(), (size_t)D * N * sizeof(float));
+            ggml_backend_tensor_set(rope_k_t, rope_k_data.data(), 0, rope_k_data.size() * sizeof(float));
+        }
+        ggml_backend_tensor_set(src_pos_t, tracker.cached_sinpe_256.data(), 0,
+                                tracker.cached_sinpe_256.size() * sizeof(float));
+        tracker.prop_consts_uploaded = true;
+    }
+
+    // Per-frame: extra embeds, decoder PE, feature copies.
+    {
+        sam3_ensure_mux_pe_caches(state, model);
+        ggml_backend_tensor_set(image_pe, state.prop_dense_pe_cache.data(), 0,
+                                state.prop_dense_pe_cache.size() * sizeof(float));
+        std::vector<float> extra((size_t)D * M, 0.0f);
+        if (model.out_valid_embed && model.out_invalid_embed) {
+            std::vector<float> ve((size_t)D * M), ie((size_t)D * M);
+            sam3_read_f32(model.out_valid_embed, ve.data(), D * M);
+            sam3_read_f32(model.out_invalid_embed, ie.data(), D * M);
+            for (int s = 0; s < M; ++s) {
+                const bool valid = s < (int)slots.size() && slots[s] != nullptr;
+                const float* srcp = valid ? ve.data() + (size_t)s * D : ie.data() + (size_t)s * D;
+                std::copy(srcp, srcp + D, extra.begin() + (size_t)s * D);
+            }
+        }
+        ggml_backend_tensor_set(extra_t, extra.data(), 0, extra.size() * sizeof(float));
+        auto* curr_4d = ggml_reshape_4d(ctx0, curr,
+                                        state.neck_trk[2]->ne[0], state.neck_trk[2]->ne[1],
+                                        state.neck_trk[2]->ne[2], state.neck_trk[2]->ne[3]);
+        ggml_backend_view_init(curr_4d);
+        ggml_backend_tensor_copy(state.neck_trk[2], curr_4d);
+        ggml_backend_tensor_copy(state.neck_trk[0], trk_s0);
+        ggml_backend_tensor_copy(state.neck_trk[1], trk_s1);
+    }
+    prof_mark = prof_split(prof_upload, prof_mark);
+
+    if (!sam3_graph_compute(model.backend, graph, 4)) return outs;
+    prof_mark = prof_split(prof_compute, prof_mark);
+
+    // ── Post-process per slot ─────────────────────────────────────────────
+    const int mhw = H * 4;
+    const int n_out = 3;
+    std::vector<float> masks((size_t)mhw * mhw * M * n_out);
+    ggml_backend_tensor_get(dec.masks, masks.data(), 0, masks.size() * sizeof(float));
+    std::vector<float> ious((size_t)M * n_out);
+    ggml_backend_tensor_get(dec.iou_pred, ious.data(), 0, ious.size() * sizeof(float));
+    std::vector<float> objl(M);
+    ggml_backend_tensor_get(dec.obj_score, objl.data(), 0, M * sizeof(float));
+    std::vector<float> toks((size_t)D * M * n_out);
+    ggml_backend_tensor_get(dec.mask_tokens_out, toks.data(), 0, toks.size() * sizeof(float));
+
+    for (int s = 0; s < M; ++s) {
+        if (s >= (int)slots.size() || slots[s] == nullptr) continue;
+        int best = 0;
+        float best_iou = ious[s * n_out + 0];
+        for (int m = 1; m < n_out; ++m) {
+            if (ious[s * n_out + m] > best_iou) { best_iou = ious[s * n_out + m]; best = m; }
+        }
+        auto& o = outs[s];
+        o.n_masks = 1; o.mask_h = mhw; o.mask_w = mhw;
+        o.mask_logits.resize((size_t)mhw * mhw);
+        if (objl[s] > 0.0f) {
+            // Graph mask column order is out-major: block index = m * M + s
+            // (the per-output [H4², M] results are concatenated along dim 1).
+            const size_t blk = (size_t)best * M + s;
+            std::copy(masks.begin() + blk * mhw * mhw,
+                      masks.begin() + (blk + 1) * mhw * mhw,
+                      o.mask_logits.begin());
+        } else {
+            // NO_OBJ_SCORE (-1024, video_tracking_multiplex.py:48): the official
+            // replaces absent slots' mask logits with this constant. The exact
+            // value matters — sigmoid(-1024) is exactly 0 in the memory-encoder
+            // mask channel, while -10 would leak sigmoid(-10)≈4.5e-5 residue.
+            std::fill(o.mask_logits.begin(), o.mask_logits.end(), -1024.0f);
+        }
+        o.iou_scores.assign(1, best_iou);
+        o.obj_score = objl[s];
+        o.sam_token.assign(toks.begin() + (size_t)(s * n_out + best) * D,
+                           toks.begin() + (size_t)(s * n_out + best + 1) * D);
+    }
+    if (s_prof) {
+        const double post_ms =
+            std::chrono::duration<double, std::milli>(clk::now() - prof_mark).count();
+        fprintf(stderr,
+                "mux_prof: bucket n_sel=%d P=%d M_total=%d %s | read %.1f prompt %.1f "
+                "upload %.1f compute %.1f post %.1f ms\n",
+                n_sel, P, mt, graph_cached ? "cached" : "BUILT",
+                prof_read, prof_prompt, prof_upload, prof_compute, post_ms);
+    }
+    return outs;
+}
+
+// One frame of 3.1 bucket-space tracking: propagate every active instance
+// through its bucket, update masklet state, and (optionally) encode the
+// bucket memory + muxed pointers. po[instance_id] receives the outputs.
+static void sam3_mux_track_instances(
+    sam3_tracker& tracker, sam3_state& state, const sam3_model& model,
+    int frame_idx, bool reverse, bool encode_mem,
+    std::map<int, sam3_prop_output>& po) {
+    const auto& hp = model.hparams;
+    const int M = hp.multiplex_count;
+    const int D = hp.neck_dim;
+    auto order = sam3_mux_slot_order(tracker);
+    if (order.empty()) return;
+    const int n_buckets = (int)((order.size() + M - 1) / M);
+    const int mhw = sam3_eff_feat_size(state, hp) * 4;
+
+    for (int b = 0; b < n_buckets; ++b) {
+        std::vector<sam3_masklet*> slots;
+        for (int s = 0; s < M; ++s) {
+            const int idx = b * M + s;
+            slots.push_back(idx < (int)order.size() ? order[idx] : nullptr);
+        }
+        fprintf(stderr, "%s: bucket %d propagate begin\n", __func__, b);
+        const bool s_prof = model.debug.profile_prop;
+        using clk = std::chrono::steady_clock;
+        const auto prof_b0 = clk::now();
+        auto outs = sam3_propagate_bucket(tracker, state, model, b, slots,
+                                          frame_idx, reverse);
+        const double prof_bucket_ms =
+            std::chrono::duration<double, std::milli>(clk::now() - prof_b0).count();
+        auto prof_m = clk::now();
+        fprintf(stderr, "%s: bucket %d propagate done\n", __func__, b);
+
+        std::vector<float> slot_logits[M];
+        float slot_obj[M]; bool slot_cond[M];
+        std::vector<float> muxed((size_t)D * M, 0.0f);
+        for (int s = 0; s < M; ++s) { slot_obj[s] = 0.0f; slot_cond[s] = false; }
+
+        for (int s = 0; s < M; ++s) {
+            sam3_masklet* ml = slots[s];
+            if (!ml) continue;
+            auto& o = outs[s];
+            if (o.mask_logits.empty()) continue;
+            po[ml->instance_id] = o;
+            // Keep each instance's last prediction available for a later
+            // add_prompt's seed-memory re-encode (sam3_store_masklet_logits).
+            if ((int)o.mask_logits.size() == mhw * mhw) {
+                sam3_store_masklet_logits(tracker, model, *ml,
+                                          o.mask_logits.data(), mhw);
+                ml->last_obj_logit = o.obj_score;
+            }
+            auto rs = sam3_bilinear_interpolate(o.mask_logits.data(), o.mask_w, o.mask_h,
+                                                state.orig_width, state.orig_height);
+            int fg = 0;
+            for (float v : rs) if (v > 0.0f) fg++;
+            float cov = (float)fg / (state.orig_width * state.orig_height);
+            ml->last_score = o.iou_scores[0];
+            ml->last_seen = frame_idx;
+            ml->mds_sum += (cov > 0.001f && o.obj_score > 0.0f) ? 1 : -1;
+
+            if (encode_mem) {
+                slot_logits[s] = o.mask_logits;
+                slot_obj[s] = o.obj_score;
+                std::vector<float> op(D);
+                sam3_extract_obj_ptr_mux(model, o.sam_token.data(), o.obj_score, op.data());
+                std::copy(op.begin(), op.end(), muxed.begin() + (size_t)s * D);
+            }
+        }
+        // Poisoned-memory guard: if the bucket pass produced no outputs at all
+        // (e.g. graph pool allocation failure), encoding all-padding masks
+        // here would write a garbage frame into the memory window and poison
+        // re-acquisition for every following frame.  Skip the frame entirely
+        // instead — the official never writes memory for a frame it did not
+        // successfully decode.
+        bool any_output = false;
+        for (int s = 0; s < M; ++s)
+            if (slots[s] && !outs[s].mask_logits.empty()) { any_output = true; break; }
+        if (encode_mem && !any_output) {
+            fprintf(stderr, "%s: bucket %d has no decoded outputs — skipping "
+                    "memory/pointer update for frame %d\n", __func__, b, frame_idx);
+            continue;
+        }
+        if (encode_mem) {
+            sam3_encode_memory_mux(tracker, state, model, b, slot_logits,
+                                   mhw, mhw, slot_obj, slot_cond, frame_idx, false);
+            sam3_store_obj_ptr_mux(tracker, model, b, muxed.data(), frame_idx, false);
+        }
+        if (!model.debug.parity_dump_dir.empty() && b == 0) {
+            char ftag[16];
+            snprintf(ftag, sizeof(ftag), "f%d", frame_idx);
+            if (tracker.prop_graph) {
+                static const char* const kNames[] = {
+                    "mux_prompt", "mux_prompt_img", "mux_prompt_img_pos",
+                    "mux_prop_curr", "mux_src_pos", "mux_dec_pe",
+                    "mux_extra_embed", "mux_trk_s0", "mux_trk_s1",
+                    "mux_mem_attn_input", "mux_mem_attn_output",
+                    "mux_dec_tokens_initial", "mux_dec_final_queries",
+                    "mux_dec_mask_tokens_out", "mux_dec_upscaled",
+                    "mux_dec_masks", "mux_dec_iou", "mux_dec_obj_score",
+                };
+                sam3_parity_dump_graph(model, tracker.prop_graph, kNames, 18, ftag);
+            }
+            if (encode_mem) {
+                if (tracker.mem_graph)
+                    sam3_parity_dump_graph(model, tracker.mem_graph,
+                                           (const char* const[]){"mux_mem_out"}, 1, ftag);
+                sam3_parity_dump_host(model, "ptr", ftag, muxed.data(), M * D);
+            }
+        }
+        if (s_prof) {
+            const double tail_ms =
+                std::chrono::duration<double, std::milli>(clk::now() - prof_m).count();
+            fprintf(stderr, "mux_prof: bucket %d total %.1f (bucket-pass %.1f, memenc+store %.1f) ms\n",
+                    b, prof_bucket_ms + tail_ms, prof_bucket_ms, tail_ms);
+        }
+    }
+}
+
 static sam3_prop_output sam3_propagate_single(
     sam3_tracker& tracker, sam3_state& state, const sam3_model& model,
     const sam3_masklet& masklet,
@@ -11448,7 +13564,7 @@ static sam3_prop_output sam3_propagate_single(
     const int H = sam3_eff_feat_size(state, hp);
     const int N = H * H;
 
-    static const bool s_prof = getenv("SAM3_PROFILE_PROP") != nullptr;
+    const bool s_prof = model.debug.profile_prop;
     auto t_p0 = std::chrono::high_resolution_clock::now();
 
     // ── Memory slot selection (official _prepare_memory_conditioned_features)
@@ -11794,6 +13910,7 @@ static sam3_prop_output sam3_propagate_single(
         ggml_build_forward_expand(graph, dec.obj_score);
         ggml_build_forward_expand(graph, dec.sam_token);
         if (dec.mask_tokens) ggml_build_forward_expand(graph, dec.mask_tokens);
+        sam3_graph_census("prop_nonmux(mem_attn+dec)", graph, model.debug.census);
 
         galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
         if (!ggml_gallocr_reserve(galloc, graph) || !ggml_gallocr_alloc_graph(galloc, graph)) {
@@ -12006,8 +14123,7 @@ static void sam3_update_tracker(sam3_tracker& tracker, int frame_idx, bool rever
         int idle = reverse ? (it->last_seen - frame_idx)
                            : (frame_idx - it->last_seen);
         if (idle > tracker.params.max_keep_alive) {
-            tracker.mem_banks.erase(it->instance_id);
-            tracker.ptr_banks.erase(it->instance_id);
+            sam3_release_banks(tracker.mem_banks, tracker.ptr_banks, it->instance_id);
             it = tracker.masklets.erase(it);
         } else
             ++it;
@@ -12024,7 +14140,7 @@ static bool sam3_encode_memory(
     const int HIGH_RES = sam3_eff_img_size(state, hp);
     const int INTERPOL = H * 16;
 
-    static const bool s_prof = getenv("SAM3_PROFILE_PROP") != nullptr;
+    const bool s_prof = model.debug.profile_prop;
     auto t_m0 = std::chrono::high_resolution_clock::now();
 
     // Mask preprocessing: mask_logits → HIGH_RES → sigmoid → scale/bias → INTERPOL
@@ -12176,7 +14292,6 @@ static bool sam3_encode_memory(
     auto* sb = ggml_backend_alloc_buffer(model.backend, MD * H * H * sizeof(float));
     struct ggml_tallocr ta = ggml_tallocr_new(sb);
     ggml_tallocr_alloc(&ta, st);
-    tracker.owned_buffers.push_back(sb);
     if (need_noobj) {
         // Occluded (SAM2.1): blend on CPU and upload the modified copy.
         ggml_backend_tensor_set(st, md.data(), 0, md.size() * sizeof(float));
@@ -12193,12 +14308,13 @@ static bool sam3_encode_memory(
     auto* speb = ggml_backend_alloc_buffer(model.backend, MD * H * H * sizeof(float));
     struct ggml_tallocr ta2 = ggml_tallocr_new(speb);
     ggml_tallocr_alloc(&ta2, spe);
-    tracker.owned_buffers.push_back(speb);
     ggml_backend_tensor_set(spe, pe_data.data(), 0, pe_data.size() * sizeof(float));
 
     sam3_memory_slot slot;
     slot.spatial_feats = st;
     slot.spatial_pe = spe;
+    slot.bufs[0] = sb;
+    slot.bufs[1] = speb;
     slot.frame_index = frame_idx;
     slot.is_cond_frame = is_cond;
     auto& bk = tracker.mem_banks[inst_id];
@@ -12207,11 +14323,12 @@ static bool sam3_encode_memory(
         bool removed = false;
         for (auto it = bk.begin(); it != bk.end(); ++it)
             if (!it->is_cond_frame) {
+                sam3_memory_slot_release(*it);
                 bk.erase(it);
                 removed = true;
                 break;
             }
-        if (!removed) bk.erase(bk.begin() + 1);
+        if (!removed) { sam3_memory_slot_release(bk[1]); bk.erase(bk.begin() + 1); }
     }
     // NOTE: mem_ctx / mem_galloc are cached in tracker and freed by
     // sam3_tracker_reset, NOT here.
@@ -12230,7 +14347,6 @@ static void sam3_store_obj_ptr(
     auto* pb = ggml_backend_alloc_buffer(model.backend, D * sizeof(float));
     struct ggml_tallocr ta = ggml_tallocr_new(pb);
     ggml_tallocr_alloc(&ta, pt);
-    tracker.owned_buffers.push_back(pb);
     ggml_backend_tensor_set(pt, pd, 0, D * sizeof(float));
     auto& bk = tracker.ptr_banks[inst_id];
     // Same frame + same conditioning identity → replace (official per-dict
@@ -12241,10 +14357,12 @@ static void sam3_store_obj_ptr(
     // encoder selection.
     for (auto& s : bk)
         if (s.frame_index == frame_idx && s.is_cond == is_cond) {
+            sam3_ptr_slot_release(s);
             s.ptr = pt;
+            s.buf = pb;
             return;
         }
-    bk.push_back({frame_idx, pt, is_cond});
+    bk.push_back({frame_idx, pt, is_cond, pb});
     // Evict oldest non-cond slots only: conditioning-frame pointers are kept
     // for the whole session (the official cond_frame_outputs dict never
     // evicts), so a long forward run cannot starve the prompt-frame pointer
@@ -12257,8 +14375,8 @@ static void sam3_store_obj_ptr(
     while ((int)bk.size() > cap) {
         bool evicted = false;
         for (auto it = bk.begin(); it != bk.end(); ++it)
-            if (!it->is_cond) { bk.erase(it); evicted = true; break; }
-        if (!evicted) bk.erase(bk.begin());
+            if (!it->is_cond) { sam3_ptr_slot_release(*it); bk.erase(it); evicted = true; break; }
+        if (!evicted) { sam3_ptr_slot_release(bk.front()); bk.erase(bk.begin()); }
     }
 }
 
@@ -12277,6 +14395,22 @@ sam3_tracker_ptr sam3_create_tracker(const sam3_model& model,
     return tracker;
 }
 
+// Official propagate/track semantics: frames whose outputs are already
+// consolidated (annotation frames and frames processed by an earlier pass)
+// are never re-processed — their outputs exist and their memory is already
+// encoded (official consolidated_frame_inds / frames_already_tracked check).
+// Re-running them here would re-encode memory from the *current* frame's
+// backbone buffers, which no longer hold that frame's features.
+static bool sam3_frame_has_memory(const sam3_tracker& tracker, int fi) {
+    for (const auto& kb : tracker.mem_banks)
+        for (const auto& s : kb.second)
+            if (s.frame_index == fi) return true;
+    for (const auto& kb : tracker.ptr_banks)
+        for (const auto& s : kb.second)
+            if (s.frame_index == fi) return true;
+    return false;
+}
+
 sam3_result sam3_track_frame(sam3_tracker& tracker, sam3_state& state,
                              const sam3_model& model, const sam3_image& frame) {
     if (model.hparams.visual_only) {
@@ -12289,11 +14423,32 @@ sam3_result sam3_track_frame(sam3_tracker& tracker, sam3_state& state,
     const int D = model.hparams.neck_dim;
     if (!sam3_encode_image(state, model, frame)) return result;
     int fi = tracker.frame_index;
+    // Skip frames already consolidated (e.g. the annotation frame right
+    // after add_instance): official propagate_in_video never re-processes
+    // them. The caller passes the next unprocessed frame's image.
+    while (sam3_frame_has_memory(tracker, fi)) ++fi;
     fprintf(stderr, "%s: frame %d (%zu active + %zu pending)\n",
             __func__, fi, tracker.masklets.size(), tracker.pending.size());
 
     std::map<int, sam3_mask> pm;
     std::map<int, sam3_prop_output> po;
+    if (model.hparams.is_multiplex()) {
+        // SAM 3.1: single bucket-space pass; memory + muxed pointers encoded.
+        sam3_mux_track_instances(tracker, state, model, fi, false, true, po);
+        for (auto& kv : po) {
+            const auto& o = kv.second;
+            if (o.mask_logits.empty()) continue;
+            auto rs = sam3_bilinear_interpolate(o.mask_logits.data(),
+                                                o.mask_w, o.mask_h,
+                                                state.orig_width, state.orig_height);
+            auto& m = pm[kv.first];
+            m.width = state.orig_width;
+            m.height = state.orig_height;
+            m.data.resize(state.orig_width * state.orig_height);
+            for (size_t p = 0; p < rs.size(); ++p)
+                m.data[p] = rs[p] > 0.0f ? 255 : 0;
+        }
+    } else
     for (auto& ml : tracker.masklets) {
         int id = ml.instance_id;
         auto im = tracker.mem_banks.find(id);
@@ -12316,7 +14471,10 @@ sam3_result sam3_track_frame(sam3_tracker& tracker, sam3_state& state,
         float cov = (float)fg / (state.orig_width * state.orig_height);
         ml.mds_sum += (cov > 0.001f && po[id].obj_score > 0.0f) ? 1 : -1;
     }
+    // ── Propagate pending masklets ───────────────────────────────────────
+    // (3.1: already covered by the bucket pass above.)
     for (auto& ml : tracker.pending) {
+        if (model.hparams.is_multiplex()) break;
         int id = ml.instance_id;
         auto im = tracker.mem_banks.find(id);
         if (im == tracker.mem_banks.end() || im->second.empty()) continue;
@@ -12414,6 +14572,52 @@ sam3_result sam3_track_frame(sam3_tracker& tracker, sam3_state& state,
                                                  : -5.0f;
                 }
             }
+            if (model.hparams.is_multiplex()) {
+                // SAM 3.1: the object pointer comes from the interactive
+                // decoder run on the mask (official _use_mask_as_output);
+                // the cond memory is the bucket-muxed encode with the new
+                // instance's conditioning channel set.
+                sam3_pvs_params pvs;
+                pvs.mask_prompt_logits = det_logits;
+                pvs.use_mask_prompt = true;
+                auto pr = sam3_segment_pvs(state, model, pvs);
+                std::vector<float> op(D, 0.0f);
+                if (!pr.detections.empty() && !pr.detections[0].sam_token.empty())
+                    sam3_extract_obj_ptr_mux(model, pr.detections[0].sam_token.data(),
+                                             10.0f, op.data());
+                const int M = model.hparams.multiplex_count;
+                auto order = sam3_mux_slot_order(tracker);
+                const int slot = (int)order.size();  // new instance appends last
+                const int b = slot / M, s = slot % M;
+                std::vector<float> slot_logits[M];
+                float slot_obj[M]; bool slot_cond[M];
+                for (int k = 0; k < M; ++k) {
+                    slot_obj[k] = 0.0f; slot_cond[k] = false;
+                    if (k < (int)order.size()) {
+                        auto it = po.find(order[k]->instance_id);
+                        if (it != po.end()) {
+                            slot_logits[k] = it->second.mask_logits;
+                            slot_obj[k] = it->second.obj_score;
+                        }
+                    }
+                }
+                slot_logits[s] = det_logits;
+                slot_obj[s] = 10.0f;
+                slot_cond[s] = true;
+                sam3_encode_memory_mux(tracker, state, model, b, slot_logits,
+                                       mh, mw, slot_obj, slot_cond, fi, true);
+                std::vector<float> muxed((size_t)D * M, 0.0f);
+                for (int k = 0; k < (int)order.size(); ++k) {
+                    auto it = po.find(order[k]->instance_id);
+                    if (it == po.end()) continue;
+                    std::vector<float> opk(D);
+                    sam3_extract_obj_ptr_mux(model, it->second.sam_token.data(),
+                                             it->second.obj_score, opk.data());
+                    std::copy(opk.begin(), opk.end(), muxed.begin() + (size_t)k * D);
+                }
+                std::copy(op.begin(), op.end(), muxed.begin() + (size_t)s * D);
+                sam3_store_obj_ptr_mux(tracker, model, b, muxed.data(), fi, true);
+            } else {
             sam3_encode_memory(tracker, state, model, ml.instance_id,
                                det_logits.data(), mh, mw, fi, true, 1.0f);
 
@@ -12429,11 +14633,13 @@ sam3_result sam3_track_frame(sam3_tracker& tracker, sam3_state& state,
                 ggml_backend_tensor_get(nop, no_ptr.data(), 0, D * sizeof(float));
             }
             sam3_store_obj_ptr(tracker, model, ml.instance_id, no_ptr.data(), fi, true);
+            }
         }
 
         tracker.pending.push_back(std::move(ml));
     }
     for (auto& ml : tracker.masklets) {
+        if (model.hparams.is_multiplex()) break;
         int id = ml.instance_id;
         auto it = po.find(id);
         if (it == po.end() || it->second.mask_logits.empty()) continue;
@@ -12499,7 +14705,7 @@ sam3_result sam3_track_frame(sam3_tracker& tracker, sam3_state& state,
         sam3_fill_holes(d.mask.data.data(), d.mask.width, d.mask.height, tracker.params.fill_hole_area);
         sam3_remove_sprinkles(d.mask.data.data(), d.mask.width, d.mask.height, tracker.params.fill_hole_area);
     }
-    tracker.frame_index++;
+    tracker.frame_index = fi + 1;
     SAM3_LOG(2, "%s: frame %d done — %zu tracked\n", __func__, fi, result.detections.size());
     return result;
 }
@@ -12544,13 +14750,72 @@ bool sam3_refine_instance(sam3_tracker& tracker, sam3_state& state,
     tgt->last_seen = fi;
     std::vector<float> op(D);
     if (!rdet.sam_token.empty()) {
-        sam3_extract_obj_ptr_cpu(model, rdet.sam_token.data(), rdet.mask.obj_score, op.data());
+        sam3_extract_obj_ptr_cpu(model, rdet.sam_token.data(),
+                                 rdet.obj_logit, op.data(), /*interactive=*/true);
     } else {
         std::fill(op.begin(), op.end(), 0.0f);
     }
+    if (model.hparams.is_multiplex()) {
+        // SAM 3.1: patch the refined slot in the bucket's muxed pointer bank
+        // and add a conditioning bucket memory built from the refined mask.
+        const int M = model.hparams.multiplex_count;
+        const int MI = sam3_eff_feat_size(state, model.hparams) * 4;
+        auto order = sam3_mux_slot_order(tracker);
+        int slot = -1;
+        for (int k = 0; k < (int)order.size(); ++k)
+            if (order[k]->instance_id == instance_id) { slot = k; break; }
+        if (slot >= 0) {
+            const int b = slot / M, s = slot % M;
+            std::vector<float> slot_logits[M];
+            float slot_obj[M]; bool slot_cond[M];
+            for (int k = 0; k < M; ++k) {
+                slot_obj[k] = 0.0f; slot_cond[k] = false;
+                const int idx = b * M + k;
+                if (k != s && idx < (int)order.size() && order[idx]->mask_logits) {
+                    slot_logits[k].resize((size_t)MI * MI);
+                    ggml_backend_tensor_get(order[idx]->mask_logits, slot_logits[k].data(),
+                                            0, (size_t)MI * MI * sizeof(float));
+                }
+            }
+            // Refined mask → 288×288 logit synthesis (±6, like add_instance).
+            std::vector<float>& sl = slot_logits[s];
+            sl.assign((size_t)MI * MI, -6.0f);
+            {
+                const auto& msk = rdet.mask;
+                for (int y = 0; y < MI; ++y) {
+                    int sy = y * msk.height / MI;
+                    for (int x = 0; x < MI; ++x) {
+                        int sx = x * msk.width / MI;
+                        sl[y * MI + x] = (msk.data[sy * msk.width + sx] > 127) ? 6.0f : -6.0f;
+                    }
+                }
+            }
+            slot_obj[s] = 10.0f;
+            slot_cond[s] = true;
+            sam3_encode_memory_mux(tracker, state, model, b, slot_logits,
+                                   MI, MI, slot_obj, slot_cond, fi, true);
+            // Pointers: copy the latest muxed entry and patch this slot.
+            std::vector<float> muxed((size_t)D * M, 0.0f);
+            auto& bk = tracker.ptr_banks[b];
+            for (auto it = bk.rbegin(); it != bk.rend(); ++it) {
+                if (it->ptr) {
+                    ggml_backend_tensor_get(it->ptr, muxed.data(), 0, (size_t)D * M * sizeof(float));
+                    break;
+                }
+            }
+            std::copy(op.begin(), op.end(), muxed.begin() + (size_t)s * D);
+            sam3_store_obj_ptr_mux(tracker, model, b, muxed.data(), fi, true);
+            sam3_store_obj_ptr_mux(tracker, model, b, muxed.data(), fi, false);
+            // The refined frame now holds consolidated cond outputs; the next
+            // propagate skips it (sam3_frame_has_memory) and continues at fi+1.
+            tracker.frame_index = fi;
+            return true;
+        }
+    }
     sam3_store_obj_ptr(tracker, model, instance_id, op.data(), fi, false);
-    // Official propagate_in_video(start_frame_idx) semantics: the next
-    // forward propagate re-processes the refined frame first.
+    // Official propagate_in_video(start_frame_idx) semantics: the refined
+    // frame's outputs are consolidated; the next propagate skips it (see
+    // sam3_frame_has_memory) and continues at fi+1 (forward) / fi-1 (reverse).
     tracker.frame_index = fi;
     SAM3_LOG(2, "%s: refined instance %d\n", __func__, instance_id);
     return true;
@@ -12563,14 +14828,36 @@ int sam3_tracker_add_instance(sam3_tracker& tracker, sam3_state& state,
     const int D = model.hparams.neck_dim;
     const int mask_hw = sam3_eff_feat_size(state, model.hparams) * 4;
 
-    // Run PVS to get the segmentation mask
-    auto r = sam3_segment_pvs(state, model, pvs_params);
+    // Run PVS to get the segmentation mask. The official add flow runs the
+    // multimask decoder for point prompts on the initial frame and selects
+    // the best mask by IoU (_use_multimask + _forward_sam_heads argmax).
+    sam3_pvs_params pvs = pvs_params;
+    if (!pvs.use_box) pvs.multimask = true;
+    pvs.return_logits = true;  // memory encoder consumes the real logits
+    auto r = sam3_segment_pvs(state, model, pvs);
     if (r.detections.empty()) {
         fprintf(stderr, "%s: PVS returned no masks\n", __func__);
         return -1;
     }
 
-    const auto& det = r.detections[0];
+    // Official multimask selection (_forward_sam_heads): with multimask
+    // output, take the mask with the highest IoU estimation
+    // (stability_score_attentuation defaults to false — plain argmax).
+    const sam3_detection* det_p = &r.detections[0];
+    for (const auto& d : r.detections)
+        if (d.iou_score > det_p->iou_score) det_p = &d;
+    const auto& det = *det_p;
+    if (!model.debug.parity_dump_dir.empty()) {
+        // PVS anchor ↔ official add_out_3 (1,1,540,960)
+        if (!det.mask_logits_lowres.empty())
+            sam3_parity_dump_host(model, "pvs_logits", "f0",
+                                  det.mask_logits_lowres.data(),
+                                  det.mask_logits_lowres.size());
+        std::vector<float> mv(det.mask.data.size());
+        for (size_t i = 0; i < det.mask.data.size(); ++i) mv[i] = det.mask.data[i] > 127 ? 1.0f : 0.0f;
+        sam3_parity_dump_host(model, "pvs_mask", "f0", mv.data(), mv.size());
+        sam3_parity_dump_host(model, "pvs_iou", "f0", &det.iou_score, 1);
+    }
     if (det.mask.data.empty()) {
         fprintf(stderr, "%s: PVS mask is empty\n", __func__);
         return -1;
@@ -12587,11 +14874,17 @@ int sam3_tracker_add_instance(sam3_tracker& tracker, sam3_state& state,
     }
     int fi = (frame_idx >= 0) ? frame_idx : std::max(0, tracker.frame_index - 1);
 
-    // Create synthetic 288x288 logits from the binary mask.
-    // sam3_encode_memory applies sigmoid then scale/bias, so +6/-6 gives
-    // sigmoid values ~0.9975/~0.0025 — practically identical to real logits.
-    std::vector<float> synth_logits(mask_hw * mask_hw);
-    {
+    // Memory-encoder mask input: the official feeds the raw decoder logits
+    // (sigmoid + scale/bias applied inside the memory encoder). Prefer the
+    // native decoder-resolution logits; fall back to synthetic ±6 logits
+    // synthesized from the binary mask when they are unavailable (box adds).
+    std::vector<float> synth_logits;
+    const std::vector<float>* mem_mask_logits = nullptr;
+    if (!det.mask_logits_lowres.empty() &&
+        (int)det.mask_logits_lowres.size() == mask_hw * mask_hw) {
+        mem_mask_logits = &det.mask_logits_lowres;
+    } else {
+        synth_logits.resize(mask_hw * mask_hw);
         int mw = det.mask.width, mh = det.mask.height;
         for (int y = 0; y < mask_hw; ++y) {
             int sy = y * mh / mask_hw;
@@ -12601,25 +14894,86 @@ int sam3_tracker_add_instance(sam3_tracker& tracker, sam3_state& state,
                     (det.mask.data[sy * mw + sx] > 127) ? 6.0f : -6.0f;
             }
         }
-    }
-
-    // Encode into memory bank
-    float obj_score = det.mask.obj_score;
-    if (!sam3_encode_memory(tracker, state, model, inst_id,
-                            synth_logits.data(), mask_hw, mask_hw,
-                            fi, true, obj_score)) {
-        fprintf(stderr, "%s: failed to encode memory for instance %d\n", __func__, inst_id);
-        return -1;
+        mem_mask_logits = &synth_logits;
     }
 
     // Extract object pointer from the SAM decoder token
     std::vector<float> op(D);
     if (!det.sam_token.empty()) {
-        sam3_extract_obj_ptr_cpu(model, det.sam_token.data(), obj_score, op.data());
+        sam3_extract_obj_ptr_cpu(model, det.sam_token.data(), det.obj_logit,
+                                 op.data(), /*interactive=*/true);
     } else {
         std::fill(op.begin(), op.end(), 0.0f);
     }
+    if (model.hparams.is_multiplex()) {
+        // SAM 3.1: the new instance takes the next mux slot; cond memory is
+        // the bucket-muxed encode with the new slot's conditioning channel.
+        const int M = model.hparams.multiplex_count;
+        auto order = sam3_mux_slot_order(tracker);
+        const int slot = (int)order.size();  // new instance appends last
+        const int b = slot / M, s = slot % M;
+        std::vector<float> slot_logits[M];
+        float slot_obj[M]; bool slot_cond[M];
+        for (int k = 0; k < M; ++k) {
+            slot_obj[k] = 0.0f; slot_cond[k] = false;
+            const int idx = b * M + k;
+            if (idx < (int)order.size() && order[idx]->mask_logits) {
+                slot_logits[k].resize((size_t)mask_hw * mask_hw);
+                ggml_backend_tensor_get(order[idx]->mask_logits, slot_logits[k].data(),
+                                        0, (size_t)mask_hw * mask_hw * sizeof(float));
+                // Official add_masks_to_existing_state: conditioning_objects
+                // accumulate — every object prompted on THIS frame is a
+                // conditioning channel of the re-encoded seed memory, and its
+                // own object-score logit drives the per-slot no_obj gate.
+                slot_cond[k] = (order[idx]->first_frame == fi);
+                slot_obj[k]  = order[idx]->last_obj_logit;
+            }
+        }
+        slot_logits[s] = *mem_mask_logits;
+        slot_obj[s] = det.obj_logit;
+        slot_cond[s] = true;
+        if (!sam3_encode_memory_mux(tracker, state, model, b, slot_logits,
+                                    mask_hw, mask_hw, slot_obj, slot_cond,
+                                    fi, true)) {
+            fprintf(stderr, "%s: failed to encode mux memory for instance %d\n",
+                    __func__, inst_id);
+            return -1;
+        }
+        std::vector<float> muxed((size_t)D * M, 0.0f);
+        auto& bk = tracker.ptr_banks[b];
+        for (auto it = bk.rbegin(); it != bk.rend(); ++it) {
+            if (it->ptr) {
+                ggml_backend_tensor_get(it->ptr, muxed.data(), 0, (size_t)D * M * sizeof(float));
+                break;
+            }
+        }
+        std::copy(op.begin(), op.end(), muxed.begin() + (size_t)s * D);
+        sam3_store_obj_ptr_mux(tracker, model, b, muxed.data(), fi, true);
+        if (!model.debug.parity_dump_dir.empty()) {
+            // f0 cond slots ↔ official cond0_{maskmem,imgfeat,objptr}
+            for (auto& sl : tracker.mem_banks[b])
+                if (sl.is_cond_frame && sl.frame_index == fi) {
+                    sam3_parity_dump_tensor(model, sl.spatial_feats, "memenc_b0_f0");
+                    sam3_parity_dump_tensor(model, sl.image_feats, "imgfeat_b0_f0");
+                    break;
+                }
+            for (auto& ps : tracker.ptr_banks[b])
+                if (ps.is_cond && ps.frame_index == fi) {
+                    sam3_parity_dump_tensor(model, ps.ptr, "ptr_f0");
+                    break;
+                }
+        }
+    } else {
+    // Encode into memory bank
+    float obj_score = det.mask.obj_score;
+    if (!sam3_encode_memory(tracker, state, model, inst_id,
+                            mem_mask_logits->data(), mask_hw, mask_hw,
+                            fi, true, obj_score)) {
+        fprintf(stderr, "%s: failed to encode memory for instance %d\n", __func__, inst_id);
+        return -1;
+    }
     sam3_store_obj_ptr(tracker, model, inst_id, op.data(), fi, true);
+    }
 
     // Create confirmed masklet
     sam3_masklet ml;
@@ -12629,12 +14983,19 @@ int sam3_tracker_add_instance(sam3_tracker& tracker, sam3_state& state,
     ml.last_score = det.score;
     ml.confirmed = true;
     ml.mds_sum = 1;
+    // Remember the add-time mask + object logit: a later add_prompt on the
+    // same frame re-encodes the seed memory with every prompted object's
+    // channel (official add_masks_to_existing_state).
+    if ((int)det.mask_logits_lowres.size() == mask_hw * mask_hw)
+        sam3_store_masklet_logits(tracker, model, ml,
+                                  det.mask_logits_lowres.data(), mask_hw);
+    ml.last_obj_logit = det.obj_logit;
     tracker.masklets.push_back(std::move(ml));
 
-    // Official propagate_in_video semantics: forward propagation re-processes
-    // the prompt frame first (range(start, end]); reverse starts at fi-1
-    // (range(start-1, ..., -1)).
-    tracker.frame_index = fi;
+    // Official propagate_in_video semantics: the annotation frame's outputs
+    // are consolidated above (memory + pointers encoded); propagation
+    // continues at fi+1 — consolidated frames are skipped, never re-run.
+    tracker.frame_index = fi + 1;
     SAM3_LOG(2, "%s: added instance #%d (score=%.3f)\n", __func__, inst_id, det.score);
     return inst_id;
 }
@@ -12683,6 +15044,61 @@ int sam3_tracker_add_instance_from_mask(sam3_tracker& tracker, sam3_state& state
         }
     }
 
+    if (model.hparams.is_multiplex()) {
+        // SAM 3.1: official _use_mask_as_output — the obj_ptr comes from the
+        // interactive decoder run on the mask; the cond memory is the
+        // bucket-muxed encode with the new slot's conditioning channel.
+        sam3_pvs_params pvs;
+        pvs.mask_prompt_logits = synth_logits;
+        pvs.use_mask_prompt = true;
+        auto pr = sam3_segment_pvs(state, model, pvs);
+        std::vector<float> op(D, 0.0f);
+        if (!pr.detections.empty() && !pr.detections[0].sam_token.empty())
+            sam3_extract_obj_ptr_cpu(model, pr.detections[0].sam_token.data(),
+                                     pr.detections[0].obj_logit, op.data(),
+                                     /*interactive=*/true);
+        const int M = model.hparams.multiplex_count;
+        auto order = sam3_mux_slot_order(tracker);
+        const int slot = (int)order.size();
+        const int b = slot / M, s = slot % M;
+        std::vector<float> slot_logits[M];
+        float slot_obj[M]; bool slot_cond[M];
+        for (int k = 0; k < M; ++k) {
+            slot_obj[k] = 0.0f; slot_cond[k] = false;
+            const int idx = b * M + k;
+            if (idx < (int)order.size() && order[idx]->mask_logits) {
+                slot_logits[k].resize((size_t)mask_hw * mask_hw);
+                ggml_backend_tensor_get(order[idx]->mask_logits, slot_logits[k].data(),
+                                        0, (size_t)mask_hw * mask_hw * sizeof(float));
+                // Official add_masks_to_existing_state: conditioning_objects
+                // accumulate — every object prompted on THIS frame is a
+                // conditioning channel of the re-encoded seed memory, and its
+                // own object-score logit drives the per-slot no_obj gate.
+                slot_cond[k] = (order[idx]->first_frame == fi);
+                slot_obj[k]  = order[idx]->last_obj_logit;
+            }
+        }
+        slot_logits[s] = synth_logits;
+        slot_obj[s] = 10.0f;
+        slot_cond[s] = true;
+        if (!sam3_encode_memory_mux(tracker, state, model, b, slot_logits,
+                                    mask_hw, mask_hw, slot_obj, slot_cond,
+                                    fi, true)) {
+            fprintf(stderr, "%s: failed to encode mux memory for instance %d\n",
+                    __func__, inst_id);
+            return -1;
+        }
+        std::vector<float> muxed((size_t)D * M, 0.0f);
+        auto& bk = tracker.ptr_banks[b];
+        for (auto it = bk.rbegin(); it != bk.rend(); ++it) {
+            if (it->ptr) {
+                ggml_backend_tensor_get(it->ptr, muxed.data(), 0, (size_t)D * M * sizeof(float));
+                break;
+            }
+        }
+        std::copy(op.begin(), op.end(), muxed.begin() + (size_t)s * D);
+        sam3_store_obj_ptr_mux(tracker, model, b, muxed.data(), fi, true);
+    } else {
     // Encode into the memory bank as a conditioning frame.
     if (!sam3_encode_memory(tracker, state, model, inst_id,
                             synth_logits.data(), mask_hw, mask_hw,
@@ -12728,6 +15144,7 @@ int sam3_tracker_add_instance_from_mask(sam3_tracker& tracker, sam3_state& state
         ggml_backend_tensor_get(model.no_obj_ptr, obj_ptr.data(), 0, D * sizeof(float));
     }
     sam3_store_obj_ptr(tracker, model, inst_id, obj_ptr.data(), fi, true);
+    }
 
     // Create confirmed masklet
     sam3_masklet ml;
@@ -12737,11 +15154,17 @@ int sam3_tracker_add_instance_from_mask(sam3_tracker& tracker, sam3_state& state
     ml.last_score = obj_score;
     ml.confirmed = true;
     ml.mds_sum = 1;
+    // Mask-prompt instances keep their conditioning mask for a later
+    // add_prompt's seed-memory re-encode (same rationale as add_instance).
+    if ((int)synth_logits.size() == mask_hw * mask_hw)
+        sam3_store_masklet_logits(tracker, model, ml, synth_logits.data(), mask_hw);
+    ml.last_obj_logit = obj_score;
     tracker.masklets.push_back(std::move(ml));
 
-    // Official propagate_in_video semantics: forward propagation re-processes
-    // the prompt frame first (range(start, end]); reverse starts at fi-1.
-    tracker.frame_index = fi;
+    // Official propagate_in_video semantics: the annotation frame's outputs
+    // are consolidated above; propagation continues at fi+1 — consolidated
+    // frames are skipped, never re-run.
+    tracker.frame_index = fi + 1;
     SAM3_LOG(2, "%s: added instance #%d from mask (obj_score=%.3f)\n",
              __func__, inst_id, obj_score);
     return inst_id;
@@ -12754,8 +15177,15 @@ void sam3_tracker_reset(sam3_tracker& tracker) {
     tracker.next_inst_id = 1;
     tracker.masklets.clear();
     tracker.pending.clear();
+    for (auto& mkb : tracker.mem_banks)
+        for (auto& s : mkb.second) sam3_memory_slot_release(s);
     tracker.mem_banks.clear();
+    for (auto& ptb : tracker.ptr_banks)
+        for (auto& s : ptb.second) sam3_ptr_slot_release(s);
     tracker.ptr_banks.clear();
+    tracker.mem_C = -1;
+    tracker.stash_frame = -1;
+    tracker.stash = {};
     tracker.eff_history.clear();
     for (auto* b : tracker.owned_buffers)
         if (b) ggml_backend_buffer_free(b);
@@ -12776,6 +15206,14 @@ void sam3_tracker_reset(sam3_tracker& tracker) {
     tracker.mem_inp_mask = nullptr;
     tracker.mem_inp_pix  = nullptr;
     tracker.mem_out      = nullptr;
+    // Release the ~300 MB host scratch alongside the cached graph
+    std::vector<float>().swap(tracker.mem_muxed_scratch);
+    std::vector<float>().swap(tracker.mem_interp_scratch);
+    // Release the per-enc_idx PE+tpos device cache (descriptors die with ctx)
+    if (tracker.pe_tpos_buf) { ggml_backend_buffer_free(tracker.pe_tpos_buf); tracker.pe_tpos_buf = nullptr; }
+    tracker.pe_tpos_rows.clear();
+    tracker.pe_tpos_cache_valid = false;
+    tracker.pe_tpos_cache_n     = 0;
     // Free cached propagate graph
     if (tracker.prop_galloc) { ggml_gallocr_free(tracker.prop_galloc); tracker.prop_galloc = nullptr; }
     if (tracker.prop_ctx)    { ggml_free(tracker.prop_ctx);             tracker.prop_ctx    = nullptr; }
@@ -12792,9 +15230,11 @@ bool sam3_tracker_remove_instance(sam3_tracker& tracker, int instance_id) {
         if (it->instance_id == instance_id) { tracker.masklets.erase(it); removed = true; break; }
     for (auto it = tracker.pending.begin(); it != tracker.pending.end(); ++it)
         if (it->instance_id == instance_id) { tracker.pending.erase(it); removed = true; break; }
-    if (tracker.mem_banks.erase(instance_id) > 0) removed = true;
-    if (tracker.ptr_banks.erase(instance_id) > 0) removed = true;
+    bool had_banks = tracker.mem_banks.count(instance_id) > 0 ||
+                     tracker.ptr_banks.count(instance_id) > 0;
+    sam3_release_banks(tracker.mem_banks, tracker.ptr_banks, instance_id);
     tracker.eff_history.erase(instance_id);
+    if (removed || had_banks) removed = true;
     if (removed)
         SAM3_LOG(2, "%s: removed instance #%d (%zu active)\n", __func__,
                  instance_id, tracker.masklets.size() + tracker.pending.size());
@@ -12810,8 +15250,11 @@ int sam3_tracker_rewind(sam3_tracker& tracker, int frame_index) {
     int dropped = 0;
     for (auto& mkb : tracker.mem_banks) {
         for (auto it = mkb.second.begin(); it != mkb.second.end();) {
-            if (it->frame_index > frame_index) { it = mkb.second.erase(it); ++dropped; }
-            else ++it;
+            if (it->frame_index > frame_index) {
+                sam3_memory_slot_release(*it);
+                it = mkb.second.erase(it);
+                ++dropped;
+            } else ++it;
         }
     }
     // eff history beyond the rewind point is dropped too (the replay rewrites
@@ -12822,16 +15265,17 @@ int sam3_tracker_rewind(sam3_tracker& tracker, int frame_index) {
             else ++it;
     for (auto& ptb : tracker.ptr_banks) {
         for (auto it = ptb.second.begin(); it != ptb.second.end();) {
-            if (it->frame_index > frame_index) it = ptb.second.erase(it);
-            else ++it;
+            if (it->frame_index > frame_index) {
+                sam3_ptr_slot_release(*it);
+                it = ptb.second.erase(it);
+            } else ++it;
         }
     }
     // Instances that first appeared after the target frame do not exist at
     // that frame yet — remove them entirely (official re-prompt semantics).
     for (auto it = tracker.masklets.begin(); it != tracker.masklets.end();) {
         if (it->first_frame > frame_index) {
-            tracker.mem_banks.erase(it->instance_id);
-            tracker.ptr_banks.erase(it->instance_id);
+            sam3_release_banks(tracker.mem_banks, tracker.ptr_banks, it->instance_id);
             SAM3_LOG(2, "%s: dropped instance #%d (first_frame %d > %d)\n",
                      __func__, it->instance_id, it->first_frame, frame_index);
             it = tracker.masklets.erase(it);
@@ -12843,8 +15287,7 @@ int sam3_tracker_rewind(sam3_tracker& tracker, int frame_index) {
     }
     for (auto it = tracker.pending.begin(); it != tracker.pending.end();) {
         if (it->first_frame > frame_index) {
-            tracker.mem_banks.erase(it->instance_id);
-            tracker.ptr_banks.erase(it->instance_id);
+            sam3_release_banks(tracker.mem_banks, tracker.ptr_banks, it->instance_id);
             tracker.eff_history.erase(it->instance_id);
             it = tracker.pending.erase(it);
         } else ++it;
@@ -12864,14 +15307,20 @@ bool sam3_tracker_clear_instance_frame(sam3_tracker& tracker, int instance_id, i
     if (mb == tracker.mem_banks.end()) return false;
     bool removed = false;
     for (auto it = mb->second.begin(); it != mb->second.end();) {
-        if (it->frame_index == frame_index) { it = mb->second.erase(it); removed = true; }
-        else ++it;
+        if (it->frame_index == frame_index) {
+            sam3_memory_slot_release(*it);
+            it = mb->second.erase(it);
+            removed = true;
+        } else ++it;
     }
     auto pb = tracker.ptr_banks.find(instance_id);
     if (pb != tracker.ptr_banks.end()) {
         for (auto it = pb->second.begin(); it != pb->second.end();) {
-            if (it->frame_index == frame_index) { it = pb->second.erase(it); removed = true; }
-            else ++it;
+            if (it->frame_index == frame_index) {
+                sam3_ptr_slot_release(*it);
+                it = pb->second.erase(it);
+                removed = true;
+            } else ++it;
         }
     }
     if (removed)
@@ -12909,15 +15358,18 @@ sam3_result sam3_propagate_frame(
     const int D = model.hparams.neck_dim;
     if (!sam3_encode_image(state, model, frame)) return result;
     // Official processing orders (propagate_in_video): forward covers
-    // range(start, end+1] — the prompt frame is re-processed first — while
-    // reverse covers range(start-1, ..., -1): it starts at the frame BEFORE
-    // the prompt frame and never re-processes the prompt frame itself.
-    if (reverse && tracker.frame_index <= 0) {
+    // range(start, end+1] and reverse covers range(start-1, ..., -1), with
+    // already-consolidated frames (the annotation frame and any frame
+    // processed by an earlier pass) skipped — their outputs exist and their
+    // memory is already encoded, so they are never re-processed. The caller
+    // passes the image of the next unprocessed frame.
+    int fi = reverse ? tracker.frame_index - 1 : tracker.frame_index;
+    while (sam3_frame_has_memory(tracker, fi)) fi += reverse ? -1 : 1;
+    if (reverse && fi < 0) {
         fprintf(stderr, "%s: cannot propagate in reverse from frame %d\n",
                 __func__, tracker.frame_index);
         return result;
     }
-    int fi = reverse ? tracker.frame_index - 1 : tracker.frame_index;
     fprintf(stderr, "%s: frame %d%s (%zu active + %zu pending)\n",
             __func__, fi, reverse ? " reverse" : "",
             tracker.masklets.size(), tracker.pending.size());
@@ -12925,6 +15377,23 @@ sam3_result sam3_propagate_frame(
     // ── Propagate active masklets ────────────────────────────────────────
     std::map<int, sam3_mask> pm;
     std::map<int, sam3_prop_output> po;
+    if (model.hparams.is_multiplex()) {
+        // SAM 3.1: one bucket-space pass covers every active instance.
+        sam3_mux_track_instances(tracker, state, model, fi, reverse, true, po);
+        for (auto& kv : po) {
+            const auto& o = kv.second;
+            if (o.mask_logits.empty()) continue;
+            auto rs = sam3_bilinear_interpolate(o.mask_logits.data(),
+                                                o.mask_w, o.mask_h,
+                                                state.orig_width, state.orig_height);
+            auto& m = pm[kv.first];
+            m.width = state.orig_width;
+            m.height = state.orig_height;
+            m.data.resize(state.orig_width * state.orig_height);
+            for (size_t p = 0; p < rs.size(); ++p)
+                m.data[p] = rs[p] > 0.0f ? 255 : 0;
+        }
+    } else
     for (auto& ml : tracker.masklets) {
         int id = ml.instance_id;
         auto im = tracker.mem_banks.find(id);
@@ -12950,7 +15419,9 @@ sam3_result sam3_propagate_frame(
     }
 
     // ── Propagate pending masklets ───────────────────────────────────────
+    // (3.1: already covered by the bucket pass above.)
     for (auto& ml : tracker.pending) {
+        if (model.hparams.is_multiplex()) break;
         int id = ml.instance_id;
         auto im = tracker.mem_banks.find(id);
         if (im == tracker.mem_banks.end() || im->second.empty()) continue;
@@ -12983,7 +15454,9 @@ sam3_result sam3_propagate_frame(
     }
 
     // ── Encode memory for active masklets ────────────────────────────────
+    // (3.1: bucket memory + muxed pointers were already encoded above.)
     for (auto& ml : tracker.masklets) {
+        if (model.hparams.is_multiplex()) break;
         int id = ml.instance_id;
         auto it = po.find(id);
         if (it == po.end() || it->second.mask_logits.empty()) continue;
@@ -13040,7 +15513,7 @@ sam3_result sam3_propagate_frame(
         sam3_remove_sprinkles(d.mask.data.data(), d.mask.width, d.mask.height,
                               tracker.params.fill_hole_area);
     }
-    tracker.frame_index += reverse ? -1 : 1;
+    tracker.frame_index = fi + (reverse ? -1 : 1);
     SAM3_LOG(2, "%s: frame %d done — %zu tracked\n",
              __func__, fi, result.detections.size());
     return result;

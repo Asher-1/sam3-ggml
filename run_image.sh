@@ -6,14 +6,14 @@
 # (built from examples/main_image.cpp).
 #
 # Usage:
-#   ./run_image.sh                          # model only (drag & drop an image in the GUI)
+#   ./run_image.sh                          # defaults: sam3.1-f16 + data/cats_on_sofa.jpg
 #   ./run_image.sh data/cats_on_sofa.jpg    # positional arg = image path
-#   ./run_image.sh --model models/sam3-visual-f16.gguf photo.jpg
+#   ./run_image.sh --model models/sam3-f16.gguf photo.jpg  # explicit legacy model
 #   ./run_image.sh --device cuda --threads 8 photo.jpg
 #
 # Environment overrides:
-#   MODEL=models/sam3-f16.gguf    default model when --model is not given
-#   IMAGE=data/cat.jpg            default image when no positional arg / --image
+#   MODEL=models/sam3.1-f16.gguf  default model when --model is not given
+#   IMAGE=data/cats_on_sofa.jpg   image used when no positional arg / --image
 #   DEVICE=auto|cpu|cuda|vulkan   appended as --device unless already given
 #   THREADS=4                     appended as --threads unless already given
 #   BUILD_DIR=build-all           which build dir to use (auto-detected otherwise)
@@ -47,10 +47,14 @@ if [[ -z "$BIN" ]]; then
     exit 1
 fi
 
+# The library spawns ffmpeg/ffprobe via PATH lookup; the repo ships its own
+# copies in data/ so a bare launch works without a system install.
+[[ -x "$ROOT/data/ffmpeg" ]] && export PATH="$ROOT/data:${PATH}"
+
 # ── Assemble arguments ───────────────────────────────────────────────────────
 # Precedence: explicit flag > positional arg > env var > default.
 # User args are passed through untouched; defaults are only prepended.
-MODEL="${MODEL:-models/sam3-f16.gguf}"
+MODEL="${MODEL:-models/sam3.1-f16.gguf}"
 
 VALUED_FLAGS=" --model --image --device --threads --encode-img-size --video "
 
@@ -87,8 +91,10 @@ POS="$(positional_arg "$@" || true)"
 if ! has_flag --image "$@"; then
     if [[ -n "$POS" ]]; then
         ARGS+=(--image "$POS")
-    elif [[ -n "${IMAGE:-}" ]]; then
-        ARGS+=(--image "$IMAGE")
+    else
+        # Default to the bundled test image so a bare launch always has
+        # something to segment; IMAGE= overrides it.
+        ARGS+=(--image "${IMAGE:-data/cats_on_sofa.jpg}")
     fi
 fi
 if [[ -n "${DEVICE:-}" ]] && ! has_flag --device "$@"; then

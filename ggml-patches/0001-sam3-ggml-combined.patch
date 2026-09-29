@@ -1,5 +1,5 @@
 diff --git a/include/ggml.h b/include/ggml.h
-index 32462d79..bf9217c0 100644
+index 35f0c44e..18304074 100644
 --- a/include/ggml.h
 +++ b/include/ggml.h
 @@ -252,6 +252,8 @@
@@ -191,10 +191,101 @@ index 6cbd6f87..3d8938c2 100644
      GGML_ASSERT(input->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
  
 diff --git a/src/ggml-cuda/cpy.cu b/src/ggml-cuda/cpy.cu
-index fd7ffc0b..4d1ed0e7 100644
+index eb5eb0eb..ab35ff5c 100644
 --- a/src/ggml-cuda/cpy.cu
 +++ b/src/ggml-cuda/cpy.cu
-@@ -615,3 +615,80 @@ void ggml_cuda_dup(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -426,6 +426,13 @@ static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tens
+     return spitch >= width && dpitch >= width;
+ }
+ 
++// (sam3) permuted-view fast-path kernel, defined below.
++__global__ void cpy_f32_permute_tiled(
++        const float * __restrict__ src, float * __restrict__ dst,
++        const int nu, const int nv, const int nb,
++        const int64_t src_ustride, const int64_t src_bstride,
++        const int64_t dst_vstride, const int64_t dst_bstride);
++
+ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, ggml_tensor * src1) {
+     const int64_t ne = ggml_nelements(src0);
+     GGML_ASSERT(ne == ggml_nelements(src1));
+@@ -477,6 +484,35 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
+         CUDA_CHECK(cudaMemcpy2DAsync(src1_ddc, mc_dpitch, src0_ddc, mc_spitch,
+                                      mc_width, mc_height, cudaMemcpyDeviceToDevice, main_stream));
+     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
++        // (sam3) permuted-view fast paths (see cpy_f32_permute_tiled).
++        // ggml layout: dim0 is unit-stride, so a contiguous dst [ne0, ne1, ne2]
++        // has element strides [1, ne0, ne0*ne1]. For dst[i0,i1,i2]=src[i0,i1,i2]
++        // this makes two recurring 3-cycle rotations batched 2D transposes:
++        //   A: src strides [ne1*ne2, 1, ne1]  (channels-last conv fixup)
++        //   B: src strides [ne0, ne0*ne1, 1]  (mirror rotation)
++        if (src0->ne[3] == 1 && src1->ne[3] == 1 && ggml_is_contiguous(src1) && ne00 > 0 && ne01 > 0 && ne02 > 0) {
++            const int64_t s0 = nb00 / 4, s1 = nb01 / 4, s2 = nb02 / 4;  // src element strides
++            if (s0 == (int64_t)ne01 * ne02 && s1 == 1 && s2 == (int64_t)ne01 && ne02 <= 65535) {
++                // batch = i2, in-plane u = i0 (dst unit), v = i1 (src unit)
++                const dim3 grid((ne01 + 31) / 32, (ne00 + 31) / 32, (unsigned)ne02);
++                const ggml_cuda_kernel_launch_params lp(grid, dim3(32, 32, 1), 0, main_stream);
++                ggml_cuda_kernel_launch(cpy_f32_permute_tiled, lp, (const float *)src0_ddc, (float *)src1_ddc,
++                    (int)ne00, (int)ne01, (int)ne02,
++                    (int64_t)ne01 * ne02, (int64_t)ne01,
++                    (int64_t)ne00, (int64_t)ne00 * ne01);
++                return;
++            }
++            if (s2 == 1 && s0 == (int64_t)ne00 && s1 == (int64_t)ne00 * ne01 && ne01 <= 65535) {
++                // batch = i1, in-plane u = i0 (dst unit), v = i2 (src unit)
++                const dim3 grid((ne02 + 31) / 32, (ne00 + 31) / 32, (unsigned)ne01);
++                const ggml_cuda_kernel_launch_params lp(grid, dim3(32, 32, 1), 0, main_stream);
++                ggml_cuda_kernel_launch(cpy_f32_permute_tiled, lp, (const float *)src0_ddc, (float *)src1_ddc,
++                    (int)ne00, (int)ne02, (int)ne01,
++                    (int64_t)ne00, (int64_t)ne00 * ne01,
++                    (int64_t)ne00 * ne01, (int64_t)ne00);
++                return;
++            }
++        }
+         if (can_be_transposed) {
+             ggml_cpy_scalar_cuda<float, float, true>
+                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+@@ -611,7 +647,121 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
+     }
+ }
+ 
++// (sam3) Fast path for the permuted-view F32 copies produced by the
++// channels-last conv / attention layout fixups. The generic cpy_scalar kernel
++// gathers these element-by-element at a fraction of the achievable bandwidth.
++//
++// Copies dst[b][v][u] = src[b][u][v] over b in [0,nb), u in [0,nu), v in
++// [0,nv) with arbitrary batch/row strides — i.e. a batched 2D in-plane
++// transpose where dim u is unit-stride on dst and dim v is unit-stride on src.
++// A shared-memory tile makes both the src reads and the dst writes coalesced:
++// the load phase reads src along v (consecutive threadIdx.x), the store phase
++// swaps the thread roles and writes dst along u (consecutive threadIdx.x) by
++// reading the tile transposed. tile[32][33] padding avoids shared-memory bank
++// conflicts on both phases.
++__global__ void cpy_f32_permute_tiled(
++        const float * __restrict__ src, float * __restrict__ dst,
++        const int nu, const int nv, const int nb,
++        const int64_t src_ustride, const int64_t src_bstride,
++        const int64_t dst_vstride, const int64_t dst_bstride) {
++    ggml_cuda_pdl_sync();
++    __shared__ float tile[32][33];
++    const int u0 = blockIdx.y * 32;
++    const int v0 = blockIdx.x * 32;
++    // load phase: thread (tx,ty) reads src(u0+ty, v0+tx) — coalesced along tx
++    const int u = u0 + threadIdx.y;
++    const int v = v0 + threadIdx.x;
++    if (u < nu && v < nv) {
++        tile[threadIdx.y][threadIdx.x] = src[(int64_t)blockIdx.z * src_bstride + (int64_t)u * src_ustride + v];
++    }
++    __syncthreads();
++    // store phase: thread (tx,ty) writes dst(v0+ty, u0+tx) — coalesced along tx;
++    // tile[tx][ty] holds src(u0+tx, v0+ty), exactly the value dst needs.
++    const int us = u0 + threadIdx.x;
++    const int vs = v0 + threadIdx.y;
++    if (us < nu && vs < nv) {
++        dst[(int64_t)blockIdx.z * dst_bstride + (int64_t)vs * dst_vstride + us] = tile[threadIdx.x][threadIdx.y];
++    }
++}
++
+ void ggml_cuda_dup(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      const ggml_tensor * src0 = dst->src[0];
      ggml_cuda_cpy(ctx, src0, dst);
  }
@@ -286,6 +377,36 @@ index a7a87d8f..d95f9395 100644
 +
 +void ggml_cuda_win_part(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 +void ggml_cuda_win_unpart(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+diff --git a/src/ggml-cuda/fattn-mma-f16.cuh b/src/ggml-cuda/fattn-mma-f16.cuh
+index 7f4cfd55..ba40ca55 100644
+--- a/src/ggml-cuda/fattn-mma-f16.cuh
++++ b/src/ggml-cuda/fattn-mma-f16.cuh
+@@ -36,6 +36,12 @@ struct fattn_mma_config {
+     }                                                                                                                                                              \
+ 
+ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_ampere(const int DKQ, const int DV, const int ncols) {
++    // (sam3) DKQ=DV=32: nbatch_K2/V2/combine = DKQ/2, DV/2, DV/2, mirroring the 64-case pattern.
++    GGML_CUDA_FATTN_MMA_CONFIG_CASE( 32,  32,  8, 128, 2, 128,  16,  16,  16, 2, true);
++    GGML_CUDA_FATTN_MMA_CONFIG_CASE( 32,  32, 16, 128, 2,  64,  16,  16,  16, 2, true);
++    GGML_CUDA_FATTN_MMA_CONFIG_CASE( 32,  32, 32, 128, 2,  64,  16,  16,  16, 2, true);
++    GGML_CUDA_FATTN_MMA_CONFIG_CASE( 32,  32, 64, 128, 2,  64,  16,  16,  16, 2, true);
++
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64,  8, 128, 2, 128,  32,  32,  32, 2, true);
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64, 16, 128, 2,  64,  32,  32,  32, 2, true);
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64, 32, 128, 2,  64,  32,  32,  32, 2, true);
+@@ -1975,6 +1981,12 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
+     extern DECL_FATTN_MMA_F16_CASE(DKQ, DV, (ncols)/ 8,  8); \
+     extern DECL_FATTN_MMA_F16_CASE(DKQ, DV, (ncols)/16, 16); \
+ 
++// (sam3) DKQ=DV=32: extern declarations for the instance files.
++DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2( 32,  32,   8)
++DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2( 32,  32,  16)
++DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2( 32,  32,  32)
++DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2( 32,  32,  64)
++
+ DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2( 64,  64,   8)
+ DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2( 80,  80,   8)
+ DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2( 96,  96,   8)
 diff --git a/src/ggml-cuda/fattn-tile.cu b/src/ggml-cuda/fattn-tile.cu
 index e563729a..93b1b00b 100644
 --- a/src/ggml-cuda/fattn-tile.cu
@@ -426,10 +547,21 @@ index d1164b85..d7d7f73a 100644
  extern DECL_FATTN_TILE_CASE( 64,  64);
  extern DECL_FATTN_TILE_CASE( 72,  72);
 diff --git a/src/ggml-cuda/fattn.cu b/src/ggml-cuda/fattn.cu
-index ab7a3b29..ad83ecad 100644
+index ab7a3b29..a4f787c9 100644
 --- a/src/ggml-cuda/fattn.cu
 +++ b/src/ggml-cuda/fattn.cu
-@@ -391,7 +391,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -119,6 +119,10 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
+     const ggml_tensor * mask = dst->src[3];
+ 
+     switch (Q->ne[0]) {
++        case 32:
++            GGML_ASSERT(V->ne[0] == 32);
++            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2< 32,  32>(ctx, dst);
++            break;
+         case 64:
+             GGML_ASSERT(V->ne[0] == 64);
+             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2< 64,  64>(ctx, dst);
+@@ -391,7 +395,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
      const int cc = ggml_cuda_info().devices[device].cc;
  
      switch (K->ne[0]) {
@@ -440,16 +572,17 @@ index ab7a3b29..ad83ecad 100644
          case  64:
          case  72:
          case  80:
-@@ -458,7 +461,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -458,7 +465,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
      const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
  
      // If Turing tensor cores are available, use them:
 -    if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
-+    if (turing_mma_available(cc) && Q->ne[0] != 16 && Q->ne[0] != 32 && Q->ne[0] != 40 && Q->ne[0] != 56 && Q->ne[0] != 72) {
++    // (sam3) DKQ=32 is supported by the MMA kernel via the config-table entries below.
++    if (turing_mma_available(cc) && Q->ne[0] != 16 && Q->ne[0] != 40 && Q->ne[0] != 56 && Q->ne[0] != 72) {
          if (can_use_vector_kernel) {
              if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
                  if (cc >= GGML_CUDA_CC_ADA_LOVELACE && Q->ne[1] == 1 && Q->ne[3] == 1 && !(gqa_ratio > 4 && K->ne[1] >= 8192)) {
-@@ -488,7 +491,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -488,7 +496,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
          gqa_ratio_eff *= 2;
      }
  
@@ -458,7 +591,7 @@ index ab7a3b29..ad83ecad 100644
          if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
              return BEST_FATTN_KERNEL_VEC;
          }
-@@ -499,7 +502,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -499,7 +507,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
      }
  
      // AMD MFMA needs a certain minimum batch size to outscale the tile kernel for large head sizes.
@@ -467,7 +600,7 @@ index ab7a3b29..ad83ecad 100644
          if ((Q->ne[0] <= 64 && Q->ne[1] * gqa_ratio_eff > 8)) {
              return BEST_FATTN_KERNEL_MMA_F16;
          }
-@@ -512,7 +515,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -512,7 +520,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
      }
  
      // AMD WMMA is always faster than the tile kernel if the full tile width of 16 can be utilized.
@@ -477,10 +610,10 @@ index ab7a3b29..ad83ecad 100644
      }
  
 diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
-index a8a1c09c..53cc9f04 100644
+index 561ab7ac..ac479111 100644
 --- a/src/ggml-cuda/ggml-cuda.cu
 +++ b/src/ggml-cuda/ggml-cuda.cu
-@@ -1433,7 +1433,8 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+@@ -1430,7 +1430,8 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
      int64_t s12 = nb12 / src1_ts;
      int64_t s13 = nb13 / src1_ts;
  
@@ -490,7 +623,7 @@ index a8a1c09c..53cc9f04 100644
  
      const cuda_t * src0_ptr = nullptr;
      const cuda_t * src1_ptr = nullptr;
-@@ -1507,11 +1508,11 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+@@ -1504,11 +1505,11 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
      const void * beta = traits::get_beta();
  
      const int cc = ggml_cuda_info().devices[ctx.device].cc;
@@ -505,7 +638,7 @@ index a8a1c09c..53cc9f04 100644
      }
  
      if (prefer_f32_output) {
-@@ -1524,9 +1525,13 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+@@ -1521,9 +1522,13 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
          if constexpr (compute_type == GGML_TYPE_F32) {
              dst_ptr = (char *) dst_ddf;  // Direct F32 output
          } else {
@@ -522,7 +655,7 @@ index a8a1c09c..53cc9f04 100644
          }
      }
  
-@@ -1613,7 +1618,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+@@ -1610,7 +1615,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
      }
  
      // Convert output back to F32 if needed
@@ -531,7 +664,7 @@ index a8a1c09c..53cc9f04 100644
          const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(traits::ggml_type_val);
          to_fp32_cuda(dst_temp.get(), dst_ddf, ne_dst, main_stream);
      }
-@@ -2218,6 +2223,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+@@ -2184,6 +2189,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
          case GGML_OP_CONCAT:
              ggml_cuda_op_concat(ctx, dst);
              break;
@@ -544,7 +677,7 @@ index a8a1c09c..53cc9f04 100644
          case GGML_OP_UPSCALE:
              ggml_cuda_op_upscale(ctx, dst);
              break;
-@@ -4929,6 +4940,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -4799,6 +4810,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                  if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16) {
                      return false;
                  }
@@ -554,7 +687,7 @@ index a8a1c09c..53cc9f04 100644
  #ifdef GGML_USE_MUSA
                  const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
                  if (b->ne[2]*b->ne[3] > 1 && !ggml_is_transposed(a) && !ggml_is_transposed(b)) {
-@@ -5238,6 +5252,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5102,6 +5116,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
          case GGML_OP_ROPE_BACK: {
              return op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) && ggml_is_contiguous_2(op->src[0]);
          }
@@ -566,10 +699,10 @@ index a8a1c09c..53cc9f04 100644
          case GGML_OP_IM2COL_3D:
          case GGML_OP_CONV_2D:
 diff --git a/src/ggml-cuda/rope.cu b/src/ggml-cuda/rope.cu
-index e546fb65..1f43bdfa 100644
+index e20a5cb6..10cf7a47 100644
 --- a/src/ggml-cuda/rope.cu
 +++ b/src/ggml-cuda/rope.cu
-@@ -532,6 +532,92 @@ static void rope_vision_cuda(const T *            x,
+@@ -503,6 +503,92 @@ static void rope_vision_cuda(const T *            x,
      }
  }
  
@@ -662,21 +795,33 @@ index e546fb65..1f43bdfa 100644
  template <bool forward>
  void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
                              ggml_tensor *               dst,
-@@ -561,7 +647,10 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
+@@ -528,11 +614,14 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
+     }
+     cudaStream_t stream = ctx.stream();
+ 
++    const int mode = ((int32_t *) dst->op_params)[2];
++
+     GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
      GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16);
      // When not fused, src0 and dst types must match
      // When fused (ROPE+VIEW+SET_ROWS), src0 may be F32 and dst may be F16
 -    GGML_ASSERT(src0->type == dst->type || (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16));
-+    // CUSTOM_FREQS additionally allows F16 -> F32 (interleaved complex RoPE)
 +    GGML_ASSERT(src0->type == dst->type || (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) ||
-+                (((const int32_t *) dst->op_params)[2] == GGML_ROPE_TYPE_CUSTOM_FREQS &&
-+                 src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32));
++                (mode == GGML_ROPE_TYPE_CUSTOM_FREQS && src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32));
  
      const int64_t ne00 = src0->ne[0]; // head dims
      const int64_t ne01 = src0->ne[1]; // num heads
-@@ -603,6 +692,37 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
-     memcpy(&beta_slow,   (int32_t *) dst->op_params + 10, sizeof(float));
-     memcpy(&sections.v,  (int32_t *) dst->op_params + 11, sizeof(int)*4);
+@@ -549,7 +638,6 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
+ 
+     //const int n_past     = ((int32_t *) dst->op_params)[0];
+     const int n_dims     = ((int32_t *) dst->op_params)[1];
+-    const int mode       = ((int32_t *) dst->op_params)[2];
+     //const int n_ctx      = ((int32_t *) dst->op_params)[3];
+     const int n_ctx_orig = ((int32_t *) dst->op_params)[4];
+     mrope_sections sections;
+@@ -575,6 +663,37 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
+     const bool is_imrope = mode == GGML_ROPE_TYPE_IMROPE;
+     const bool is_vision = mode == GGML_ROPE_TYPE_VISION;
  
 +    if (mode == GGML_ROPE_TYPE_CUSTOM_FREQS) {
 +        GGML_ASSERT(forward && set_rows == nullptr);
@@ -709,9 +854,201 @@ index e546fb65..1f43bdfa 100644
 +        return;
 +    }
 +
-     const bool is_neox = mode & GGML_ROPE_TYPE_NEOX;
-     const bool is_mrope = mode & GGML_ROPE_TYPE_MROPE;
-     const bool is_imrope = mode == GGML_ROPE_TYPE_IMROPE;
+     if (is_mrope) {
+         GGML_ASSERT(sections.v[0] > 0 || sections.v[1] > 0 || sections.v[2] > 0);
+     }
+diff --git a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8.cu b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8.cu
+index 6ae77bec..2ffb90cb 100644
+--- a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8.cu
++++ b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_8.cu
+@@ -2,6 +2,7 @@
+ 
+ #include "../fattn-mma-f16.cuh"
+ 
++DECL_FATTN_MMA_F16_CASE(32, 32, 1, 8);
+ DECL_FATTN_MMA_F16_CASE(64, 64, 1, 8);
+ DECL_FATTN_MMA_F16_CASE(80, 80, 1, 8);
+ DECL_FATTN_MMA_F16_CASE(96, 96, 1, 8);
+diff --git a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1.cu b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1.cu
+index 9d3cfd8e..01619207 100644
+--- a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1.cu
++++ b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_1.cu
+@@ -2,6 +2,7 @@
+ 
+ #include "../fattn-mma-f16.cuh"
+ 
++DECL_FATTN_MMA_F16_CASE(32, 32, 16, 1);
+ DECL_FATTN_MMA_F16_CASE(64, 64, 16, 1);
+ DECL_FATTN_MMA_F16_CASE(80, 80, 16, 1);
+ DECL_FATTN_MMA_F16_CASE(96, 96, 16, 1);
+diff --git a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2.cu b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2.cu
+index 0c1a37fd..94dee950 100644
+--- a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2.cu
++++ b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_2.cu
+@@ -2,6 +2,7 @@
+ 
+ #include "../fattn-mma-f16.cuh"
+ 
++DECL_FATTN_MMA_F16_CASE(32, 32, 16, 2);
+ DECL_FATTN_MMA_F16_CASE(64, 64, 16, 2);
+ DECL_FATTN_MMA_F16_CASE(80, 80, 16, 2);
+ DECL_FATTN_MMA_F16_CASE(96, 96, 16, 2);
+diff --git a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4.cu b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4.cu
+index d2415bfa..afb0a545 100644
+--- a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4.cu
++++ b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_16-ncols2_4.cu
+@@ -2,6 +2,7 @@
+ 
+ #include "../fattn-mma-f16.cuh"
+ 
++DECL_FATTN_MMA_F16_CASE(32, 32, 16, 4);
+ DECL_FATTN_MMA_F16_CASE(64, 64, 16, 4);
+ DECL_FATTN_MMA_F16_CASE(80, 80, 16, 4);
+ DECL_FATTN_MMA_F16_CASE(96, 96, 16, 4);
+diff --git a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4.cu b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4.cu
+index 8eec1d74..9cc0eb57 100644
+--- a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4.cu
++++ b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_4.cu
+@@ -2,6 +2,7 @@
+ 
+ #include "../fattn-mma-f16.cuh"
+ 
++DECL_FATTN_MMA_F16_CASE(32, 32, 2, 4);
+ DECL_FATTN_MMA_F16_CASE(64, 64, 2, 4);
+ DECL_FATTN_MMA_F16_CASE(80, 80, 2, 4);
+ DECL_FATTN_MMA_F16_CASE(96, 96, 2, 4);
+diff --git a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8.cu b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8.cu
+index 9f4bef11..8bba1a67 100644
+--- a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8.cu
++++ b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_2-ncols2_8.cu
+@@ -2,6 +2,7 @@
+ 
+ #include "../fattn-mma-f16.cuh"
+ 
++DECL_FATTN_MMA_F16_CASE(32, 32, 2, 8);
+ DECL_FATTN_MMA_F16_CASE(64, 64, 2, 8);
+ DECL_FATTN_MMA_F16_CASE(80, 80, 2, 8);
+ DECL_FATTN_MMA_F16_CASE(96, 96, 2, 8);
+diff --git a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1.cu b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1.cu
+index 0543532e..2971d83a 100644
+--- a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1.cu
++++ b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_1.cu
+@@ -2,6 +2,7 @@
+ 
+ #include "../fattn-mma-f16.cuh"
+ 
++DECL_FATTN_MMA_F16_CASE(32, 32, 32, 1);
+ DECL_FATTN_MMA_F16_CASE(64, 64, 32, 1);
+ DECL_FATTN_MMA_F16_CASE(80, 80, 32, 1);
+ DECL_FATTN_MMA_F16_CASE(96, 96, 32, 1);
+diff --git a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2.cu b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2.cu
+index d5a4d160..e97fc1be 100644
+--- a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2.cu
++++ b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_32-ncols2_2.cu
+@@ -2,6 +2,7 @@
+ 
+ #include "../fattn-mma-f16.cuh"
+ 
++DECL_FATTN_MMA_F16_CASE(32, 32, 32, 2);
+ DECL_FATTN_MMA_F16_CASE(64, 64, 32, 2);
+ DECL_FATTN_MMA_F16_CASE(80, 80, 32, 2);
+ DECL_FATTN_MMA_F16_CASE(96, 96, 32, 2);
+diff --git a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2.cu b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2.cu
+index d8e7588c..f7a62a96 100644
+--- a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2.cu
++++ b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_2.cu
+@@ -2,6 +2,7 @@
+ 
+ #include "../fattn-mma-f16.cuh"
+ 
++DECL_FATTN_MMA_F16_CASE(32, 32, 4, 2);
+ DECL_FATTN_MMA_F16_CASE(64, 64, 4, 2);
+ DECL_FATTN_MMA_F16_CASE(80, 80, 4, 2);
+ DECL_FATTN_MMA_F16_CASE(96, 96, 4, 2);
+diff --git a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4.cu b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4.cu
+index 3475dfea..fb955fb3 100644
+--- a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4.cu
++++ b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4.cu
+@@ -2,6 +2,7 @@
+ 
+ #include "../fattn-mma-f16.cuh"
+ 
++DECL_FATTN_MMA_F16_CASE(32, 32, 4, 4);
+ DECL_FATTN_MMA_F16_CASE(64, 64, 4, 4);
+ DECL_FATTN_MMA_F16_CASE(80, 80, 4, 4);
+ DECL_FATTN_MMA_F16_CASE(96, 96, 4, 4);
+diff --git a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8.cu b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8.cu
+index 859bea5c..f3046dbd 100644
+--- a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8.cu
++++ b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_8.cu
+@@ -2,6 +2,7 @@
+ 
+ #include "../fattn-mma-f16.cuh"
+ 
++DECL_FATTN_MMA_F16_CASE(32, 32, 4, 8);
+ DECL_FATTN_MMA_F16_CASE(64, 64, 4, 8);
+ DECL_FATTN_MMA_F16_CASE(80, 80, 4, 8);
+ DECL_FATTN_MMA_F16_CASE(96, 96, 4, 8);
+diff --git a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1.cu b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1.cu
+index 0d7a9c72..87dfb90e 100644
+--- a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1.cu
++++ b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_64-ncols2_1.cu
+@@ -2,6 +2,7 @@
+ 
+ #include "../fattn-mma-f16.cuh"
+ 
++DECL_FATTN_MMA_F16_CASE(32, 32, 64, 1);
+ DECL_FATTN_MMA_F16_CASE(64, 64, 64, 1);
+ DECL_FATTN_MMA_F16_CASE(80, 80, 64, 1);
+ DECL_FATTN_MMA_F16_CASE(96, 96, 64, 1);
+diff --git a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1.cu b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1.cu
+index 9d5a9976..a330d9ea 100644
+--- a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1.cu
++++ b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_1.cu
+@@ -2,6 +2,7 @@
+ 
+ #include "../fattn-mma-f16.cuh"
+ 
++DECL_FATTN_MMA_F16_CASE(32, 32, 8, 1);
+ DECL_FATTN_MMA_F16_CASE(64, 64, 8, 1);
+ DECL_FATTN_MMA_F16_CASE(80, 80, 8, 1);
+ DECL_FATTN_MMA_F16_CASE(96, 96, 8, 1);
+diff --git a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2.cu b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2.cu
+index e48e28c4..358aa079 100644
+--- a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2.cu
++++ b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_2.cu
+@@ -2,6 +2,7 @@
+ 
+ #include "../fattn-mma-f16.cuh"
+ 
++DECL_FATTN_MMA_F16_CASE(32, 32, 8, 2);
+ DECL_FATTN_MMA_F16_CASE(64, 64, 8, 2);
+ DECL_FATTN_MMA_F16_CASE(80, 80, 8, 2);
+ DECL_FATTN_MMA_F16_CASE(96, 96, 8, 2);
+diff --git a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4.cu b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4.cu
+index 684cd25c..184271ad 100644
+--- a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4.cu
++++ b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_4.cu
+@@ -2,6 +2,7 @@
+ 
+ #include "../fattn-mma-f16.cuh"
+ 
++DECL_FATTN_MMA_F16_CASE(32, 32, 8, 4);
+ DECL_FATTN_MMA_F16_CASE(64, 64, 8, 4);
+ DECL_FATTN_MMA_F16_CASE(80, 80, 8, 4);
+ DECL_FATTN_MMA_F16_CASE(96, 96, 8, 4);
+diff --git a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8.cu b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8.cu
+index c975ce6b..7851dff1 100644
+--- a/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8.cu
++++ b/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8.cu
+@@ -2,6 +2,7 @@
+ 
+ #include "../fattn-mma-f16.cuh"
+ 
++DECL_FATTN_MMA_F16_CASE(32, 32, 8, 8);
+ DECL_FATTN_MMA_F16_CASE(64, 64, 8, 8);
+ DECL_FATTN_MMA_F16_CASE(80, 80, 8, 8);
+ DECL_FATTN_MMA_F16_CASE(96, 96, 8, 8);
 diff --git a/src/ggml-cuda/template-instances/fattn-tile-instance-dkq16-dv16.cu b/src/ggml-cuda/template-instances/fattn-tile-instance-dkq16-dv16.cu
 new file mode 100644
 index 00000000..088b27f7
@@ -746,26 +1083,27 @@ index 00000000..00edd305
 +
 +DECL_FATTN_TILE_CASE(56, 56);
 diff --git a/src/ggml-metal/ggml-metal-device.m b/src/ggml-metal/ggml-metal-device.m
-index 312b00dc..f3331d1f 100644
+index 2dc6eb8f..d9b1eb25 100644
 --- a/src/ggml-metal/ggml-metal-device.m
 +++ b/src/ggml-metal/ggml-metal-device.m
-@@ -1273,8 +1273,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
-             return ggml_is_contiguous(op->src[0]);
+@@ -1272,9 +1272,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+             return true;
          case GGML_OP_FLASH_ATTN_EXT:
              // for new head sizes, add checks here
 -            if (op->src[0]->ne[0] != 32 &&
 +            if (op->src[0]->ne[0] != 16 &&
 +                op->src[0]->ne[0] != 32 &&
                  op->src[0]->ne[0] != 40 &&
-+                op->src[0]->ne[0] != 56 &&
                  op->src[0]->ne[0] != 48 &&
++                op->src[0]->ne[0] != 56 &&
                  op->src[0]->ne[0] != 64 &&
                  op->src[0]->ne[0] != 72 &&
+                 op->src[0]->ne[0] != 80 &&
 diff --git a/src/ggml-metal/ggml-metal.metal b/src/ggml-metal/ggml-metal.metal
-index 27f97b5e..96dd17d6 100644
+index 7d12cb0f..96a53dad 100644
 --- a/src/ggml-metal/ggml-metal.metal
 +++ b/src/ggml-metal/ggml-metal.metal
-@@ -7240,9 +7240,11 @@ kernel void kernel_flash_attn_ext(
+@@ -7125,9 +7125,11 @@ kernel void kernel_flash_attn_ext(
  
  typedef decltype(kernel_flash_attn_ext<FA_TYPES, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 64, 64>) flash_attn_ext_t;
  
@@ -777,7 +1115,7 @@ index 27f97b5e..96dd17d6 100644
  template [[host_name("kernel_flash_attn_ext_f32_dk64_dv64"  )]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_F32, float4x4,   1, dequantize_f32,  float4x4,   1, dequantize_f32,  64,  64>;
  template [[host_name("kernel_flash_attn_ext_f32_dk72_dv72"  )]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_F32, float4x4,   1, dequantize_f32,  float4x4,   1, dequantize_f32,  72,  72>;
  template [[host_name("kernel_flash_attn_ext_f32_dk80_dv80"  )]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_F32, float4x4,   1, dequantize_f32,  float4x4,   1, dequantize_f32,  80,  80>;
-@@ -7256,9 +7258,11 @@ template [[host_name("kernel_flash_attn_ext_f32_dk320_dv256")]]  kernel flash_at
+@@ -7141,9 +7143,11 @@ template [[host_name("kernel_flash_attn_ext_f32_dk320_dv256")]]  kernel flash_at
  template [[host_name("kernel_flash_attn_ext_f32_dk512_dv512")]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_F32, float4x4,   1, dequantize_f32,  float4x4,   1, dequantize_f32,  512, 512>;
  template [[host_name("kernel_flash_attn_ext_f32_dk576_dv512")]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_F32, float4x4,   1, dequantize_f32,  float4x4,   1, dequantize_f32,  576, 512>;
  
@@ -789,7 +1127,7 @@ index 27f97b5e..96dd17d6 100644
  template [[host_name("kernel_flash_attn_ext_f16_dk64_dv64"  )]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    half4x4,    1, dequantize_f16,  half4x4,    1, dequantize_f16,  64,  64>;
  template [[host_name("kernel_flash_attn_ext_f16_dk72_dv72"  )]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    half4x4,    1, dequantize_f16,  half4x4,    1, dequantize_f16,  72,  72>;
  template [[host_name("kernel_flash_attn_ext_f16_dk80_dv80"  )]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    half4x4,    1, dequantize_f16,  half4x4,    1, dequantize_f16,  80,  80>;
-@@ -7273,9 +7277,11 @@ template [[host_name("kernel_flash_attn_ext_f16_dk512_dv512")]]  kernel flash_at
+@@ -7158,9 +7162,11 @@ template [[host_name("kernel_flash_attn_ext_f16_dk512_dv512")]]  kernel flash_at
  template [[host_name("kernel_flash_attn_ext_f16_dk576_dv512")]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    half4x4,    1, dequantize_f16,  half4x4,    1, dequantize_f16,  576, 512>;
  
  #if defined(GGML_METAL_HAS_BF16)
@@ -801,7 +1139,7 @@ index 27f97b5e..96dd17d6 100644
  template [[host_name("kernel_flash_attn_ext_bf16_dk64_dv64"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_BF, bfloat4x4,  1, dequantize_bf16, bfloat4x4,  1, dequantize_bf16, 64,  64>;
  template [[host_name("kernel_flash_attn_ext_bf16_dk72_dv72"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_BF, bfloat4x4,  1, dequantize_bf16, bfloat4x4,  1, dequantize_bf16, 72,  72>;
  template [[host_name("kernel_flash_attn_ext_bf16_dk80_dv80"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_BF, bfloat4x4,  1, dequantize_bf16, bfloat4x4,  1, dequantize_bf16, 80,  80>;
-@@ -7290,9 +7296,11 @@ template [[host_name("kernel_flash_attn_ext_bf16_dk512_dv512")]] kernel flash_at
+@@ -7175,9 +7181,11 @@ template [[host_name("kernel_flash_attn_ext_bf16_dk512_dv512")]] kernel flash_at
  template [[host_name("kernel_flash_attn_ext_bf16_dk576_dv512")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_BF, bfloat4x4,  1, dequantize_bf16, bfloat4x4,  1, dequantize_bf16, 576, 512>;
  #endif
  
@@ -813,7 +1151,7 @@ index 27f97b5e..96dd17d6 100644
  template [[host_name("kernel_flash_attn_ext_q4_0_dk64_dv64"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_q4_0, 2, dequantize_q4_0, block_q4_0, 2, dequantize_q4_0, 64,  64>;
  template [[host_name("kernel_flash_attn_ext_q4_0_dk72_dv72"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_q4_0, 2, dequantize_q4_0, block_q4_0, 2, dequantize_q4_0, 72,  72>;
  template [[host_name("kernel_flash_attn_ext_q4_0_dk80_dv80"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_q4_0, 2, dequantize_q4_0, block_q4_0, 2, dequantize_q4_0, 80,  80>;
-@@ -7306,9 +7314,11 @@ template [[host_name("kernel_flash_attn_ext_q4_0_dk320_dv256")]] kernel flash_at
+@@ -7191,9 +7199,11 @@ template [[host_name("kernel_flash_attn_ext_q4_0_dk320_dv256")]] kernel flash_at
  template [[host_name("kernel_flash_attn_ext_q4_0_dk512_dv512")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_q4_0, 2, dequantize_q4_0, block_q4_0, 2, dequantize_q4_0, 512, 512>;
  template [[host_name("kernel_flash_attn_ext_q4_0_dk576_dv512")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_q4_0, 2, dequantize_q4_0, block_q4_0, 2, dequantize_q4_0, 576, 512>;
  
@@ -825,7 +1163,7 @@ index 27f97b5e..96dd17d6 100644
  template [[host_name("kernel_flash_attn_ext_q4_1_dk64_dv64"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_q4_1, 2, dequantize_q4_1, block_q4_1, 2, dequantize_q4_1, 64,  64>;
  template [[host_name("kernel_flash_attn_ext_q4_1_dk72_dv72"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_q4_1, 2, dequantize_q4_1, block_q4_1, 2, dequantize_q4_1, 72,  72>;
  template [[host_name("kernel_flash_attn_ext_q4_1_dk80_dv80"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_q4_1, 2, dequantize_q4_1, block_q4_1, 2, dequantize_q4_1, 80,  80>;
-@@ -7322,9 +7332,11 @@ template [[host_name("kernel_flash_attn_ext_q4_1_dk320_dv256")]] kernel flash_at
+@@ -7207,9 +7217,11 @@ template [[host_name("kernel_flash_attn_ext_q4_1_dk320_dv256")]] kernel flash_at
  template [[host_name("kernel_flash_attn_ext_q4_1_dk512_dv512")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_q4_1, 2, dequantize_q4_1, block_q4_1, 2, dequantize_q4_1, 512, 512>;
  template [[host_name("kernel_flash_attn_ext_q4_1_dk576_dv512")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_q4_1, 2, dequantize_q4_1, block_q4_1, 2, dequantize_q4_1, 576, 512>;
  
@@ -837,7 +1175,7 @@ index 27f97b5e..96dd17d6 100644
  template [[host_name("kernel_flash_attn_ext_q5_0_dk64_dv64"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_q5_0, 2, dequantize_q5_0, block_q5_0, 2, dequantize_q5_0, 64,  64>;
  template [[host_name("kernel_flash_attn_ext_q5_0_dk72_dv72"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_q5_0, 2, dequantize_q5_0, block_q5_0, 2, dequantize_q5_0, 72,  72>;
  template [[host_name("kernel_flash_attn_ext_q5_0_dk80_dv80"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_q5_0, 2, dequantize_q5_0, block_q5_0, 2, dequantize_q5_0, 80,  80>;
-@@ -7338,9 +7350,11 @@ template [[host_name("kernel_flash_attn_ext_q5_0_dk320_dv256")]] kernel flash_at
+@@ -7223,9 +7235,11 @@ template [[host_name("kernel_flash_attn_ext_q5_0_dk320_dv256")]] kernel flash_at
  template [[host_name("kernel_flash_attn_ext_q5_0_dk512_dv512")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_q5_0, 2, dequantize_q5_0, block_q5_0, 2, dequantize_q5_0, 512, 512>;
  template [[host_name("kernel_flash_attn_ext_q5_0_dk576_dv512")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_q5_0, 2, dequantize_q5_0, block_q5_0, 2, dequantize_q5_0, 576, 512>;
  
@@ -849,7 +1187,7 @@ index 27f97b5e..96dd17d6 100644
  template [[host_name("kernel_flash_attn_ext_q5_1_dk64_dv64"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_q5_1, 2, dequantize_q5_1, block_q5_1, 2, dequantize_q5_1, 64,  64>;
  template [[host_name("kernel_flash_attn_ext_q5_1_dk72_dv72"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_q5_1, 2, dequantize_q5_1, block_q5_1, 2, dequantize_q5_1, 72,  72>;
  template [[host_name("kernel_flash_attn_ext_q5_1_dk80_dv80"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_q5_1, 2, dequantize_q5_1, block_q5_1, 2, dequantize_q5_1, 80,  80>;
-@@ -7354,9 +7368,11 @@ template [[host_name("kernel_flash_attn_ext_q5_1_dk320_dv256")]] kernel flash_at
+@@ -7239,9 +7253,11 @@ template [[host_name("kernel_flash_attn_ext_q5_1_dk320_dv256")]] kernel flash_at
  template [[host_name("kernel_flash_attn_ext_q5_1_dk512_dv512")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_q5_1, 2, dequantize_q5_1, block_q5_1, 2, dequantize_q5_1, 512, 512>;
  template [[host_name("kernel_flash_attn_ext_q5_1_dk576_dv512")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_q5_1, 2, dequantize_q5_1, block_q5_1, 2, dequantize_q5_1, 576, 512>;
  
@@ -862,10 +1200,10 @@ index 27f97b5e..96dd17d6 100644
  template [[host_name("kernel_flash_attn_ext_q8_0_dk72_dv72"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_q8_0, 2, dequantize_q8_0, block_q8_0, 2, dequantize_q8_0, 72,  72>;
  template [[host_name("kernel_flash_attn_ext_q8_0_dk80_dv80"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_q8_0, 2, dequantize_q8_0, block_q8_0, 2, dequantize_q8_0, 80,  80>;
 diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
-index f6cbaecb..60f89139 100644
+index 510fb689..31cea40d 100644
 --- a/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/src/ggml-vulkan/ggml-vulkan.cpp
-@@ -1082,6 +1082,9 @@ struct vk_device_struct {
+@@ -1043,6 +1043,9 @@ struct vk_device_struct {
      std::map<vk_conv3d_pipeline_state, vk_pipeline> pipeline_conv3d_f16_f32[CONV_SHAPE_COUNT];
      vk_pipeline pipeline_conv2d_dw_whcn_f32, pipeline_conv2d_dw_whcn_f16_f32;
      vk_pipeline pipeline_conv2d_dw_cwhn_f32, pipeline_conv2d_dw_cwhn_f16_f32;
@@ -875,7 +1213,7 @@ index f6cbaecb..60f89139 100644
  
      std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16;
  
-@@ -1906,6 +1909,20 @@ template <> void init_pushconst_fastdiv(vk_op_conv2d_push_constants &p) {
+@@ -1807,6 +1810,20 @@ template <> void init_pushconst_fastdiv(vk_op_conv2d_push_constants &p) {
      init_fastdiv_values(p.OW*p.OH,  p.OWOHmp,  p.OWOHL);
  }
  
@@ -896,7 +1234,7 @@ index f6cbaecb..60f89139 100644
  struct vk_op_conv3d_push_constants {
      uint32_t OC;
      uint32_t IC;
-@@ -5814,6 +5831,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+@@ -5648,6 +5665,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
      ggml_vk_create_pipeline(device, device->pipeline_timestep_embedding_f32, "timestep_embedding_f32", timestep_embedding_f32_len, timestep_embedding_f32_data, "main", 2, sizeof(vk_op_timestep_embedding_push_constants), {256, 1, 1}, {}, 1);
  
      ggml_vk_create_pipeline(device, device->pipeline_conv_transpose_1d_f32, "conv_transpose_1d_f32", conv_transpose_1d_f32_len, conv_transpose_1d_f32_data, "main", 3, sizeof(vk_op_conv_transpose_1d_push_constants), {1, 1, 1}, {}, 1);
@@ -906,7 +1244,7 @@ index f6cbaecb..60f89139 100644
      ggml_vk_create_pipeline(device, device->pipeline_col2im_1d_f32,  "col2im_1d_f32",  col2im_1d_f32_len,  col2im_1d_f32_data,  "main", 2, sizeof(vk_op_col2im_1d_push_constants), {256, 1, 1}, {}, 1, true);
      ggml_vk_create_pipeline(device, device->pipeline_col2im_1d_f16,  "col2im_1d_f16",  col2im_1d_f16_len,  col2im_1d_f16_data,  "main", 2, sizeof(vk_op_col2im_1d_push_constants), {256, 1, 1}, {}, 1, true);
      ggml_vk_create_pipeline(device, device->pipeline_col2im_1d_bf16, "col2im_1d_bf16", col2im_1d_bf16_len, col2im_1d_bf16_data, "main", 2, sizeof(vk_op_col2im_1d_push_constants), {256, 1, 1}, {}, 1, true);
-@@ -14209,6 +14229,126 @@ static void ggml_vk_pool_2d(ggml_backend_vk_context * ctx, vk_context& subctx, c
+@@ -13888,6 +13908,134 @@ static void ggml_vk_pool_2d(ggml_backend_vk_context * ctx, vk_context& subctx, c
      });
  }
  
@@ -957,6 +1295,8 @@ index f6cbaecb..60f89139 100644
 +    ggml_vk_dispatch_pipeline(ctx, subctx, reorder_pipeline, { buf_w, buf_k },
 +        vk_op_conv_transpose_2d_reorder_push_constants{ Cout, Cin, reorder_total },
 +        { reorder_total, 1, 1 });
++    // the GEMM reads the reordered kernel: order the two dispatches
++    ggml_vk_sync_buffers(ctx, subctx);
 +
 +    // 2. one 1x1 conv GEMM: [K, Cin] @ [Cin, WH] = [K, WH]
 +    const vk_conv_shapes shape = ggml_vk_conv_select_shape(ctx, K, WH);
@@ -969,10 +1309,14 @@ index f6cbaecb..60f89139 100644
 +    vk_conv2d_pipeline_state conv_state(1, 1, 0, 0, 1, 1, 1, 1, aligned);
 +
 +    std::map<vk_conv2d_pipeline_state, vk_pipeline> *pipelines = nullptr;
++    // Must use the TRANSPOSE-compiled shader variants: their kernel indexing is
++    // knl_idx = K_idx * nb02 + Cin_idx_a * nb03 (KW = KH = 1), i.e. the dense
++    // reordered [K, Cin] matrix is read with strides (Cin, 1). The plain conv2d
++    // variants swap the two terms and read the buffer completely out of bounds.
 +    if (kernel_f16) {
-+        pipelines = &ctx->device->pipeline_conv2d_f16_f32[shape];
++        pipelines = &ctx->device->pipeline_conv_transpose_2d_f16_f32[shape];
 +    } else {
-+        pipelines = &ctx->device->pipeline_conv2d_f32[shape];
++        pipelines = &ctx->device->pipeline_conv_transpose_2d_f32[shape];
 +    }
 +    vk_pipeline conv_pipeline = nullptr;
 +    {
@@ -994,12 +1338,12 @@ index f6cbaecb..60f89139 100644
 +    p.H  = H;
 +    p.OW = W;
 +    p.OH = H;
-+    // Reordered kernel layout: [Cin, Cout, 4] i.e. [1, 1, Cin, K] with K=4*Cout.
-+    // The conv_transpose_2d shader swaps Cin<->Cout so the weight shape seen
-+    // by the shader is [1, 1, Cout, K]. Strides for [Cin, Cout, 4]:
-+    p.nb01 = 1;          // ci
-+    p.nb02 = Cin;        // co
-+    p.nb03 = Cin * Cout; // phase
++    // Reordered kernel is a dense [K, Cin] row-major matrix (K = 4*Cout):
++    // A[K_idx, ci] = kbuf[K_idx * Cin + ci]. The TRANSPOSE shader computes
++    // knl_idx = K_idx * nb02 + Cin_idx_a * nb03, so nb02 = Cin, nb03 = 1.
++    p.nb01 = 1;          // unused (KW = KH = 1)
++    p.nb02 = Cin;        // K_idx stride
++    p.nb03 = 1;          // ci stride
 +    // input [W,H,Cin]
 +    p.nb11 = W;
 +    p.nb12 = WH;
@@ -1017,6 +1361,8 @@ index f6cbaecb..60f89139 100644
 +        elements[1] = 512;
 +    }
 +    ggml_vk_dispatch_pipeline(ctx, subctx, conv_pipeline, { buf_k, buf_in, buf_ph }, p, elements);
++    // the interleave reads the GEMM output: order the two dispatches
++    ggml_vk_sync_buffers(ctx, subctx);
 +
 +    // 3. interleave the four [Cout, WH] phase matrices into the strided output
 +    vk_pipeline interleave_pipeline = ctx->device->pipeline_conv_transpose_2d_interleave_f32;
@@ -1033,7 +1379,7 @@ index f6cbaecb..60f89139 100644
  static void ggml_vk_conv_2d(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * src0,
                              const ggml_tensor * src1, ggml_tensor * dst) {
      GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
-@@ -14222,6 +14362,13 @@ static void ggml_vk_conv_2d(ggml_backend_vk_context * ctx, vk_context & subctx,
+@@ -13901,6 +14049,13 @@ static void ggml_vk_conv_2d(ggml_backend_vk_context * ctx, vk_context & subctx,
  
      bool transpose = dst->op == GGML_OP_CONV_TRANSPOSE_2D;
  
@@ -1148,10 +1494,10 @@ index 00000000..b4d99866
 +    data_d[idx] = data_a[src];
 +}
 diff --git a/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
-index caa0c889..d6f84e48 100644
+index 0223d2e0..858ca129 100644
 --- a/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
 +++ b/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
-@@ -1106,6 +1106,16 @@ void process_shaders() {
+@@ -1097,6 +1097,16 @@ void process_shaders() {
          }
      }
  
@@ -1169,7 +1515,7 @@ index caa0c889..d6f84e48 100644
          for (auto a_f16 : {false, true}) {
              std::map<std::string, std::string> defines = {
 diff --git a/src/ggml.c b/src/ggml.c
-index 1a60fec7..109de653 100644
+index 59191c66..52388fa8 100644
 --- a/src/ggml.c
 +++ b/src/ggml.c
 @@ -3275,15 +3275,17 @@ static inline bool ggml_can_mul_mat(const struct ggml_tensor * t0, const struct
@@ -1207,7 +1553,7 @@ index 1a60fec7..109de653 100644
  void ggml_mul_mat_set_prec(
          struct ggml_tensor * a,
          enum ggml_prec       prec) {
-@@ -4235,6 +4244,66 @@ struct ggml_tensor * ggml_rope(
+@@ -4233,6 +4242,66 @@ struct ggml_tensor * ggml_rope(
      );
  }
  
@@ -1274,3 +1620,181 @@ index 1a60fec7..109de653 100644
  struct ggml_tensor * ggml_rope_multi(
          struct ggml_context * ctx,
          struct ggml_tensor  * a,
+@@ -4665,7 +4734,12 @@ struct ggml_tensor * ggml_conv_2d(
+         int                   p1,
+         int                   d0,
+         int                   d1) {
+-    struct ggml_tensor * im2col = ggml_im2col(ctx, a, b, s0, s1, p0, p1, d0, d1, true, a->type == GGML_TYPE_BF16 ? GGML_TYPE_F32 : GGML_TYPE_F16); // [N, OH, OW, IC * KH * KW]
++    // im2col precision must follow the kernel dtype: F32/F16/BF16 weights keep
++    // their own precision (matches PyTorch semantics where the input is cast to
++    // the model dtype before conv). The old rule forced F16 for everything except
++    // BF16, which silently rounded F32-model activations through F16.
++    const enum ggml_type im2col_dst = (a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_BF16) ? GGML_TYPE_F32 : GGML_TYPE_F16;
++    struct ggml_tensor * im2col = ggml_im2col(ctx, a, b, s0, s1, p0, p1, d0, d1, true, im2col_dst); // [N, OH, OW, IC * KH * KW]
+ 
+     struct ggml_tensor * result =
+         ggml_mul_mat(ctx,
+diff --git a/src/ggml-cuda/im2col.cu b/src/ggml-cuda/im2col.cu
+index 28c79ab4..2a5ca37f 100644
+--- a/src/ggml-cuda/im2col.cu
++++ b/src/ggml-cuda/im2col.cu
+@@ -59,11 +59,118 @@ static void im2col_cuda(const float * x, T* dst,
+                                                                                      s0, s1, p0, p1, d0, d1);
+ }
+ 
++// Tiled fast path for unit-dilation 2D im2col (the common vision-tower case).
++// The scalar kernel above gathers every source tap with only s0-wide
++// contiguous segments (3-wide for 3x3 kernels), so read bandwidth collapses;
++// this variant streams both sides near full bandwidth:
++//   - phase 1: cooperatively load the input tile [KH][IC_B][in_w] (with halo)
++//     into shared memory using fully coalesced reads, zeros pre-filled for
++//     out-of-bounds taps;
++//   - phase 2: one thread per output element, written as contiguous spans of
++//     the [N, OH, OW, IC*KH*KW] layout, reading taps from shared memory.
++// Pure data movement - output is bit-identical to the scalar kernel.
++template <typename T>
++static __global__ void im2col_tiled_kernel(
++        const float * x, T * dst,
++        int64_t IC, int64_t IW, int64_t IH, int64_t OW, int64_t OH,
++        int64_t KH, int64_t KW, int64_t KH_KW, int64_t IC_KH_KW,
++        int s0, int s1, int p0, int p1,
++        int64_t IC_B, int64_t TW, int64_t in_w,
++        int64_t ic_blocks, int64_t tiles_x, int64_t rows) {
++    extern __shared__ float smem[];  // [KH][IC_B][in_w]
++
++    // Per-tile element counts are bounded by the smem guard below (<= 48 KB /
++    // 4 B and <= 32*32*196), so 32-bit indices are safe and much cheaper than
++    // 64-bit division on GPU.
++    const int c_total = (int)(IC_B * in_w);
++    const int cw      = (int)in_w;
++    const int out_span = (int)(IC_B * KH_KW);
++
++    for (int64_t iz = blockIdx.z; iz < rows; iz += MAX_GRIDDIM_Z) {
++        const int oh = (int)(iz % OH);
++        const int n  = (int)(iz / OH);
++        for (int64_t iy = blockIdx.y; iy < tiles_x; iy += MAX_GRIDDIM_Y) {
++            const int ow0 = (int)(iy * TW);
++            const int iw0 = ow0 * s0 - p0;
++          for (int64_t ix = blockIdx.x; ix < ic_blocks; ix += MAX_GRIDDIM_Y) {
++            const int ic0 = (int)(ix * IC_B);
++
++            // phase 1: load [KH][IC_B][in_w], zeros for out-of-bounds taps
++            const int total_in = (int)KH * c_total;
++            for (int t = threadIdx.x; t < total_in; t += blockDim.x) {
++                const int kh = t / c_total;
++                const int r  = t - kh * c_total;
++                const int c  = r / cw;
++                const int j  = r - c * cw;
++                const int ic = ic0 + c;
++                const int ih = oh * s1 + kh - p1;
++                const int iw = iw0 + j;
++                float v = 0.0f;
++                if (ic < (int)IC && ih >= 0 && ih < (int)IH && iw >= 0 && iw < (int)IW) {
++                    v = x[((int64_t)n * IC + ic) * IH * IW + (int64_t)ih * IW + iw];
++                }
++                smem[(kh * c_total) + r] = v;  // == smem[kh*IC_B*in_w + c*in_w + j]
++            }
++            __syncthreads();
++
++            // phase 2: one thread per output element, contiguous dst spans
++            const int total_out = (int)TW * out_span;
++            const int64_t row_base = ((int64_t)n * OH + oh) * OW * IC_KH_KW;
++            for (int t = threadIdx.x; t < total_out; t += blockDim.x) {
++                const int owl   = t / out_span;
++                const int r     = t - owl * out_span;
++                const int c     = r / (int)KH_KW;
++                const int ikhkw = r - c * (int)KH_KW;
++                const int ic    = ic0 + c;
++                if (ic < (int)IC && ow0 + owl < (int)OW) {
++                    const int kh  = ikhkw / (int)KW;
++                    const int ikw = ikhkw - kh * (int)KW;
++                    const float v = smem[kh * c_total + c * cw + owl * s0 + ikw];
++                    dst[row_base + (int64_t)(ow0 + owl) * IC_KH_KW + ic * KH_KW + ikhkw] = (T) v;
++                }
++            }
++            __syncthreads();
++          }
++        }
++    }
++}
++
++template <typename T>
++static bool im2col_tiled_try(const float * x, T* dst,
++    int64_t IW, int64_t IH, int64_t OW, int64_t OH, int64_t KW, int64_t KH, int64_t IC,
++    int64_t N, int s0,int s1,int p0,int p1,int d0,int d1, cudaStream_t stream) {
++    if (d0 != 1 || d1 != 1) {
++        return false;
++    }
++    int64_t TW = 32;
++    int64_t IC_B = (CUDA_IM2COL_BLOCK_SIZE + KH*KW - 1) / (KH*KW);
++    if (IC_B < 1)  IC_B = 1;
++    if (IC_B > 32) IC_B = 32;
++    int64_t in_w = (TW - 1) * s0 + KW;
++    while (TW > 1 && IC_B * KH * in_w * sizeof(float) > 48*1024) {
++        TW /= 2;
++        in_w = (TW - 1) * s0 + KW;
++    }
++    const size_t smem_size = (size_t)(IC_B * KH * in_w) * sizeof(float);
++    if (smem_size > 48*1024) {
++        return false;
++    }
++    const int64_t rows      = N * OH;
++    const int64_t ic_blocks = (IC + IC_B - 1) / IC_B;
++    const int64_t tiles_x   = (OW + TW - 1) / TW;
++    dim3 block_nums(MIN(ic_blocks, MAX_GRIDDIM_Y), MIN(tiles_x, MAX_GRIDDIM_Y), MIN(rows, MAX_GRIDDIM_Z));
++    im2col_tiled_kernel<<<block_nums, CUDA_IM2COL_BLOCK_SIZE, smem_size, stream>>>(
++        x, dst, IC, IW, IH, OW, OH, KH, KW, KW*KH, IC*KH*KW,
++        s0, s1, p0, p1, IC_B, TW, in_w, ic_blocks, tiles_x, rows);
++    return true;
++}
++
+ static void im2col_cuda_f16(const float * x, half * dst,
+     int64_t IW, int64_t IH, int64_t OW, int64_t OH, int64_t KW, int64_t KH, int64_t IC,
+     int64_t N, int64_t IC_IH_IW, int64_t IH_IW,
+     int s0,int s1,int p0,int p1,int d0,int d1, cudaStream_t stream) {
+ 
++    // tiled dispatch happens in ggml_cuda_op_im2col (needs the src stride check)
+     im2col_cuda<half>(x, dst, IW, IH, OW, OH, KW, KH, IC, N, IC_IH_IW, IH_IW, s0, s1, p0, p1, d0, d1, stream);
+ }
+ 
+@@ -72,6 +179,7 @@ static void im2col_cuda_f32(const float * x, float * dst,
+     int64_t N, int64_t IC_IH_IW, int64_t IH_IW,
+     int s0,int s1,int p0,int p1,int d0,int d1, cudaStream_t stream) {
+ 
++    // tiled dispatch happens in ggml_cuda_op_im2col (needs the src stride check)
+     im2col_cuda<float>(x, dst, IW, IH, OW, OH, KW, KH, IC, N, IC_IH_IW, IH_IW, s0, s1, p0, p1, d0, d1, stream);
+ }
+ 
+@@ -108,6 +216,32 @@ void ggml_cuda_op_im2col(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const int64_t N        = src1->ne[is_2D ? 3 : 2];
+     const int64_t IH_IW    = src1->nb[is_2D ? 3 : 2] / 4; // nb is byte offset, src is type float32
+ 
++    // tiled fast path requires a fully contiguous source (the tiled kernel
++    // indexes [N, IC, IH, IW] directly); otherwise fall through to the scalar
++    // kernel, which honours arbitrary batch strides
++#ifdef GGML_NO_FAST_IM2COL
++    const bool src_contiguous = false;
++#else
++    const bool src_contiguous = src1->nb[0] == sizeof(float)
++                             && (is_2D ? (src1->nb[1] == IW*sizeof(float)
++                                       && src1->nb[2] == IW*IH*sizeof(float)
++                                       && src1->nb[3] == IW*IH*IC*sizeof(float))
++                                       : true);
++#endif
++    if (src_contiguous) {
++        if (dst->type == GGML_TYPE_F16) {
++            if (im2col_tiled_try<half>(src1_d, (half *) dst_d, IW, IH, OW, OH, KW, KH, IC, N,
++                                       s0, s1, p0, p1, d0, d1, stream)) {
++                return;
++            }
++        } else {
++            if (im2col_tiled_try<float>(src1_d, (float *) dst_d, IW, IH, OW, OH, KW, KH, IC, N,
++                                        s0, s1, p0, p1, d0, d1, stream)) {
++                return;
++            }
++        }
++    }
++
+     if(dst->type == GGML_TYPE_F16) {
+         im2col_cuda_f16(src1_d, (half *) dst_d, IW, IH, OW, OH, KW, KH, IC, N, IC_IH_IW, IH_IW, s0, s1, p0, p1, d0, d1, stream);
+     } else {

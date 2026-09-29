@@ -76,7 +76,7 @@ The `ggml/` submodule tracks the **official upstream repo** (`https://github.com
 To update ggml: bump the submodule tag, then regenerate/adjust the consolidated patch against the new tree (`cd ggml && git apply --check ../ggml-patches/0001-sam3-ggml-combined.patch`), and update the pin in this file + README.
 
 Current patch set:
-`0001-sam3-ggml-combined.patch` — the single consolidated patch containing the Metal head-dimension extensions, CUDA flash-attention head-dimension support, CUDA/Vulkan conv2d-transpose fast paths, CUDA F16 matmul output, fused custom-frequency/F16-to-F32 RoPE, native window partition, and fused QKV layout plus Q/K RoPE changes.
+`0001-sam3-ggml-combined.patch` — the single consolidated patch containing the Metal head-dimension extensions, CUDA flash-attention head-dimension support (tile + MMA hd=32: `case 32` dispatch, Ampere config-table entries, DKQ=32 kernel instantiations), CUDA/Vulkan conv2d-transpose fast paths, CUDA F16 matmul output, fused custom-frequency/F16-to-F32 RoPE, native window partition, and fused QKV layout plus Q/K RoPE changes.
 
 ## Model format (GGUF, CRITICAL)
 

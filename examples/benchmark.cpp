@@ -24,6 +24,7 @@
  */
 
 #include "sam3.h"
+#include "example_debug.h"
 #include "ggml.h"
 
 #include <algorithm>
@@ -46,6 +47,7 @@
 // ── Global options ──────────────────────────────────────────────────────────
 
 static sam3_device g_device = SAM3_DEVICE_AUTO;  // --device override
+static sam3_debug_options g_debug;               // diagnostics flags (--census etc.)
 
 // ── Wire format for child→parent result ─────────────────────────────────────
 
@@ -234,6 +236,7 @@ static BenchWire run_single_benchmark(const std::string & model_path,
     params.n_threads     = n_threads;
     params.encode_img_size = encode_img_size;
     params.device        = g_device;
+    params.debug         = g_debug;
     if (!use_gpu) {
         params.device = SAM3_DEVICE_CPU;  // --cpu-only wins over --device
     }
@@ -486,6 +489,7 @@ int main(int argc, char ** argv) {
         else if (arg == "--n-threads"  && i + 1 < argc) { n_threads = atoi(argv[++i]); }
         else if (arg == "--encode-img-size" && i + 1 < argc) { encode_img_size = atoi(argv[++i]); }
         else if (arg == "--cpu-only")  { cpu_only = true; }
+        else if (sam3_example_debug_flag(argv[i], g_debug)) { /* diagnostics flag consumed */ }
         else if (arg == "--gpu-only")  { gpu_only = true; }
         else if (arg == "--filter"     && i + 1 < argc) { filter = argv[++i]; }
         else if (arg == "--device"     && i + 1 < argc) {
@@ -508,7 +512,9 @@ int main(int argc, char ** argv) {
                 "  --cpu-only            Skip Metal runs\n"
                 "  --gpu-only            Skip CPU runs\n"
                 "  --device <dev>        auto|cpu|cuda|vulkan (default: auto)\n"
-                "  --filter <substr>     Filter model filenames\n",
+                "  --filter <substr>     Filter model filenames\n"
+                "  diagnostics: --census [--census=2] --profile-prop --pcs-prof\n"
+                "               --encode-timing --dump-vit-blocks --sam2-dump-dir=DIR\n",
                 argv[0]);
             return 0;
         } else {

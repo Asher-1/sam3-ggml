@@ -6,14 +6,14 @@
 # example (built from examples/main_video.cpp).
 #
 # Usage:
-#   ./run_video.sh                              # model only (pick a video via --video)
+#   ./run_video.sh                              # defaults: sam3.1-f16 + data/test_video_market_5.mp4
 #   ./run_video.sh data/test_video.mp4          # positional arg = video path
-#   ./run_video.sh --model models/sam3-visual-f16.gguf clip.mp4
+#   ./run_video.sh --model models/sam3-f16.gguf clip.mp4   # explicit legacy model
 #   ./run_video.sh --device cuda --threads 8 data/test_video.mp4
 #
 # Environment overrides:
-#   MODEL=models/sam3-f16.gguf    default model when --model is not given
-#   VIDEO=data/test_video.mp4     default video when no positional arg / --video
+#   MODEL=models/sam3.1-f16.gguf  default model when --model is not given
+#   VIDEO=data/test_video_market_5.mp4 video used when no positional arg / --video
 #   DEVICE=auto|cpu|cuda|vulkan   appended as --device unless already given
 #   THREADS=4                     appended as --threads unless already given
 #   BUILD_DIR=build-all           which build dir to use (auto-detected otherwise)
@@ -47,10 +47,14 @@ if [[ -z "$BIN" ]]; then
     exit 1
 fi
 
+# The library spawns ffmpeg/ffprobe via PATH lookup; the repo ships its own
+# copies in data/ so a bare launch works without a system install.
+[[ -x "$ROOT/data/ffmpeg" ]] && export PATH="$ROOT/data:${PATH}"
+
 # ── Assemble arguments ───────────────────────────────────────────────────────
 # Precedence: explicit flag > positional arg > env var > default.
 # User args are passed through untouched; defaults are only prepended.
-MODEL="${MODEL:-models/sam3-f16.gguf}"
+MODEL="${MODEL:-models/sam3.1-f16.gguf}"
 
 VALUED_FLAGS=" --model --image --video --device --threads --encode-img-size "
 
@@ -87,8 +91,10 @@ POS="$(positional_arg "$@" || true)"
 if ! has_flag --video "$@"; then
     if [[ -n "$POS" ]]; then
         ARGS+=(--video "$POS")
-    elif [[ -n "${VIDEO:-}" ]]; then
-        ARGS+=(--video "$VIDEO")
+    else
+        # Default to the bundled test video so a bare launch always has
+        # something to track; VIDEO= overrides it.
+        ARGS+=(--video "${VIDEO:-data/test_video_market_5.mp4}")
     fi
 fi
 if [[ -n "${DEVICE:-}" ]] && ! has_flag --device "$@"; then

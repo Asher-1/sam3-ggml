@@ -110,9 +110,15 @@ struct sam3_detection {
     int       instance_id = -1;
     sam3_mask  mask;
     std::vector<float> sam_token;   // raw SAM decoder output token (for obj_ptr)
+    float      obj_logit = 0.0f;    // raw object-score logit (3.1 gating input)
     std::vector<float> mask_logits; // opt-in: pre-binarization logits at mask
                                     // resolution (width x height), filled only
                                     // when return_logits is set; empty otherwise
+    std::vector<float> mask_logits_lowres; // opt-in: pre-binarization logits at
+                                    // the native decoder resolution (288x288
+                                    // for 3.1), filled only when return_logits
+                                    // is set; the official memory encoder
+                                    // consumes these directly
 };
 
 struct sam3_result {
@@ -135,6 +141,22 @@ enum sam3_device {
     SAM3_DEVICE_VULKAN = 3,
 };
 
+// Explicit diagnostics switches. The library performs zero environment
+// lookups; every knob below must be set programmatically through
+// sam3_params::debug (replaces the former SAM3_CENSUS / SAM3_PROFILE_PROP /
+// SAM3_PCS_PROF / SAM3_ENCODE_TIMING / SAM31_DUMP_BLOCKS / SAM2_DUMP_DIR
+// environment variables).
+struct sam3_debug_options {
+    int         census          = 0;    // 1 = graph/op census, 2 = + CPY shape dump
+    int         profile_prop    = 0;    // 1 = propagate + memenc stage timings
+    int         pcs_prof        = 0;    // 1 = PCS stage timings
+    int         encode_timing   = 0;    // 1 = image-encode graph timing
+    int         dump_vit_blocks = 0;    // 1 = dump ViT block tensors (debug builds)
+    std::string sam2_dump_dir;          // non-empty = dump SAM2 intermediate tensors here
+    std::string parity_dump_dir;        // non-empty = dump mux-path graph tensors (f32)
+                                        // for numeric alignment vs official PyTorch
+};
+
 struct sam3_params {
     std::string model_path;
     int         n_threads       = 4;
@@ -142,6 +164,7 @@ struct sam3_params {
     sam3_device device          = SAM3_DEVICE_AUTO;  // explicit device; AUTO picks CUDA->Vulkan->CPU
     int         seed            = 42;
     int         encode_img_size = 0;  // 0 = model default; override input resolution
+    sam3_debug_options debug;         // diagnostics; defaults disable all logging
 };
 
 struct sam3_tensor_info {
@@ -488,20 +511,20 @@ SAM3_API sam3_tracker_ptr sam3_create_visual_tracker(
 ** The image is encoded, then each tracked instance is propagated via
 ** memory attention + SAM mask decode, and the memory bank is updated.
 **
-** reverse=false (default): processes the frame at the tracker's current
-** index — on the first call this re-processes the prompt frame, exactly
-** like the official forward processing order range(start, end].
+** The passed frame must be the next *unprocessed* frame in the tracking
+** direction: after add_instance on frame f, pass frame f+1 (forward) or
+** f-1 (reverse). Frames whose outputs are already consolidated (the
+** annotation frame, and frames processed by an earlier pass) are skipped
+** exactly like the official propagate_in_video
+** (consolidated_frame_inds / frames_already_tracked check): their outputs
+** already exist and their memory is already encoded, so they are never
+** re-processed.
 **
 ** reverse=true: aligned with the official propagate_in_video(reverse=True).
-** Processes the frame BEFORE the current index (the prompt frame itself is
-** never re-processed, matching the official reverse order
-** range(start-1, ..., -1)); memory slots and object pointers on the future
-** side of the current frame participate, with temporal positions folded to
-** non-negative distances in tracking order (official tpos_sign_mul).
-** frame_index decrements; hotstart/keep-alive are measured in tracking
-** order. Passing the frame image whose index equals
-** (tracker.frame_index - 1) for reverse, or tracker.frame_index for
-** forward, is the caller's responsibility.
+** Memory slots and object pointers on the future side of the current frame
+** participate, with temporal positions folded to non-negative distances in
+** tracking order (official tpos_sign_mul). Hotstart/keep-alive are measured
+** in tracking order.
 */
 SAM3_API sam3_result sam3_propagate_frame(
     sam3_tracker     & tracker,
